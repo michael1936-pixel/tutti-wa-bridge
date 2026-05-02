@@ -1,89 +1,58 @@
 // tutti-wa-bridge/server.js
-import express from "express";
-import fs from "fs";
-import path from "path";
-import pino from "pino";
-import {
-  default as makeWASocket,
+// WhatsApp pairing bridge using Baileys.
+// Handles 515 (restartRequired) by recreating the socket — the typical
+// post-pairing handshake. Persists auth/<phone>/ to a Railway Volume.
+
+const express = require('express');
+const fs = require('fs');
+const path = require('path');
+const pino = require('pino');
+const {
+  default: makeWASocket,
   useMultiFileAuthState,
+  DisconnectReason,
   fetchLatestBaileysVersion,
   Browsers,
-  DisconnectReason,
-} from "@whiskeysockets/baileys";
+} = require('@whiskeysockets/baileys');
 
 const PORT = process.env.PORT || 3000;
-const API_KEY = process.env.API_KEY || process.env.BRIDGE_API_KEY || "";
-const AUTH_DIR = process.env.AUTH_DIR || "./auth";
+const API_KEY = process.env.WHATSAPP_VPS_API_KEY || process.env.API_KEY;
+const AUTH_ROOT = process.env.AUTH_ROOT || path.join(__dirname, 'auth');
 
+if (!fs.existsSync(AUTH_ROOT)) fs.mkdirSync(AUTH_ROOT, { recursive: true });
+
+const log = pino({ level: 'info' });
 const app = express();
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json());
 
-// In-memory map of phone -> { sock, state, lastCode, creds }
+// In-memory session map: phone -> { sock, status, lastCode, lastError, startedAt }
 const sessions = new Map();
 
-const log = pino({ level: "info" });
+function normalizePhone(input) {
+  if (!input) return null;
+  let p = String(input).replace(/\D/g, '');
+  if (p.startsWith('0')) p = '972' + p.slice(1);
+  if (p.length < 10 || p.length > 15) return null;
+  return p;
+}
 
-// ---------- Public endpoints (NO auth) ----------
-app.get("/", (_req, res) => res.status(200).send("ok"));
-app.get("/health", (_req, res) => res.status(200).json({ ok: true }));
-app.get("/status", (req, res) => {
-  const phone = (req.query.phone || "").toString();
-  if (phone) {
-    const s = sessions.get(normalizePhone(phone).phone);
-    return res.status(200).json({
-      ok: true,
-      phone,
-      hasSession: !!s,
-      connectionState: s?.state ?? "none",
-      lastCode: s?.lastCode ?? null,
-    });
-  }
-  const list = [...sessions.entries()].map(([p, s]) => ({
-    phone: p, state: s.state, hasCode: !!s.lastCode,
-  }));
-  return res.status(200).json({ ok: true, sessions: list });
-});
+function authDir(phone) {
+  return path.join(AUTH_ROOT, phone);
+}
 
-// ---------- API key guard for everything below ----------
-app.use((req, res, next) => {
-  if (!API_KEY) {
-    return res.status(500).json({ ok: false, error: "server_missing_api_key" });
-  }
-  const key = req.header("X-Api-Key");
-  if (key !== API_KEY) {
-    return res.status(401).json({ ok: false, error: "unauthorized" });
-  }
+function requireKey(req, res, next) {
+  if (!API_KEY) return next();
+  const k = req.header('X-Api-Key') || req.query.key;
+  if (k !== API_KEY) return res.status(401).json({ ok: false, error: 'unauthorized' });
   next();
-});
-
-// ---------- Helpers ----------
-function normalizePhone(raw) {
-  let p = (raw || "").toString().replace(/[^\d]/g, "");
-  if (p.startsWith("00")) p = p.slice(2);
-  if (p.startsWith("0")) p = "972" + p.slice(1); // Israeli local -> intl
-  return { phone: p, valid: p.length >= 10 && p.length <= 15 };
 }
 
-function formatCode(code) {
-  if (!code) return code;
-  const c = code.toString().replace(/\s|-/g, "");
-  return c.length === 8 ? `${c.slice(0, 4)}-${c.slice(4)}` : c;
-}
-
-function authPathFor(phone) {
-  return path.join(AUTH_DIR, phone);
-}
-
-async function startSocketForPairing(phone) {
-  const dir = authPathFor(phone);
-
-  // Wipe any old creds so Baileys generates a fresh pairing
-  try {
+async function startSocket(phone, { freshPair = false } = {}) {
+  const dir = authDir(phone);
+  if (freshPair && fs.existsSync(dir)) {
     fs.rmSync(dir, { recursive: true, force: true });
-  } catch (e) {
-    log.warn({ err: e?.message }, "rm auth dir failed");
   }
-  fs.mkdirSync(dir, { recursive: true });
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 
   const { state, saveCreds } = await useMultiFileAuthState(dir);
   const { version } = await fetchLatestBaileysVersion();
@@ -92,109 +61,172 @@ async function startSocketForPairing(phone) {
     version,
     auth: state,
     printQRInTerminal: false,
-    browser: Browsers.macOS("Safari"),
-    logger: pino({ level: "warn" }),
+    browser: Browsers.macOS('Safari'),
+    logger: pino({ level: 'silent' }),
     syncFullHistory: false,
     markOnlineOnConnect: false,
   });
 
-  const session = { sock, state: "connecting", lastCode: null };
+  const session = sessions.get(phone) || {
+    status: 'starting',
+    startedAt: Date.now(),
+    lastCode: null,
+    lastError: null,
+  };
+  session.sock = sock;
+  session.status = session.status === 'connected' ? 'connected' : 'starting';
   sessions.set(phone, session);
 
-  sock.ev.on("creds.update", saveCreds);
-  sock.ev.on("connection.update", (u) => {
-    log.info({ phone, u }, "connection.update");
-    if (u.connection) session.state = u.connection;
-    if (u.connection === "close") {
-      const code = u.lastDisconnect?.error?.output?.statusCode;
+  sock.ev.on('creds.update', saveCreds);
+
+  sock.ev.on('connection.update', (update) => {
+    const { connection, lastDisconnect, isNewLogin } = update;
+    log.info({ phone, connection, isNewLogin }, 'connection.update');
+
+    if (connection === 'connecting') {
+      session.status = session.status === 'connected' ? 'connected' : 'connecting';
+    }
+
+    if (connection === 'open') {
+      session.status = 'connected';
+      session.lastError = null;
+      log.info({ phone }, 'CONNECTED ✅');
+    }
+
+    if (connection === 'close') {
+      const code =
+        lastDisconnect?.error?.output?.statusCode ||
+        lastDisconnect?.error?.output?.payload?.statusCode;
+      const reasonName =
+        Object.keys(DisconnectReason).find((k) => DisconnectReason[k] === code) || 'unknown';
+      log.warn({ phone, code, reasonName }, 'connection close');
+
+      // 515 = restartRequired. Standard after pairing — recreate socket.
+      if (code === DisconnectReason.restartRequired || code === 515) {
+        log.info({ phone }, 'restart required, recreating socket');
+        setTimeout(() => startSocket(phone).catch((e) => log.error(e)), 500);
+        return;
+      }
+
       if (code === DisconnectReason.loggedOut) {
+        session.status = 'failed';
+        session.lastError = 'logged out';
         sessions.delete(phone);
+        try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_) {}
+        return;
+      }
+
+      // Other close reasons → reconnect within pairing window
+      const ageMs = Date.now() - session.startedAt;
+      if (ageMs < 120_000) {
+        setTimeout(() => startSocket(phone).catch((e) => log.error(e)), 3000);
+      } else if (session.status !== 'connected') {
+        session.status = 'failed';
+        session.lastError = `closed (${code} ${reasonName})`;
       }
     }
   });
 
-  return sock;
+  return { sock, saveCreds, session };
 }
 
-// ---------- /pair ----------
-app.post("/pair", async (req, res) => {
-  let stage = "init";
+app.get('/health', (_req, res) => {
+  res.json({ ok: true, sessions: sessions.size, ts: Date.now() });
+});
+
+app.get('/status', requireKey, (_req, res) => {
+  const list = [];
+  for (const [phone, s] of sessions.entries()) {
+    list.push({ phone, status: s.status, lastError: s.lastError });
+  }
+  res.json({ ok: true, sessions: list });
+});
+
+app.get('/session/:phone', requireKey, (req, res) => {
+  const phone = normalizePhone(req.params.phone);
+  if (!phone) return res.status(400).json({ ok: false, error: 'invalid_phone' });
+  const s = sessions.get(phone);
+  if (!s) {
+    if (fs.existsSync(authDir(phone)) && fs.readdirSync(authDir(phone)).length > 0) {
+      return res.json({ ok: true, status: 'disconnected', phone });
+    }
+    return res.json({ ok: true, status: 'unknown', phone });
+  }
+  res.json({ ok: true, status: s.status, phone, error: s.lastError, lastCode: s.lastCode });
+});
+
+app.post('/pair', requireKey, async (req, res) => {
+  let stage = 'validate';
   try {
-    const { phone: rawPhone } = req.body || {};
-    stage = "validate";
-    const { phone, valid } = normalizePhone(rawPhone);
-    if (!valid) {
-      return res.status(400).json({ ok: false, stage, error: "invalid_phone", phone });
-    }
+    const phone = normalizePhone(req.body?.phone);
+    if (!phone) return res.status(400).json({ ok: false, error: 'invalid_phone', stage });
 
-    // Already connected?
     const existing = sessions.get(phone);
-    if (existing && existing.state === "open") {
-      return res.status(200).json({ ok: true, alreadyConnected: true, phone });
+    if (existing && existing.status === 'connected') {
+      return res.json({ ok: true, alreadyConnected: true, phone });
     }
 
-    stage = "start_socket";
-    const sock = await startSocketForPairing(phone);
+    stage = 'start_socket';
+    const { sock, session } = await startSocket(phone, { freshPair: true });
+    session.startedAt = Date.now();
+    session.status = 'pairing';
+    session.lastCode = null;
+    session.lastError = null;
 
-    // Wait one tick so authState is fully wired
-    await new Promise((r) => setTimeout(r, 500));
+    await new Promise((r) => setTimeout(r, 1500));
 
-    // If by some reason already registered, requestPairingCode throws
+    stage = 'request_code';
     if (sock.authState?.creds?.registered) {
-      return res.status(200).json({ ok: true, alreadyConnected: true, phone });
+      return res.json({ ok: true, alreadyConnected: true, phone });
     }
 
-    stage = "request_code";
-    const rawCode = await sock.requestPairingCode(phone);
-    if (!rawCode) {
-      return res.status(500).json({ ok: false, stage, error: "no_code_returned", phone });
+    let code;
+    try {
+      code = await sock.requestPairingCode(phone);
+    } catch (err) {
+      log.error({ phone, err: err?.message }, 'requestPairingCode failed');
+      session.status = 'failed';
+      session.lastError = err?.message || 'requestPairingCode failed';
+      return res.status(500).json({
+        ok: false,
+        error: err?.message || 'requestPairingCode failed',
+        stage,
+      });
     }
-    const code = formatCode(rawCode);
-    sessions.get(phone).lastCode = code;
 
-    log.info({ phone, code }, "pair code issued");
-    return res.status(200).json({ ok: true, phone, code });
+    if (!code) {
+      session.status = 'failed';
+      session.lastError = 'no_code_returned';
+      return res.status(500).json({ ok: false, error: 'no_code_returned', stage });
+    }
+
+    const formatted = code.length === 8 ? `${code.slice(0, 4)}-${code.slice(4)}` : code;
+    session.lastCode = formatted;
+    log.info({ phone, code: formatted }, 'pair code issued');
+    res.json({ ok: true, code: formatted, phone });
   } catch (err) {
-    log.error({ stage, err: err?.message, stack: err?.stack }, "pair failed");
-    return res.status(500).json({
+    log.error({ err: err?.message, stack: err?.stack }, 'pair handler error');
+    res.status(500).json({
       ok: false,
+      error: err?.message || String(err),
       stage,
-      error: err?.message || "unknown",
-      stack: (err?.stack || "").toString().slice(0, 500),
+      stack: (err?.stack || '').slice(0, 500),
     });
   }
 });
 
-// ---------- /send ----------
-app.post("/send", async (req, res) => {
-  try {
-    const { phone, to, text } = req.body || {};
-    const { phone: from } = normalizePhone(phone);
-    const s = sessions.get(from);
-    if (!s || s.state !== "open") {
-      return res.status(409).json({ ok: false, error: "not_connected", state: s?.state });
-    }
-    const jid = to.includes("@") ? to : `${normalizePhone(to).phone}@s.whatsapp.net`;
-    const m = await s.sock.sendMessage(jid, { text });
-    return res.status(200).json({ ok: true, id: m?.key?.id });
-  } catch (err) {
-    return res.status(500).json({ ok: false, error: err?.message });
+app.post('/disconnect', requireKey, async (req, res) => {
+  const phone = normalizePhone(req.body?.phone);
+  if (!phone) return res.status(400).json({ ok: false, error: 'invalid_phone' });
+  const s = sessions.get(phone);
+  if (s?.sock) {
+    try { await s.sock.logout(); } catch (_) {}
   }
+  sessions.delete(phone);
+  try { fs.rmSync(authDir(phone), { recursive: true, force: true }); } catch (_) {}
+  res.json({ ok: true, disconnected: phone });
 });
 
-// ---------- /groups ----------
-app.get("/groups", async (req, res) => {
-  try {
-    const { phone } = normalizePhone(req.query.phone || "");
-    const s = sessions.get(phone);
-    if (!s || s.state !== "open") {
-      return res.status(409).json({ ok: false, error: "not_connected", state: s?.state });
-    }
-    const groups = await s.sock.groupFetchAllParticipating();
-    return res.status(200).json({ ok: true, groups });
-  } catch (err) {
-    return res.status(500).json({ ok: false, error: err?.message });
-  }
+app.listen(PORT, () => {
+  log.info({ port: PORT, authRoot: AUTH_ROOT }, 'WA bridge listening');
 });
-
-app.listen(PORT, () => log.info(`bridge listening on ${PORT}`));
