@@ -5,6 +5,7 @@
 //   GET  /qr.png         -> raw QR image (when pairing)
 //   GET  /groups         -> [{ id, subject, size }]    (X-Api-Key required)
 //   POST /send           -> { jid, text }              (X-Api-Key required)
+//   POST /pair           -> { phone } -> { ok, code }  (X-Api-Key required)
 //
 // Session is persisted to AUTH_DIR (mount a Railway Volume there).
 
@@ -38,6 +39,7 @@ let sock = null;
 let latestQR = null;
 let connected = false;
 let meUser = null;
+let usePairingCode = false; // when true, suppress QR output for the next session
 
 async function start() {
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
@@ -52,47 +54,48 @@ async function start() {
   });
 
   sock.ev.on('creds.update', saveCreds);
-// === Forward incoming private messages to Lovable ===
-sock.ev.on('messages.upsert', async ({ messages }) => {
-  const WEBHOOK_URL = process.env.LOVABLE_WEBHOOK_URL;
-  const WEBHOOK_SECRET = process.env.LOVABLE_WEBHOOK_SECRET;
-  const STATION_ID = process.env.DEFAULT_STATION_ID;
-  if (!WEBHOOK_URL || !WEBHOOK_SECRET || !STATION_ID) return;
 
-  for (const msg of messages || []) {
-    try {
-      if (!msg?.key || msg.key.fromMe) continue;
-      const jid = msg.key.remoteJid || '';
-      if (!jid || jid.endsWith('@g.us') || jid.endsWith('@broadcast')) continue;
+  // === Forward incoming private messages to Lovable ===
+  sock.ev.on('messages.upsert', async ({ messages }) => {
+    const WEBHOOK_URL = process.env.LOVABLE_WEBHOOK_URL;
+    const WEBHOOK_SECRET = process.env.LOVABLE_WEBHOOK_SECRET;
+    const STATION_ID = process.env.DEFAULT_STATION_ID;
+    if (!WEBHOOK_URL || !WEBHOOK_SECRET || !STATION_ID) return;
 
-      const text =
-        msg.message?.conversation ||
-        msg.message?.extendedTextMessage?.text ||
-        msg.message?.imageMessage?.caption ||
-        '';
-      if (!text) continue;
+    for (const msg of messages || []) {
+      try {
+        if (!msg?.key || msg.key.fromMe) continue;
+        const jid = msg.key.remoteJid || '';
+        if (!jid || jid.endsWith('@g.us') || jid.endsWith('@broadcast')) continue;
 
-      const driverPhone = jid.split('@')[0].split(':')[0];
+        const text =
+          msg.message?.conversation ||
+          msg.message?.extendedTextMessage?.text ||
+          msg.message?.imageMessage?.caption ||
+          '';
+        if (!text) continue;
 
-      const r = await fetch(WEBHOOK_URL, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-bridge-secret': WEBHOOK_SECRET,
-        },
-        body: JSON.stringify({
-          station_id: STATION_ID,
-          driver_phone: driverPhone,
-          text,
-          direction: 'incoming',
-        }),
-      });
-      logger.info({ status: r.status, driverPhone }, 'forwarded incoming msg');
-    } catch (e) {
-      logger.error({ err: String(e?.message || e) }, 'forward failed');
+        const driverPhone = jid.split('@')[0].split(':')[0];
+
+        const r = await fetch(WEBHOOK_URL, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-bridge-secret': WEBHOOK_SECRET,
+          },
+          body: JSON.stringify({
+            station_id: STATION_ID,
+            driver_phone: driverPhone,
+            text,
+            direction: 'incoming',
+          }),
+        });
+        logger.info({ status: r.status, driverPhone }, 'forwarded incoming msg');
+      } catch (e) {
+        logger.error({ err: String(e?.message || e) }, 'forward failed');
+      }
     }
-  }
-});
+  });
 
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
@@ -103,6 +106,7 @@ sock.ev.on('messages.upsert', async ({ messages }) => {
     if (connection === 'open') {
       connected = true;
       latestQR = null;
+      usePairingCode = false;
       meUser = sock.user?.id || null;
       logger.info({ user: meUser }, 'WhatsApp connected');
     }
@@ -147,43 +151,14 @@ app.get('/qr.png', async (_req, res) => {
 app.get('/qr', (_req, res) => {
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
   res.send(`<!doctype html>
-<html lang="he" dir="rtl">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Tutti WhatsApp Bridge — סריקת QR</title>
-  <style>
-    body { font-family: -apple-system, system-ui, sans-serif; background:#0f172a; color:#fff;
-           display:flex; flex-direction:column; align-items:center; padding:24px; gap:16px; }
-    .card { background:#fff; padding:16px; border-radius:16px; }
-    h1 { margin:0; font-size:20px; }
-    p { color:#94a3b8; max-width:340px; text-align:center; line-height:1.5; }
-    .ok { color:#22c55e; font-size:18px; }
-  </style>
-</head>
-<body>
-  <h1>חיבור WhatsApp ל-Tutti</h1>
-  <p>פתח/י את WhatsApp בטלפון → תפריט → <b>מכשירים מקושרים</b> → <b>קישור מכשיר</b>, וסרק/י את הקוד.</p>
-  <div id="box"></div>
-  <script>
-    async function tick() {
-      const s = await fetch('/status').then(r => r.json()).catch(() => null);
-      const box = document.getElementById('box');
-      if (s && s.connected) {
-        box.innerHTML = '<div class="ok">✅ מחובר! המספר: ' + (s.user || '') + '</div>';
-        return;
-      }
-      if (s && s.hasQR) {
-        box.innerHTML = '<div class="card"><img src="/qr.png?t=' + Date.now() + '" width="320" height="320" /></div>';
-      } else {
-        box.innerHTML = '<p>טוען…</p>';
-      }
-      setTimeout(tick, 3000);
-    }
-    tick();
-  </script>
-</body>
-</html>`);
+<html lang="he" dir="rtl"><head><meta charset="utf-8"><title>WhatsApp QR</title>
+<meta http-equiv="refresh" content="5"></head>
+<body style="font-family:system-ui;text-align:center;padding:24px">
+<h2>חיבור WhatsApp ל-Tutti</h2>
+<p>פתח/י WhatsApp → מכשירים מקושרים → קישור מכשיר, וסרק/י את הקוד.</p>
+<img src="/qr.png" alt="QR" style="max-width:320px"/>
+<p>הדף מתרענן אוטומטית כל 5 שניות.</p>
+</body></html>`);
 });
 
 app.get('/groups', requireKey, async (_req, res) => {
@@ -210,6 +185,34 @@ app.post('/send', requireKey, async (req, res) => {
     res.json({ ok: true, messageId: result?.key?.id || null });
   } catch (e) {
     res.status(500).json({ error: String(e?.message || e) });
+  }
+});
+
+// --- Pairing code (link via phone number, not QR) ---
+app.post('/pair', requireKey, async (req, res) => {
+  try {
+    if (!sock) return res.status(503).json({ error: 'socket not initialized' });
+    if (connected || sock.user) {
+      return res.json({ ok: true, alreadyConnected: true });
+    }
+
+    const raw = String(req.body?.phone || '').replace(/\D/g, '');
+    if (!raw || raw.length < 10) {
+      return res.status(400).json({ error: 'invalid phone (E.164 digits, no +)' });
+    }
+
+    if (typeof sock.requestPairingCode !== 'function') {
+      return res.status(500).json({ error: 'pairing code not supported by this Baileys version' });
+    }
+
+    usePairingCode = true;
+    const code = await sock.requestPairingCode(raw);
+    const formatted = code && code.length === 8 ? `${code.slice(0, 4)}-${code.slice(4)}` : code;
+    logger.info({ phone: raw }, 'issued pairing code');
+    return res.json({ ok: true, code: formatted });
+  } catch (e) {
+    logger.error({ err: String(e?.message || e) }, 'pair failed');
+    return res.status(500).json({ error: String(e?.message || e) || 'pair failed' });
   }
 });
 
