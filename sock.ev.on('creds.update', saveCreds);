@@ -52,6 +52,47 @@ async function start() {
   });
 
   sock.ev.on('creds.update', saveCreds);
+// === Forward incoming private messages to Lovable ===
+sock.ev.on('messages.upsert', async ({ messages }) => {
+  const WEBHOOK_URL = process.env.LOVABLE_WEBHOOK_URL;
+  const WEBHOOK_SECRET = process.env.LOVABLE_WEBHOOK_SECRET;
+  const STATION_ID = process.env.DEFAULT_STATION_ID;
+  if (!WEBHOOK_URL || !WEBHOOK_SECRET || !STATION_ID) return;
+
+  for (const msg of messages || []) {
+    try {
+      if (!msg?.key || msg.key.fromMe) continue;
+      const jid = msg.key.remoteJid || '';
+      if (!jid || jid.endsWith('@g.us') || jid.endsWith('@broadcast')) continue;
+
+      const text =
+        msg.message?.conversation ||
+        msg.message?.extendedTextMessage?.text ||
+        msg.message?.imageMessage?.caption ||
+        '';
+      if (!text) continue;
+
+      const driverPhone = jid.split('@')[0].split(':')[0];
+
+      const r = await fetch(WEBHOOK_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-bridge-secret': WEBHOOK_SECRET,
+        },
+        body: JSON.stringify({
+          station_id: STATION_ID,
+          driver_phone: driverPhone,
+          text,
+          direction: 'incoming',
+        }),
+      });
+      logger.info({ status: r.status, driverPhone }, 'forwarded incoming msg');
+    } catch (e) {
+      logger.error({ err: String(e?.message || e) }, 'forward failed');
+    }
+  }
+});
 
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
