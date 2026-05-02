@@ -1,4 +1,4 @@
-// server.js — Tutti WhatsApp Bridge (pair-mode hardened, Baileys 6.7.x)
+// server.js — Tutti WhatsApp Bridge (pair-mode hardened + Railway healthcheck)
 import express from "express";
 import bodyParser from "body-parser";
 import fs from "fs";
@@ -16,267 +16,158 @@ const API_KEY = process.env.API_KEY || "";
 const AUTH_DIR = process.env.AUTH_DIR || "./auth";
 
 const logger = pino({ level: "warn" });
-const startedAt = Date.now();
-
 const app = express();
 app.use(bodyParser.json({ limit: "1mb" }));
 
-// --- public health endpoints (no auth) for Railway healthcheck ---
+// ---------- PUBLIC HEALTH ENDPOINTS (no auth) — must come BEFORE the API-key middleware
 app.get("/", (_req, res) => res.status(200).send("ok"));
-app.get("/health", (_req, res) =>
-  res.status(200).json({ ok: true, uptime: (Date.now() - startedAt) / 1000 })
-);
+app.get("/health", (_req, res) => res.status(200).json({ ok: true }));
 
-// ---------- shared state ----------
+// ---------- API key guard for everything else
+app.use((req, res, next) => {
+  if (!API_KEY) return next();
+  if (req.headers["x-api-key"] === API_KEY) return next();
+  return res.status(401).json({ ok: false, error: "unauthorized" });
+});
+
+// ---------- state
 let sock = null;
-let currentSockId = 0;
-let mode = "qr"; // 'qr' | 'pair'
-let connectionState = "close";
-let lastQR = null;
-let lastQRAt = null;
+let sockId = 0;
+let connectionState = "idle";
 let lastDisconnectCode = null;
 let lastConnectionUpdate = null;
-let pairing = false;
+let mode = "qr";          // "qr" | "pair"
+let qrDataUrl = null;
 let pairCode = null;
 let pairCodeFormatted = null;
-let pairCodeIssuedAt = null;
-let pairStartedAt = null;
-let pairRequestedForSockId = -1;
-let lastPairError = null;
-let credsRegistered = false;
-let connectedUser = null;
+let pairRequestedForSockId = null;
+let pairAttemptId = 0;
+let pairRequestedAt = null;
+let pairPhone = null;
 
-let pendingPairPhone = null;
-let pairResolver = null;
-
-// ---------- helpers ----------
-function wipeAuthDir() {
-  try {
-    if (fs.existsSync(AUTH_DIR)) fs.rmSync(AUTH_DIR, { recursive: true, force: true });
-  } catch (e) {
-    console.error("wipeAuthDir failed:", e.message);
-  }
+async function clearAuth() {
+  try { fs.rmSync(AUTH_DIR, { recursive: true, force: true }); } catch {}
   fs.mkdirSync(AUTH_DIR, { recursive: true });
 }
 
-async function killSocket() {
-  if (!sock) return;
-  try { sock.ev.removeAllListeners(); } catch {}
-  try { sock.end(undefined); } catch {}
-  try { sock.ws?.close?.(); } catch {}
-  sock = null;
-}
-
-// ---------- start socket ----------
-async function startSocket(nextMode /* 'qr' | 'pair' */) {
-  await killSocket();
-  mode = nextMode;
-  connectionState = "close";
-  lastQR = null;
-  lastQRAt = null;
-  lastDisconnectCode = null;
-  lastConnectionUpdate = null;
-  if (mode === "pair") {
-    pairing = true;
-    pairCode = null;
-    pairCodeFormatted = null;
-    pairStartedAt = new Date().toISOString();
-    pairCodeIssuedAt = null;
-    lastPairError = null;
-  } else {
-    pairing = false;
+async function startSocket(nextMode = "qr", phone = null) {
+  if (sock) {
+    try { sock.ev.removeAllListeners(); } catch {}
+    try { sock.end(); } catch {}
+    sock = null;
   }
-
-  const sockId = ++currentSockId;
+  mode = nextMode;
+  qrDataUrl = null;
+  pairCode = null;
+  pairCodeFormatted = null;
+  pairPhone = phone;
+  connectionState = "starting";
+  lastDisconnectCode = null;
 
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
   const { version } = await fetchLatestBaileysVersion();
 
-  const s = makeWASocket({
+  const id = ++sockId;
+  sock = makeWASocket({
     version,
     logger,
     printQRInTerminal: false,
-    markOnlineOnConnect: false,
-    syncFullHistory: false,
-    connectTimeoutMs: 60_000,
-    defaultQueryTimeoutMs: 60_000,
-    emitOwnEvents: false,
-    // No `browser` override — known cause of "invalid pairing code" in 6.7.x.
     auth: {
       creds: state.creds,
       keys: makeCacheableSignalKeyStore(state.keys, logger),
     },
+    connectTimeoutMs: 60_000,
+    defaultQueryTimeoutMs: 60_000,
+    syncFullHistory: false,
+    markOnlineOnConnect: false,
   });
 
-  sock = s;
-  credsRegistered = !!s.authState.creds.registered;
+  sock.ev.on("creds.update", saveCreds);
 
-  s.ev.on("creds.update", async () => {
-    await saveCreds();
-    credsRegistered = !!s.authState.creds.registered;
-  });
+  sock.ev.on("connection.update", async (u) => {
+    lastConnectionUpdate = { ...u, at: new Date().toISOString() };
+    if (u.connection) connectionState = u.connection;
 
-  s.ev.on("connection.update", async (update) => {
-    if (sockId !== currentSockId) return; // stale event
-    lastConnectionUpdate = { ...update, at: new Date().toISOString() };
-    const { connection, lastDisconnect, qr } = update;
-    if (connection) connectionState = connection;
-
-    if (qr) {
-      if (mode === "qr") {
-        lastQR = qr;
-        lastQRAt = new Date().toISOString();
-      } else {
-        lastQR = null; // suppress in pair mode
-      }
-    }
-
-    if (
-      mode === "pair" &&
-      connection === "connecting" &&
-      !s.authState.creds.registered &&
-      pairRequestedForSockId !== sockId &&
-      pendingPairPhone
-    ) {
-      pairRequestedForSockId = sockId;
+    if (u.qr && mode === "qr") {
       try {
-        await new Promise((r) => setTimeout(r, 1500));
-        const code = await s.requestPairingCode(pendingPairPhone);
-        pairCode = code.replace(/-/g, "");
-        pairCodeFormatted =
-          pairCode.length === 8
-            ? `${pairCode.slice(0, 4)}-${pairCode.slice(4)}`
-            : code;
-        pairCodeIssuedAt = new Date().toISOString();
-        if (pairResolver) {
-          pairResolver({ ok: true, code: pairCode, codeFormatted: pairCodeFormatted });
-          pairResolver = null;
-        }
-      } catch (e) {
-        lastPairError = e?.message || String(e);
-        if (pairResolver) {
-          pairResolver({ ok: false, error: lastPairError });
-          pairResolver = null;
-        }
-      }
+        const QRCode = (await import("qrcode")).default;
+        qrDataUrl = await QRCode.toDataURL(u.qr);
+      } catch {}
     }
 
-    if (connection === "open") {
-      pairing = false;
-      connectedUser = s.user || null;
+    if (mode === "pair" && u.connection === "connecting" && pairRequestedForSockId !== id && pairPhone) {
+      pairRequestedForSockId = id;
+      setTimeout(async () => {
+        try {
+          const code = await sock.requestPairingCode(pairPhone);
+          pairCode = code.replace(/[^A-Z0-9]/gi, "").toUpperCase();
+          pairCodeFormatted = pairCode.match(/.{1,4}/g)?.join("-") || pairCode;
+          pairAttemptId++;
+          pairRequestedAt = new Date().toISOString();
+        } catch (e) {
+          console.error("requestPairingCode failed:", e?.message || e);
+        }
+      }, 1500);
     }
 
-    if (connection === "close") {
-      const code = lastDisconnect?.error?.output?.statusCode;
-      lastDisconnectCode = code ?? null;
-
-      // While pairing, do NOT auto-reconnect — a second socket invalidates the code.
-      if (mode === "pair" && pairing) return;
-
+    if (u.connection === "close") {
+      const code = u.lastDisconnect?.error?.output?.statusCode;
+      lastDisconnectCode = code || null;
       const loggedOut = code === DisconnectReason.loggedOut;
-      if (!loggedOut) {
-        setTimeout(() => startSocket("qr").catch(console.error), 2000);
-      }
+      if (mode === "pair") return; // do not auto-reconnect during pair
+      if (!loggedOut) setTimeout(() => startSocket("qr").catch(console.error), 2000);
     }
   });
 }
 
-async function startPair(phone) {
-  pendingPairPhone = phone;
-  await killSocket();
-  wipeAuthDir();
-  await startSocket("pair");
-
-  return await new Promise((resolve) => {
-    pairResolver = resolve;
-    setTimeout(() => {
-      if (pairResolver) {
-        pairResolver({ ok: false, error: "pair timeout" });
-        pairResolver = null;
-      }
-    }, 30_000);
-  });
-}
-
-// ---------- middleware ----------
-function auth(req, res, next) {
-  if (!API_KEY) return next();
-  if (req.header("X-Api-Key") === API_KEY) return next();
-  return res.status(401).json({ ok: false, error: "unauthorized" });
-}
-
-// ---------- routes ----------
-app.get("/status", auth, (_req, res) => {
+// ---------- routes
+app.get("/status", (_req, res) => {
   res.json({
     ok: true,
-    configured: true,
     mode,
-    wsOpen: !!sock?.ws && sock.ws.readyState === 1,
     connectionState,
     connected: connectionState === "open",
-    credsRegistered,
-    hasQR: !!lastQR,
-    pairing,
+    pairing: mode === "pair" && connectionState !== "open",
+    hasQR: !!qrDataUrl && mode === "qr",
+    qrDataUrl: mode === "qr" ? qrDataUrl : null,
     pairCode,
     pairCodeFormatted,
-    pairCodeIssuedAt,
-    pairStartedAt,
+    pairAttemptId,
+    pairRequestedAt,
+    sockId,
     lastDisconnectCode,
-    lastPairError,
     lastConnectionUpdate,
-    sockId: currentSockId,
-    user: connectedUser?.id || null,
-    uptime: (Date.now() - startedAt) / 1000,
   });
 });
 
-app.post("/pair", auth, async (req, res) => {
+app.post("/pair", async (req, res) => {
   try {
-    const phone = String(req.body?.phone || "").replace(/\D/g, "");
-    if (!phone || phone.length < 10) {
-      return res.status(400).json({ ok: false, error: "invalid phone" });
-    }
-    if (connectionState === "open" && credsRegistered) {
-      return res.json({ ok: true, alreadyConnected: true });
-    }
-    const result = await startPair(phone);
-    if (!result.ok) return res.status(500).json(result);
-    res.json(result);
+    const phone = String(req.body?.phone || "").replace(/[^\d]/g, "");
+    if (!phone) return res.status(400).json({ ok: false, error: "phone required" });
+    await clearAuth();
+    pairRequestedForSockId = null;
+    await startSocket("pair", phone);
+    res.json({ ok: true, message: "pairing started, poll /status for pairCode" });
   } catch (e) {
     res.status(500).json({ ok: false, error: e?.message || String(e) });
   }
 });
 
-app.post("/reset", auth, async (_req, res) => {
-  await killSocket();
-  wipeAuthDir();
-  await startSocket("qr");
-  res.json({ ok: true });
-});
-
-app.get("/groups", auth, async (_req, res) => {
-  if (!sock || connectionState !== "open") {
-    return res.status(503).json({ ok: false, error: "not connected" });
-  }
+app.post("/qr", async (_req, res) => {
   try {
-    const all = await sock.groupFetchAllParticipating();
-    const groups = Object.values(all).map((g) => ({
-      jid: g.id,
-      name: g.subject,
-      participants: g.participants?.length ?? null,
-      announce: !!g.announce,
-    }));
-    res.json({ ok: true, groups });
+    await clearAuth();
+    await startSocket("qr");
+    res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ ok: false, error: e?.message || String(e) });
   }
 });
 
-app.post("/send", auth, async (req, res) => {
-  if (!sock || connectionState !== "open") {
-    return res.status(503).json({ ok: false, error: "not connected" });
-  }
+app.post("/send", async (req, res) => {
   try {
+    if (!sock || connectionState !== "open") {
+      return res.status(409).json({ ok: false, error: "not connected" });
+    }
     const { jid, text } = req.body || {};
     if (!jid || !text) return res.status(400).json({ ok: false, error: "jid+text required" });
     const m = await sock.sendMessage(jid, { text });
@@ -286,7 +177,7 @@ app.post("/send", auth, async (req, res) => {
   }
 });
 
-// ---------- boot ----------
+// ---------- boot
 fs.mkdirSync(AUTH_DIR, { recursive: true });
 startSocket("qr").catch(console.error);
 
