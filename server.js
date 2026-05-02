@@ -1,172 +1,200 @@
 // tutti-wa-bridge/server.js
 import express from "express";
-import bodyParser from "body-parser";
+import fs from "fs";
+import path from "path";
 import pino from "pino";
 import {
   default as makeWASocket,
   useMultiFileAuthState,
   fetchLatestBaileysVersion,
-  DisconnectReason,
   Browsers,
+  DisconnectReason,
 } from "@whiskeysockets/baileys";
 
 const PORT = process.env.PORT || 3000;
-const API_KEY = process.env.BRIDGE_API_KEY || "";
+const API_KEY = process.env.API_KEY || process.env.BRIDGE_API_KEY || "";
 const AUTH_DIR = process.env.AUTH_DIR || "./auth";
 
-const logger = pino({ level: "info" });
 const app = express();
-app.use(bodyParser.json({ limit: "2mb" }));
+app.use(express.json({ limit: "2mb" }));
 
-// ---- State ----
-let sock = null;
-let authState = null;
-let saveCreds = null;
-let connectionState = "close"; // "open" | "connecting" | "close"
-let pairCode = null;
-let pairAttemptId = null;
-let pairRequestedAt = null;
-let lastError = null;
+// In-memory map of phone -> { sock, state, lastCode, creds }
+const sessions = new Map();
 
-// ---- PUBLIC endpoints (no auth) — for Railway healthcheck & debug ----
+const log = pino({ level: "info" });
+
+// ---------- Public endpoints (NO auth) ----------
 app.get("/", (_req, res) => res.status(200).send("ok"));
 app.get("/health", (_req, res) => res.status(200).json({ ok: true }));
-app.get("/status", (_req, res) => {
-  res.status(200).json({
-    ok: true,
-    connectionState,
-    pairing: !!pairCode,
-    pairCode: pairCode || null,
-    pairCodeFormatted: pairCode ? `${pairCode.slice(0, 4)}-${pairCode.slice(4)}` : null,
-    pairAttemptId,
-    pairRequestedAt,
-    hasCreds: !!authState?.creds?.registered,
-    lastError,
-    uptime: process.uptime(),
-  });
+app.get("/status", (req, res) => {
+  const phone = (req.query.phone || "").toString();
+  if (phone) {
+    const s = sessions.get(normalizePhone(phone).phone);
+    return res.status(200).json({
+      ok: true,
+      phone,
+      hasSession: !!s,
+      connectionState: s?.state ?? "none",
+      lastCode: s?.lastCode ?? null,
+    });
+  }
+  const list = [...sessions.entries()].map(([p, s]) => ({
+    phone: p, state: s.state, hasCode: !!s.lastCode,
+  }));
+  return res.status(200).json({ ok: true, sessions: list });
 });
 
-// ---- API key guard for everything below ----
+// ---------- API key guard for everything below ----------
 app.use((req, res, next) => {
+  if (!API_KEY) {
+    return res.status(500).json({ ok: false, error: "server_missing_api_key" });
+  }
   const key = req.header("X-Api-Key");
-  if (!API_KEY || key !== API_KEY) {
+  if (key !== API_KEY) {
     return res.status(401).json({ ok: false, error: "unauthorized" });
   }
   next();
 });
 
-// ---- Socket lifecycle ----
-async function startSock() {
-  const { state, saveCreds: sc } = await useMultiFileAuthState(AUTH_DIR);
-  authState = state;
-  saveCreds = sc;
+// ---------- Helpers ----------
+function normalizePhone(raw) {
+  let p = (raw || "").toString().replace(/[^\d]/g, "");
+  if (p.startsWith("00")) p = p.slice(2);
+  if (p.startsWith("0")) p = "972" + p.slice(1); // Israeli local -> intl
+  return { phone: p, valid: p.length >= 10 && p.length <= 15 };
+}
 
+function formatCode(code) {
+  if (!code) return code;
+  const c = code.toString().replace(/\s|-/g, "");
+  return c.length === 8 ? `${c.slice(0, 4)}-${c.slice(4)}` : c;
+}
+
+function authPathFor(phone) {
+  return path.join(AUTH_DIR, phone);
+}
+
+async function startSocketForPairing(phone) {
+  const dir = authPathFor(phone);
+
+  // Wipe any old creds so Baileys generates a fresh pairing
+  try {
+    fs.rmSync(dir, { recursive: true, force: true });
+  } catch (e) {
+    log.warn({ err: e?.message }, "rm auth dir failed");
+  }
+  fs.mkdirSync(dir, { recursive: true });
+
+  const { state, saveCreds } = await useMultiFileAuthState(dir);
   const { version } = await fetchLatestBaileysVersion();
-  sock = makeWASocket({
+
+  const sock = makeWASocket({
     version,
     auth: state,
     printQRInTerminal: false,
-    logger,
     browser: Browsers.macOS("Safari"),
+    logger: pino({ level: "warn" }),
     syncFullHistory: false,
     markOnlineOnConnect: false,
   });
 
-  sock.ev.on("creds.update", saveCreds);
+  const session = { sock, state: "connecting", lastCode: null };
+  sessions.set(phone, session);
 
+  sock.ev.on("creds.update", saveCreds);
   sock.ev.on("connection.update", (u) => {
-    const { connection, lastDisconnect } = u;
-    if (connection) connectionState = connection;
-    if (connection === "open") {
-      pairCode = null;
-      pairAttemptId = null;
-      pairRequestedAt = null;
-      lastError = null;
-      logger.info("WA connection OPEN");
-    }
-    if (connection === "close") {
-      const code = lastDisconnect?.error?.output?.statusCode;
-      lastError = lastDisconnect?.error?.message || null;
-      logger.warn({ code, lastError }, "WA connection CLOSED");
-      const shouldReconnect = code !== DisconnectReason.loggedOut;
-      if (shouldReconnect) setTimeout(() => startSock().catch(() => {}), 2000);
+    log.info({ phone, u }, "connection.update");
+    if (u.connection) session.state = u.connection;
+    if (u.connection === "close") {
+      const code = u.lastDisconnect?.error?.output?.statusCode;
+      if (code === DisconnectReason.loggedOut) {
+        sessions.delete(phone);
+      }
     }
   });
+
+  return sock;
 }
 
-// ---- Routes (protected) ----
+// ---------- /pair ----------
 app.post("/pair", async (req, res) => {
+  let stage = "init";
   try {
-    const phone = String(req.body?.phone || "").replace(/\D/g, "");
-    if (!phone || phone.length < 10) {
-      return res.status(400).json({ ok: false, error: "invalid phone" });
-    }
-    if (!sock || connectionState === "close") await startSock();
-    if (authState?.creds?.registered) {
-      return res.status(409).json({ ok: false, error: "already registered" });
+    const { phone: rawPhone } = req.body || {};
+    stage = "validate";
+    const { phone, valid } = normalizePhone(rawPhone);
+    if (!valid) {
+      return res.status(400).json({ ok: false, stage, error: "invalid_phone", phone });
     }
 
-    pairAttemptId = Math.random().toString(36).slice(2, 10);
-    pairRequestedAt = new Date().toISOString();
+    // Already connected?
+    const existing = sessions.get(phone);
+    if (existing && existing.state === "open") {
+      return res.status(200).json({ ok: true, alreadyConnected: true, phone });
+    }
 
-    // Wait briefly for socket to be ready
-    await new Promise((r) => setTimeout(r, 1500));
+    stage = "start_socket";
+    const sock = await startSocketForPairing(phone);
 
-    const code = await sock.requestPairingCode(phone);
-    pairCode = String(code).replace(/\W/g, "");
-    res.json({
-      ok: true,
-      pairCode,
-      pairCodeFormatted: `${pairCode.slice(0, 4)}-${pairCode.slice(4)}`,
-      pairAttemptId,
+    // Wait one tick so authState is fully wired
+    await new Promise((r) => setTimeout(r, 500));
+
+    // If by some reason already registered, requestPairingCode throws
+    if (sock.authState?.creds?.registered) {
+      return res.status(200).json({ ok: true, alreadyConnected: true, phone });
+    }
+
+    stage = "request_code";
+    const rawCode = await sock.requestPairingCode(phone);
+    if (!rawCode) {
+      return res.status(500).json({ ok: false, stage, error: "no_code_returned", phone });
+    }
+    const code = formatCode(rawCode);
+    sessions.get(phone).lastCode = code;
+
+    log.info({ phone, code }, "pair code issued");
+    return res.status(200).json({ ok: true, phone, code });
+  } catch (err) {
+    log.error({ stage, err: err?.message, stack: err?.stack }, "pair failed");
+    return res.status(500).json({
+      ok: false,
+      stage,
+      error: err?.message || "unknown",
+      stack: (err?.stack || "").toString().slice(0, 500),
     });
-  } catch (e) {
-    lastError = e?.message || String(e);
-    res.status(500).json({ ok: false, error: lastError });
   }
 });
 
-app.post("/logout", async (_req, res) => {
-  try {
-    await sock?.logout();
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e?.message });
-  }
-});
-
+// ---------- /send ----------
 app.post("/send", async (req, res) => {
   try {
-    const { jid, text } = req.body || {};
-    if (!jid || !text) return res.status(400).json({ ok: false, error: "jid+text required" });
-    const msg = await sock.sendMessage(jid, { text: String(text) });
-    res.json({ ok: true, id: msg?.key?.id });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e?.message });
+    const { phone, to, text } = req.body || {};
+    const { phone: from } = normalizePhone(phone);
+    const s = sessions.get(from);
+    if (!s || s.state !== "open") {
+      return res.status(409).json({ ok: false, error: "not_connected", state: s?.state });
+    }
+    const jid = to.includes("@") ? to : `${normalizePhone(to).phone}@s.whatsapp.net`;
+    const m = await s.sock.sendMessage(jid, { text });
+    return res.status(200).json({ ok: true, id: m?.key?.id });
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: err?.message });
   }
 });
 
-app.get("/groups", async (_req, res) => {
+// ---------- /groups ----------
+app.get("/groups", async (req, res) => {
   try {
-    const groups = await sock.groupFetchAllParticipating();
-    res.json({
-      ok: true,
-      groups: Object.values(groups).map((g) => ({
-        id: g.id,
-        subject: g.subject,
-        size: g.participants?.length || 0,
-      })),
-    });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e?.message });
+    const { phone } = normalizePhone(req.query.phone || "");
+    const s = sessions.get(phone);
+    if (!s || s.state !== "open") {
+      return res.status(409).json({ ok: false, error: "not_connected", state: s?.state });
+    }
+    const groups = await s.sock.groupFetchAllParticipating();
+    return res.status(200).json({ ok: true, groups });
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: err?.message });
   }
 });
 
-// ---- Boot ----
-app.listen(PORT, () => {
-  logger.info(`Bridge listening on :${PORT}`);
-  startSock().catch((e) => {
-    lastError = e?.message;
-    logger.error(e, "startSock failed");
-  });
-});
+app.listen(PORT, () => log.info(`bridge listening on ${PORT}`));
