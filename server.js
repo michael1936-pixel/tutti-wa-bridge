@@ -6,12 +6,14 @@
 //   GET  /groups         -> [{ id, subject, size }]    (X-Api-Key required)
 //   POST /send           -> { jid, text }              (X-Api-Key required)
 //   POST /pair           -> { phone } -> { ok, code }  (X-Api-Key required)
+//   POST /reset          -> wipes auth dir, restarts socket (X-Api-Key required)
 //
 // Session is persisted to AUTH_DIR (mount a Railway Volume there).
 
 import express from 'express';
 import pino from 'pino';
 import QRCode from 'qrcode';
+import fs from 'fs/promises';
 import {
   default as makeWASocket,
   useMultiFileAuthState,
@@ -27,7 +29,7 @@ const logger = pino({ level: 'info' });
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 
-// CORS — allow the Lovable app + browser QR scanning
+// CORS
 app.use((_req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Api-Key');
@@ -39,85 +41,102 @@ let sock = null;
 let latestQR = null;
 let connected = false;
 let meUser = null;
-let usePairingCode = false; // when true, suppress QR output for the next session
+let starting = false;
+
+function isWsOpen() {
+  // Baileys uses a WebSocket internally; readyState === 1 means OPEN
+  const ws = sock?.ws;
+  if (!ws) return false;
+  if (typeof ws.readyState === 'number') return ws.readyState === 1;
+  if (typeof ws.socket?.readyState === 'number') return ws.socket.readyState === 1;
+  return false;
+}
 
 async function start() {
-  const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
-  const { version } = await fetchLatestBaileysVersion();
+  if (starting) {
+    logger.warn('start() called while already starting — skipping');
+    return;
+  }
+  starting = true;
+  try {
+    const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+    const { version } = await fetchLatestBaileysVersion();
 
-  sock = makeWASocket({
-    version,
-    auth: state,
-    printQRInTerminal: false,
-    logger: pino({ level: 'silent' }),
-    browser: ['Tutti Bridge', 'Chrome', '1.0.0'],
-  });
+    sock = makeWASocket({
+      version,
+      auth: state,
+      printQRInTerminal: false,
+      logger: pino({ level: 'silent' }),
+      browser: ['Tutti Bridge', 'Chrome', '1.0.0'],
+    });
 
-  sock.ev.on('creds.update', saveCreds);
+    sock.ev.on('creds.update', saveCreds);
 
-  // === Forward incoming private messages to Lovable ===
-  sock.ev.on('messages.upsert', async ({ messages }) => {
-    const WEBHOOK_URL = process.env.LOVABLE_WEBHOOK_URL;
-    const WEBHOOK_SECRET = process.env.LOVABLE_WEBHOOK_SECRET;
-    const STATION_ID = process.env.DEFAULT_STATION_ID;
-    if (!WEBHOOK_URL || !WEBHOOK_SECRET || !STATION_ID) return;
+    // === Forward incoming private messages to Lovable ===
+    sock.ev.on('messages.upsert', async ({ messages }) => {
+      const WEBHOOK_URL = process.env.LOVABLE_WEBHOOK_URL;
+      const WEBHOOK_SECRET = process.env.LOVABLE_WEBHOOK_SECRET;
+      const STATION_ID = process.env.DEFAULT_STATION_ID;
+      if (!WEBHOOK_URL || !WEBHOOK_SECRET || !STATION_ID) return;
 
-    for (const msg of messages || []) {
-      try {
-        if (!msg?.key || msg.key.fromMe) continue;
-        const jid = msg.key.remoteJid || '';
-        if (!jid || jid.endsWith('@g.us') || jid.endsWith('@broadcast')) continue;
+      for (const msg of messages || []) {
+        try {
+          if (!msg?.key || msg.key.fromMe) continue;
+          const jid = msg.key.remoteJid || '';
+          if (!jid || jid.endsWith('@g.us') || jid.endsWith('@broadcast')) continue;
 
-        const text =
-          msg.message?.conversation ||
-          msg.message?.extendedTextMessage?.text ||
-          msg.message?.imageMessage?.caption ||
-          '';
-        if (!text) continue;
+          const text =
+            msg.message?.conversation ||
+            msg.message?.extendedTextMessage?.text ||
+            msg.message?.imageMessage?.caption ||
+            '';
+          if (!text) continue;
 
-        const driverPhone = jid.split('@')[0].split(':')[0];
+          const driverPhone = jid.split('@')[0].split(':')[0];
 
-        const r = await fetch(WEBHOOK_URL, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'x-bridge-secret': WEBHOOK_SECRET,
-          },
-          body: JSON.stringify({
-            station_id: STATION_ID,
-            driver_phone: driverPhone,
-            text,
-            direction: 'incoming',
-          }),
-        });
-        logger.info({ status: r.status, driverPhone }, 'forwarded incoming msg');
-      } catch (e) {
-        logger.error({ err: String(e?.message || e) }, 'forward failed');
+          const r = await fetch(WEBHOOK_URL, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'x-bridge-secret': WEBHOOK_SECRET,
+            },
+            body: JSON.stringify({
+              station_id: STATION_ID,
+              driver_phone: driverPhone,
+              text,
+              direction: 'incoming',
+            }),
+          });
+          logger.info({ status: r.status, driverPhone }, 'forwarded incoming msg');
+        } catch (e) {
+          logger.error({ err: String(e?.message || e) }, 'forward failed');
+        }
       }
-    }
-  });
+    });
 
-  sock.ev.on('connection.update', async (update) => {
-    const { connection, lastDisconnect, qr } = update;
-    if (qr) {
-      latestQR = qr;
-      logger.info('QR generated — open /qr in browser');
-    }
-    if (connection === 'open') {
-      connected = true;
-      latestQR = null;
-      usePairingCode = false;
-      meUser = sock.user?.id || null;
-      logger.info({ user: meUser }, 'WhatsApp connected');
-    }
-    if (connection === 'close') {
-      connected = false;
-      const code = lastDisconnect?.error?.output?.statusCode;
-      const shouldReconnect = code !== DisconnectReason.loggedOut;
-      logger.warn({ code }, 'connection closed');
-      if (shouldReconnect) setTimeout(start, 2000);
-    }
-  });
+    sock.ev.on('connection.update', async (update) => {
+      const { connection, lastDisconnect, qr } = update;
+      if (qr) {
+        latestQR = qr;
+        logger.info('QR generated — open /qr in browser');
+      }
+      if (connection === 'open') {
+        connected = true;
+        latestQR = null;
+        meUser = sock.user?.id || null;
+        logger.info({ user: meUser }, 'WhatsApp connected');
+      }
+      if (connection === 'close') {
+        connected = false;
+        const code = lastDisconnect?.error?.output?.statusCode;
+        const shouldReconnect = code !== DisconnectReason.loggedOut;
+        logger.warn({ code }, 'connection closed');
+        if (shouldReconnect) setTimeout(() => start().catch(() => {}), 2000);
+      }
+    });
+  } finally {
+    starting = false;
+  }
 }
 
 start().catch((e) => logger.error(e, 'failed to start Baileys'));
@@ -137,6 +156,7 @@ app.get('/status', (_req, res) => {
     connected,
     hasQR: !!latestQR,
     user: meUser,
+    wsOpen: isWsOpen(),
     uptime: process.uptime(),
   });
 });
@@ -151,12 +171,13 @@ app.get('/qr.png', async (_req, res) => {
 app.get('/qr', (_req, res) => {
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
   res.send(`<!doctype html>
-<html lang="he" dir="rtl"><head><meta charset="utf-8"><title>WhatsApp QR</title>
-<meta http-equiv="refresh" content="5"></head>
-<body style="font-family:system-ui;text-align:center;padding:24px">
+<html lang="he" dir="rtl"><head><meta charset="utf-8"><title>חיבור WhatsApp ל-Tutti</title>
+<meta http-equiv="refresh" content="5">
+<style>body{font-family:system-ui;text-align:center;padding:24px}</style>
+</head><body>
 <h2>חיבור WhatsApp ל-Tutti</h2>
 <p>פתח/י WhatsApp → מכשירים מקושרים → קישור מכשיר, וסרק/י את הקוד.</p>
-<img src="/qr.png" alt="QR" style="max-width:320px"/>
+<img src="/qr.png?t=${Date.now()}" alt="QR" />
 <p>הדף מתרענן אוטומטית כל 5 שניות.</p>
 </body></html>`);
 });
@@ -191,21 +212,46 @@ app.post('/send', requireKey, async (req, res) => {
 // --- Pairing code (link via phone number, not QR) ---
 app.post('/pair', requireKey, async (req, res) => {
   try {
-    if (!sock) return res.status(503).json({ error: 'socket not initialized' });
-    if (connected || sock.user) {
-      return res.json({ ok: true, alreadyConnected: true });
-    }
-
     const raw = String(req.body?.phone || '').replace(/\D/g, '');
     if (!raw || raw.length < 10) {
       return res.status(400).json({ error: 'invalid phone (E.164 digits, no +)' });
     }
 
-    if (typeof sock.requestPairingCode !== 'function') {
-      return res.status(500).json({ error: 'pairing code not supported by this Baileys version' });
+    // Only treat as already-connected if WS is actually open
+    if (connected && isWsOpen()) {
+      return res.json({ ok: true, alreadyConnected: true });
     }
 
-    usePairingCode = true;
+    // Stale session: cached creds exist but socket isn't actually connected.
+    // Wipe auth and start fresh so requestPairingCode works.
+    if (!isWsOpen()) {
+      logger.warn('stale socket detected — resetting auth and restarting');
+      try { sock?.end?.(undefined); } catch {}
+      try { sock?.ws?.close?.(); } catch {}
+      sock = null;
+      connected = false;
+      meUser = null;
+      latestQR = null;
+      try {
+        await fs.rm(AUTH_DIR, { recursive: true, force: true });
+        await fs.mkdir(AUTH_DIR, { recursive: true });
+      } catch (e) {
+        logger.warn({ err: String(e?.message || e) }, 'auth dir reset issue');
+      }
+      await start();
+
+      // wait up to 10s for the new socket to be ready to issue a pairing code
+      const deadline = Date.now() + 10_000;
+      while (Date.now() < deadline) {
+        if (sock && typeof sock.requestPairingCode === 'function' && !sock.authState?.creds?.registered) break;
+        await new Promise((r) => setTimeout(r, 200));
+      }
+    }
+
+    if (!sock || typeof sock.requestPairingCode !== 'function') {
+      return res.status(503).json({ error: 'socket not ready for pairing' });
+    }
+
     const code = await sock.requestPairingCode(raw);
     const formatted = code && code.length === 8 ? `${code.slice(0, 4)}-${code.slice(4)}` : code;
     logger.info({ phone: raw }, 'issued pairing code');
@@ -213,6 +259,24 @@ app.post('/pair', requireKey, async (req, res) => {
   } catch (e) {
     logger.error({ err: String(e?.message || e) }, 'pair failed');
     return res.status(500).json({ error: String(e?.message || e) || 'pair failed' });
+  }
+});
+
+// --- Manual reset (wipe auth + restart) ---
+app.post('/reset', requireKey, async (_req, res) => {
+  try {
+    try { sock?.end?.(undefined); } catch {}
+    try { sock?.ws?.close?.(); } catch {}
+    sock = null;
+    connected = false;
+    meUser = null;
+    latestQR = null;
+    await fs.rm(AUTH_DIR, { recursive: true, force: true });
+    await fs.mkdir(AUTH_DIR, { recursive: true });
+    await start();
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: String(e?.message || e) });
   }
 });
 
