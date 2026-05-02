@@ -1,12 +1,11 @@
-// Tutti WhatsApp Bridge — Railway edition (pairing-fixed)
-// Endpoints:
-//   GET  /status   -> { connected, hasQR, wsOpen, connectionState, pairing, lastPairError, user }
-//   GET  /qr       -> HTML page (auto-refresh QR)
-//   GET  /qr.png   -> raw QR image
-//   GET  /groups   -> [{ id, subject, size }]                (X-Api-Key)
-//   POST /send     -> { jid, text }                          (X-Api-Key)
-//   POST /pair     -> { phone } -> { ok, code | alreadyConnected } (X-Api-Key)
-//   POST /reset    -> wipes auth dir, restarts socket        (X-Api-Key)
+// Tutti WhatsApp Bridge — Railway edition (pairing v3 — split QR / pair-code paths)
+// GET  /status -> diagnostics
+// GET  /qr     -> HTML auto-refresh QR (only when in QR mode)
+// GET  /qr.png -> raw QR image
+// GET  /groups -> list groups (X-Api-Key)
+// POST /send   -> { jid, text } (X-Api-Key)
+// POST /pair   -> { phone } -> { ok, code } (X-Api-Key)
+// POST /reset  -> wipe + restart (X-Api-Key)
 
 import express from 'express';
 import pino from 'pino';
@@ -15,8 +14,10 @@ import fs from 'fs/promises';
 import {
   default as makeWASocket,
   useMultiFileAuthState,
+  makeCacheableSignalKeyStore,
   DisconnectReason,
   fetchLatestBaileysVersion,
+  Browsers,
 } from '@whiskeysockets/baileys';
 
 const PORT = process.env.PORT || 3001;
@@ -39,9 +40,18 @@ let latestQR = null;
 let connected = false;
 let meUser = null;
 let starting = false;
-let pairingInProgress = false;     // when true, suppress auto-restart
-let connectionState = 'idle';       // 'idle' | 'connecting' | 'open' | 'close'
+
+let mode = 'qr';                  // 'qr' | 'pair'
+let pairingInProgress = false;
+let connectionState = 'idle';     // 'idle' | 'connecting' | 'open' | 'close'
+let credsRegistered = false;
 let lastPairError = null;
+let lastDisconnectCode = null;
+let pairStartedAt = null;
+let pairCodeIssuedAt = null;
+let currentSockId = 0;            // monotonically increasing — used to ignore stale events
+
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 function isWsOpen() {
   const ws = sock?.ws;
@@ -51,53 +61,68 @@ function isWsOpen() {
   return false;
 }
 
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+async function killSocket() {
+  try { sock?.ev?.removeAllListeners?.(); } catch {}
+  try { sock?.end?.(undefined); } catch {}
+  try { sock?.ws?.close?.(); } catch {}
+  sock = null;
+  latestQR = null;
+  connected = false;
+  meUser = null;
+  connectionState = 'idle';
+  credsRegistered = false;
+}
 
-async function start() {
+async function start({ pairMode = false } = {}) {
   if (starting) { logger.warn('start() already running'); return; }
   starting = true;
+  mode = pairMode ? 'pair' : 'qr';
+  const myId = ++currentSockId;
   try {
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
     const { version } = await fetchLatestBaileysVersion();
 
+    credsRegistered = !!state?.creds?.registered;
+
     sock = makeWASocket({
       version,
-      auth: state,
-      printQRInTerminal: false,
       logger: pino({ level: 'silent' }),
-      browser: ['Tutti Bridge', 'Chrome', '1.0.0'],
-      // Important for pairing-code flow: don't fire QR events
-      // (Baileys will still emit 'connecting' which we wait for)
+      printQRInTerminal: false,
+      auth: {
+        creds: state.creds,
+        keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'silent' })),
+      },
+      browser: Browsers.macOS('Google Chrome'), // Baileys default that works for pairing
+      connectTimeoutMs: 60_000,
+      defaultQueryTimeoutMs: 60_000,
+      emitOwnEvents: true,
+      markOnlineOnConnect: true,
+      syncFullHistory: false,
     });
 
     sock.ev.on('creds.update', saveCreds);
 
-    // Forward incoming private messages to Lovable
     sock.ev.on('messages.upsert', async ({ messages }) => {
       const WEBHOOK_URL = process.env.LOVABLE_WEBHOOK_URL;
       const WEBHOOK_SECRET = process.env.LOVABLE_WEBHOOK_SECRET;
       const STATION_ID = process.env.DEFAULT_STATION_ID;
       if (!WEBHOOK_URL || !WEBHOOK_SECRET || !STATION_ID) return;
-
       for (const msg of messages || []) {
         try {
           if (!msg?.key || msg.key.fromMe) continue;
           const jid = msg.key.remoteJid || '';
           if (!jid || jid.endsWith('@g.us') || jid.endsWith('@broadcast')) continue;
-
           const text =
             msg.message?.conversation ||
             msg.message?.extendedTextMessage?.text ||
             msg.message?.imageMessage?.caption || '';
           if (!text) continue;
-
           const driverPhone = jid.split('@')[0].split(':')[0];
-          const r = await fetch(WEBHOOK_URL, {
+          await fetch(WEBHOOK_URL, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'x-bridge-secret': WEBHOOK_SECRET },
             body: JSON.stringify({ station_id: STATION_ID, driver_phone: driverPhone, text, direction: 'incoming' }),
           });
-          logger.info({ status: r.status, driverPhone }, 'forwarded incoming msg');
         } catch (e) {
           logger.error({ err: String(e?.message || e) }, 'forward failed');
         }
@@ -105,27 +130,32 @@ async function start() {
     });
 
     sock.ev.on('connection.update', async (update) => {
+      if (myId !== currentSockId) return; // stale socket — ignore
       const { connection, lastDisconnect, qr } = update;
       if (connection) connectionState = connection;
-      if (qr) {
+
+      // In pair mode we MUST NOT serve a QR
+      if (qr && mode !== 'pair') {
         latestQR = qr;
-        logger.info('QR generated');
       }
+
       if (connection === 'open') {
         connected = true;
         latestQR = null;
         pairingInProgress = false;
-        meUser = sock.user?.id || null;
+        credsRegistered = true;
+        meUser = sock?.user?.id || null;
         logger.info({ user: meUser }, 'WhatsApp connected');
       }
       if (connection === 'close') {
         connected = false;
         const code = lastDisconnect?.error?.output?.statusCode;
+        lastDisconnectCode = code ?? null;
+        logger.warn({ code, mode, pairingInProgress }, 'connection closed');
         const shouldReconnect = code !== DisconnectReason.loggedOut;
-        logger.warn({ code, pairingInProgress }, 'connection closed');
-        // Don't fight a pairing flow with auto-restart
+        // Don't auto-restart while user is typing a pairing code
         if (shouldReconnect && !pairingInProgress) {
-          setTimeout(() => start().catch(() => {}), 2000);
+          setTimeout(() => start({ pairMode: false }).catch(() => {}), 2000);
         }
       }
     });
@@ -134,7 +164,7 @@ async function start() {
   }
 }
 
-start().catch((e) => logger.error(e, 'failed to start Baileys'));
+start({ pairMode: false }).catch((e) => logger.error(e, 'failed to start Baileys'));
 
 function requireKey(req, res, next) {
   if (!API_KEY) return res.status(500).json({ error: 'API_KEY not configured' });
@@ -144,9 +174,19 @@ function requireKey(req, res, next) {
 
 app.get('/status', (_req, res) => {
   res.json({
-    connected, hasQR: !!latestQR, wsOpen: isWsOpen(),
-    connectionState, pairing: pairingInProgress,
-    lastPairError, user: meUser, uptime: process.uptime(),
+    connected,
+    hasQR: !!latestQR,
+    wsOpen: isWsOpen(),
+    connectionState,
+    mode,
+    pairing: pairingInProgress,
+    credsRegistered,
+    lastPairError,
+    lastDisconnectCode,
+    pairStartedAt,
+    pairCodeIssuedAt,
+    user: meUser,
+    uptime: process.uptime(),
   });
 });
 
@@ -184,7 +224,6 @@ app.post('/send', requireKey, async (req, res) => {
   } catch (e) { res.status(500).json({ error: String(e?.message || e) }); }
 });
 
-// --- Pairing code ---
 app.post('/pair', requireKey, async (req, res) => {
   try {
     const raw = String(req.body?.phone || '').replace(/\D/g, '');
@@ -196,16 +235,11 @@ app.post('/pair', requireKey, async (req, res) => {
 
     pairingInProgress = true;
     lastPairError = null;
+    pairStartedAt = new Date().toISOString();
+    pairCodeIssuedAt = null;
 
-    // Always start fresh: close current socket, wipe auth, start new one
-    try { sock?.end?.(undefined); } catch {}
-    try { sock?.ws?.close?.(); } catch {}
-    sock = null;
-    connected = false;
-    meUser = null;
-    latestQR = null;
-    connectionState = 'idle';
-
+    // Hard reset: kill socket + wipe creds, then start FRESH in pair-mode
+    await killSocket();
     try {
       await fs.rm(AUTH_DIR, { recursive: true, force: true });
       await fs.mkdir(AUTH_DIR, { recursive: true });
@@ -213,15 +247,17 @@ app.post('/pair', requireKey, async (req, res) => {
       logger.warn({ err: String(e?.message || e) }, 'auth dir reset issue');
     }
 
-    await start();
+    await start({ pairMode: true });
 
-    // CRITICAL: wait until socket is in 'connecting' state (or QR fired) before requesting code.
-    // Per Baileys docs, requestPairingCode must be called after the socket starts connecting.
-    const deadline = Date.now() + 20_000;
+    // Wait for THIS socket to reach 'connecting' — per Baileys docs it must be called then.
+    const myId = currentSockId;
+    const deadline = Date.now() + 25_000;
     while (Date.now() < deadline) {
-      if (sock && (connectionState === 'connecting' || latestQR) &&
+      if (myId === currentSockId &&
+          sock &&
           typeof sock.requestPairingCode === 'function' &&
-          !sock.authState?.creds?.registered) {
+          !sock.authState?.creds?.registered &&
+          (connectionState === 'connecting' || isWsOpen())) {
         break;
       }
       await sleep(150);
@@ -233,15 +269,14 @@ app.post('/pair', requireKey, async (req, res) => {
       return res.status(503).json({ error: 'socket not ready for pairing' });
     }
 
-    // Small extra grace so the WS handshake fully completes
-    await sleep(500);
+    // Extra grace so the WS handshake fully completes
+    await sleep(800);
 
     const code = await sock.requestPairingCode(raw);
-    const formatted = code && code.length === 8 ? `${code.slice(0, 4)}-${code.slice(4)}` : code;
-    logger.info({ phone: raw, code: formatted }, 'issued pairing code');
-    // Keep pairingInProgress=true so auto-restart doesn't kill the socket
-    // before the user types the code. It's cleared on 'open'.
-    return res.json({ ok: true, code: formatted });
+    pairCodeIssuedAt = new Date().toISOString();
+    logger.info({ phone: raw, code }, 'issued pairing code');
+    // pairingInProgress stays true until 'open' fires — prevents auto-restart from killing the link.
+    return res.json({ ok: true, code, codeFormatted: code?.length === 8 ? `${code.slice(0,4)}-${code.slice(4)}` : code });
   } catch (e) {
     pairingInProgress = false;
     lastPairError = String(e?.message || e);
@@ -253,12 +288,10 @@ app.post('/pair', requireKey, async (req, res) => {
 app.post('/reset', requireKey, async (_req, res) => {
   try {
     pairingInProgress = false;
-    try { sock?.end?.(undefined); } catch {}
-    try { sock?.ws?.close?.(); } catch {}
-    sock = null; connected = false; meUser = null; latestQR = null; connectionState = 'idle';
+    await killSocket();
     await fs.rm(AUTH_DIR, { recursive: true, force: true });
     await fs.mkdir(AUTH_DIR, { recursive: true });
-    await start();
+    await start({ pairMode: false });
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: String(e?.message || e) }); }
 });
