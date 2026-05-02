@@ -2,7 +2,6 @@
 import express from "express";
 import bodyParser from "body-parser";
 import fs from "fs";
-import path from "path";
 import pino from "pino";
 import {
   default as makeWASocket,
@@ -15,18 +14,24 @@ import {
 const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.API_KEY || "";
 const AUTH_DIR = process.env.AUTH_DIR || "./auth";
-const WEBHOOK_URL = process.env.WEBHOOK_URL || "";
-const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "";
 
 const logger = pino({ level: "warn" });
+const startedAt = Date.now();
+
 const app = express();
 app.use(bodyParser.json({ limit: "1mb" }));
+
+// --- public health endpoints (no auth) for Railway healthcheck ---
+app.get("/", (_req, res) => res.status(200).send("ok"));
+app.get("/health", (_req, res) =>
+  res.status(200).json({ ok: true, uptime: (Date.now() - startedAt) / 1000 })
+);
 
 // ---------- shared state ----------
 let sock = null;
 let currentSockId = 0;
 let mode = "qr"; // 'qr' | 'pair'
-let connectionState = "close"; // 'open' | 'connecting' | 'close'
+let connectionState = "close";
 let lastQR = null;
 let lastQRAt = null;
 let lastDisconnectCode = null;
@@ -40,9 +45,11 @@ let pairRequestedForSockId = -1;
 let lastPairError = null;
 let credsRegistered = false;
 let connectedUser = null;
-let startedAt = Date.now();
 
-// ---------- auth helpers ----------
+let pendingPairPhone = null;
+let pairResolver = null;
+
+// ---------- helpers ----------
 function wipeAuthDir() {
   try {
     if (fs.existsSync(AUTH_DIR)) fs.rmSync(AUTH_DIR, { recursive: true, force: true });
@@ -94,8 +101,7 @@ async function startSocket(nextMode /* 'qr' | 'pair' */) {
     connectTimeoutMs: 60_000,
     defaultQueryTimeoutMs: 60_000,
     emitOwnEvents: false,
-    // IMPORTANT: do NOT set `browser`. Custom browser profiles are a known cause
-    // of "invalid pairing code" with Baileys 6.7.x. Let Baileys use its default.
+    // No `browser` override — known cause of "invalid pairing code" in 6.7.x.
     auth: {
       creds: state.creds,
       keys: makeCacheableSignalKeyStore(state.keys, logger),
@@ -111,10 +117,9 @@ async function startSocket(nextMode /* 'qr' | 'pair' */) {
   });
 
   s.ev.on("connection.update", async (update) => {
-    if (sockId !== currentSockId) return; // stale event from killed socket
+    if (sockId !== currentSockId) return; // stale event
     lastConnectionUpdate = { ...update, at: new Date().toISOString() };
     const { connection, lastDisconnect, qr } = update;
-
     if (connection) connectionState = connection;
 
     if (qr) {
@@ -122,13 +127,10 @@ async function startSocket(nextMode /* 'qr' | 'pair' */) {
         lastQR = qr;
         lastQRAt = new Date().toISOString();
       } else {
-        // suppress QR completely in pair mode
-        lastQR = null;
+        lastQR = null; // suppress in pair mode
       }
     }
 
-    // Request pairing code as soon as the socket reaches "connecting"
-    // and we haven't already requested one for this socket instance.
     if (
       mode === "pair" &&
       connection === "connecting" &&
@@ -138,14 +140,13 @@ async function startSocket(nextMode /* 'qr' | 'pair' */) {
     ) {
       pairRequestedForSockId = sockId;
       try {
-        // small delay so handshake settles
         await new Promise((r) => setTimeout(r, 1500));
-        const raw = pendingPairPhone;
-        const code = await s.requestPairingCode(raw);
+        const code = await s.requestPairingCode(pendingPairPhone);
         pairCode = code.replace(/-/g, "");
-        pairCodeFormatted = pairCode.length === 8
-          ? `${pairCode.slice(0, 4)}-${pairCode.slice(4)}`
-          : code;
+        pairCodeFormatted =
+          pairCode.length === 8
+            ? `${pairCode.slice(0, 4)}-${pairCode.slice(4)}`
+            : code;
         pairCodeIssuedAt = new Date().toISOString();
         if (pairResolver) {
           pairResolver({ ok: true, code: pairCode, codeFormatted: pairCodeFormatted });
@@ -169,33 +170,25 @@ async function startSocket(nextMode /* 'qr' | 'pair' */) {
       const code = lastDisconnect?.error?.output?.statusCode;
       lastDisconnectCode = code ?? null;
 
-      // While we are mid-pairing, do NOT auto-reconnect — a second socket
-      // would invalidate the just-issued pairing code.
+      // While pairing, do NOT auto-reconnect — a second socket invalidates the code.
       if (mode === "pair" && pairing) return;
 
       const loggedOut = code === DisconnectReason.loggedOut;
       if (!loggedOut) {
-        // simple back-off reconnect in qr mode
         setTimeout(() => startSocket("qr").catch(console.error), 2000);
       }
     }
   });
 }
 
-// ---------- /pair flow ----------
-let pendingPairPhone = null;
-let pairResolver = null;
-
 async function startPair(phone) {
   pendingPairPhone = phone;
-  // fresh session — pairing requires unregistered creds
   await killSocket();
   wipeAuthDir();
   await startSocket("pair");
 
   return await new Promise((resolve) => {
     pairResolver = resolve;
-    // safety timeout
     setTimeout(() => {
       if (pairResolver) {
         pairResolver({ ok: false, error: "pair timeout" });
