@@ -134,7 +134,7 @@ app.get('/health', (_req, res) => {
   res.json({ ok: true, sessions: sessions.size, ts: Date.now() });
 });
 
-app.get('/status', requireKey, (_req, res) => {
+app.get('/status', (_req, res) => {
   const list = [];
   for (const [phone, s] of sessions.entries()) {
     list.push({ phone, status: s.status, lastError: s.lastError });
