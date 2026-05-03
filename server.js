@@ -1,11 +1,5 @@
-// WhatsApp Multi-Session Bridge for Lovable
+// WhatsApp Multi-Session Bridge
 // Each "session" is a phone number (e.g. "972501234567") with its own auth folder.
-//
-// ENV:
-//   PORT              (default 3000)
-//   API_KEY           shared secret, must match WHATSAPP_VPS_API_KEY in Lovable
-//   AUTH_DIR          base dir for auth folders (default ./auth)
-//   DEFAULT_SESSION   optional fallback session id when request omits ?session=
 
 import express from 'express';
 import pino from 'pino';
@@ -22,25 +16,22 @@ import path from 'path';
 import fs from 'fs';
 
 const PORT = Number(process.env.PORT || 3000);
-const API_KEY = process.env.API_KEY || '';
+// תומך בשני שמות — תאימות לאחור גם אם ה-secret נקרא BRIDGE_API_KEY וגם API_KEY
+const API_KEY = process.env.BRIDGE_API_KEY || process.env.API_KEY || '';
 const AUTH_DIR = process.env.AUTH_DIR || path.resolve('./auth');
-const DEFAULT_SESSION = process.env.DEFAULT_SESSION || '';
 const logger = pino({ level: 'info' });
 
 if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
 
-// sessionId -> { sock, status, qr, lastError, startedAt }
 const sessions = new Map();
 
 function sanitizeSession(s) {
-  const v = String(s || '').replace(/[^0-9a-zA-Z_-]/g, '');
-  return v.slice(0, 32);
+  return String(s || '').replace(/[^0-9a-zA-Z_-]/g, '').slice(0, 32);
 }
 
 function pickSession(req) {
-  const raw = req.query.session || req.body?.session || DEFAULT_SESSION;
-  const id = sanitizeSession(raw);
-  return id || null;
+  const raw = req.query.session || req.body?.session || '';
+  return sanitizeSession(raw) || null;
 }
 
 async function getOrCreateSession(sessionId) {
@@ -112,22 +103,28 @@ async function getOrCreateSession(sessionId) {
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 
+// אימות API key
 app.use((req, res, next) => {
   if (req.method === 'OPTIONS') return res.sendStatus(200);
-  if (!API_KEY) return next();
+  if (req.path === '/status' && req.method === 'GET' && req.query.health === '1') return next();
+  if (!API_KEY) return res.status(500).json({ ok: false, error: 'API_KEY (or BRIDGE_API_KEY) is not configured on Railway' });
   const k = req.header('X-Api-Key');
-  if (k !== API_KEY) return res.status(401).json({ error: 'unauthorized' });
+  if (k !== API_KEY) return res.status(401).json({ ok: false, error: 'unauthorized' });
   next();
 });
 
+// Healthcheck (ללא auth) — Railway צריך את זה
 app.get('/health', (_req, res) => {
   res.json({ ok: true, sessions: Array.from(sessions.keys()) });
 });
 
-// GET /status?session=972...
+// GET /status?session=972...   (Railway healthcheck גם משתמש בזה)
 app.get('/status', async (req, res) => {
   const sessionId = pickSession(req);
-  if (!sessionId) return res.status(400).json({ ok: false, error: 'session required' });
+  if (!sessionId) {
+    // ללא session — מחזיר OK כללי כדי שה-healthcheck של Railway יעבור
+    return res.json({ ok: true, reachable: true, sessions: Array.from(sessions.keys()) });
+  }
   try {
     const s = await getOrCreateSession(sessionId);
     res.json({
@@ -144,7 +141,7 @@ app.get('/status', async (req, res) => {
   }
 });
 
-// POST /pair  { phone, session }
+// POST /pair  { phone, session }  — מחזיר קוד 8 ספרות
 app.post('/pair', async (req, res) => {
   const sessionId = pickSession(req);
   const phone = String(req.body?.phone || '').replace(/\D/g, '');
@@ -176,7 +173,7 @@ app.post('/send', async (req, res) => {
   if (!jid || !text) return res.status(400).json({ ok: false, error: 'jid+text required' });
   const s = sessions.get(sessionId);
   if (!s || s.status !== 'connected') {
-    return res.status(409).json({ ok: false, error: `session ${sessionId} not connected (${s?.status || 'none'})` });
+    return res.status(503).json({ ok: false, error: `session ${sessionId} not connected (${s?.status || 'none'})` });
   }
   try {
     const r = await s.sock.sendMessage(jid, { text });
@@ -192,7 +189,7 @@ app.get('/groups', async (req, res) => {
   if (!sessionId) return res.status(400).json({ ok: false, error: 'session required' });
   const s = sessions.get(sessionId);
   if (!s || s.status !== 'connected') {
-    return res.status(409).json({ ok: false, error: 'session not connected' });
+    return res.status(503).json({ ok: false, error: 'session not connected' });
   }
   try {
     const all = await s.sock.groupFetchAllParticipating();
@@ -219,6 +216,7 @@ app.delete('/session/:id', async (req, res) => {
   res.json({ ok: true });
 });
 
+// Auto-restore כל ה-sessions הקיימים בעת הפעלה
 async function restoreAll() {
   const dirs = fs.readdirSync(AUTH_DIR, { withFileTypes: true })
     .filter((d) => d.isDirectory())
@@ -228,10 +226,10 @@ async function restoreAll() {
       logger.error({ err: e, sessionId: d }, 'restore failed'),
     );
   }
-  logger.info({ count: dirs.length }, 'sessions restoring');
+  logger.info({ count: dirs.length, sessions: dirs }, 'sessions restoring');
 }
 
 app.listen(PORT, async () => {
-  logger.info({ PORT, AUTH_DIR }, 'bridge listening');
+  logger.info({ PORT, AUTH_DIR, hasApiKey: !!API_KEY }, 'bridge listening');
   await restoreAll();
 });
