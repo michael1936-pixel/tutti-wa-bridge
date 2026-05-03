@@ -111,11 +111,21 @@ app.get('/session/:id/qr', requireApiKey, (req, res) => {
   res.json({ status: s.status, qr: s.qr });
 });
 
+// ✅ /send — מקבל גם { sessionId, jid, message } וגם { session, jid, text }
 app.post('/send', requireApiKey, async (req, res) => {
-  const { sessionId, jid, message } = req.body || {};
+  const body = req.body || {};
+  const sessionId = body.sessionId || body.session;
+  const jid = body.jid || body.to;
+  const message = body.message ?? body.text;
+
   if (!sessionId || !jid || !message) {
-    return res.status(400).json({ error: 'missing sessionId/jid/message' });
+    return res.status(400).json({
+      error: 'missing fields',
+      required: 'sessionId|session, jid|to, message|text',
+      received: Object.keys(body),
+    });
   }
+
   try {
     if (!sessions[sessionId]?.sock) await startSession(sessionId);
     const sock = sessions[sessionId]?.sock;
