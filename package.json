@@ -1,9 +1,7 @@
 {
-  "name": "whatsapp-railway-bridge",
+  "name": "whatsapp-bridge",
   "version": "1.0.0",
   "private": true,
-  "type": "module",
-  "description": "WhatsApp Baileys bridge for Lovable Cloud",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
@@ -12,10 +10,8 @@
     "node": ">=20"
   },
   "dependencies": {
-    "@hapi/boom": "10.0.1",
-    "@whiskeysockets/baileys": "6.7.18",
-    "cors": "2.8.5",
-    "express": "4.19.2",
-    "pino": "9.4.0"
+    "@whiskeysockets/baileys": "^6.7.18",
+    "express": "^4.19.2",
+    "pino": "^8.20.0"
   }
 }
