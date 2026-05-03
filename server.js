@@ -103,17 +103,18 @@ async function getOrCreateSession(sessionId) {
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 
-// אימות API key
+// אימות API key — חוץ מ-/status ו-/health (ש-Railway healthcheck משתמש בהם)
 app.use((req, res, next) => {
   if (req.method === 'OPTIONS') return res.sendStatus(200);
-  if (req.path === '/status' && req.method === 'GET' && req.query.health === '1') return next();
+  if (req.path === '/status' && req.method === 'GET') return next();
+  if (req.path === '/health') return next();
   if (!API_KEY) return res.status(500).json({ ok: false, error: 'API_KEY (or BRIDGE_API_KEY) is not configured on Railway' });
   const k = req.header('X-Api-Key');
   if (k !== API_KEY) return res.status(401).json({ ok: false, error: 'unauthorized' });
   next();
 });
 
-// Healthcheck (ללא auth) — Railway צריך את זה
+// Healthcheck (ללא auth)
 app.get('/health', (_req, res) => {
   res.json({ ok: true, sessions: Array.from(sessions.keys()) });
 });
@@ -229,7 +230,7 @@ async function restoreAll() {
   logger.info({ count: dirs.length, sessions: dirs }, 'sessions restoring');
 }
 
-app.listen(PORT, async () => {
+app.listen(PORT, '0.0.0.0', async () => {
   logger.info({ PORT, AUTH_DIR, hasApiKey: !!API_KEY }, 'bridge listening');
   await restoreAll();
 });
