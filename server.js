@@ -1,17 +1,5 @@
 // =============================================================================
 // WhatsApp Baileys bridge — Railway server.js
-// Fixes "the pairing code is invalid" by:
-//   1. Pinning a known-good Baileys version + WA Web protocol version.
-//   2. Using a stock Chrome browser fingerprint (custom names get rejected).
-//   3. Waiting for the socket to become pairing-ready before requestPairingCode.
-//   4. Persisting auth in /data and never wiping it after generating the code.
-//   5. Exposing precise statuses + /logout, /reset, DELETE /session/:id.
-//
-// Env vars:
-//   API_KEY    — value Lovable Cloud sends in X-Api-Key (must match
-//                WHATSAPP_VPS_API_KEY in Lovable Cloud secrets)
-//   AUTH_DIR   — persistent dir, default "/data" (mount Railway Volume here)
-//   PORT       — provided by Railway
 // =============================================================================
 
 const express = require('express');
@@ -31,20 +19,10 @@ const {
 const PORT = Number(process.env.PORT || 3000);
 const API_KEY = process.env.API_KEY || '';
 const AUTH_ROOT = process.env.AUTH_DIR || '/data';
+const WEBHOOK_URL = process.env.WEBHOOK_URL || '';
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || '';
 
 const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
-
-// ---------------------------------------------------------------------------
-// Session manager
-// ---------------------------------------------------------------------------
-//
-// status values:
-//   not_started        — no live socket
-//   connecting         — socket created, waiting for pair-device readiness
-//   pairing_code_ready — code returned, waiting for user to enter it
-//   connected          — paired with WhatsApp
-//   logged_out         — WA forced us out (loggedOut / 401)
-//   failed             — terminal error before pairing succeeded
 
 const sessions = new Map();
 
@@ -56,15 +34,9 @@ function ensureSession(phone) {
   let s = sessions.get(phone);
   if (!s) {
     s = {
-      phone,
-      status: 'not_started',
-      lastError: null,
-      pairingCode: null,
-      codeExpiresAt: null,
-      sock: null,
-      pairingReady: false,
-      pairingPromise: null,
-      lastUpdate: Date.now(),
+      phone, status: 'not_started', lastError: null,
+      pairingCode: null, codeExpiresAt: null, sock: null,
+      pairingReady: false, pairingPromise: null, lastUpdate: Date.now(),
     };
     sessions.set(phone, s);
   }
@@ -105,7 +77,6 @@ async function createSocket(phone, { forceReset } = {}) {
 
   const { state, saveCreds } = await useMultiFileAuthState(dir);
   const { version } = await fetchLatestBaileysVersion().catch(() => ({
-    // Fallback to a known-good WA Web version. Bump if WA forces an upgrade.
     version: [2, 3000, 1033893291],
   }));
 
@@ -113,7 +84,6 @@ async function createSocket(phone, { forceReset } = {}) {
     version,
     logger: logger.child({ scope: 'baileys', phone }),
     printQRInTerminal: false,
-    // Stock browser fingerprint — custom names get rejected by WA.
     browser: Browsers.macOS('Chrome'),
     auth: {
       creds: state.creds,
@@ -134,12 +104,55 @@ async function createSocket(phone, { forceReset } = {}) {
 
   sock.ev.on('creds.update', saveCreds);
 
+  // ----- Forward INCOMING 1:1 driver messages to Lovable Cloud webhook -----
+  sock.ev.on('messages.upsert', async (ev) => {
+    if (!WEBHOOK_URL) return;
+    if (ev.type !== 'notify') return;
+    for (const m of ev.messages || []) {
+      try {
+        if (!m?.message) continue;
+        if (m.key?.fromMe) continue;
+        const jid = m.key?.remoteJid || '';
+        if (!jid || jid.endsWith('@g.us') || jid.endsWith('@broadcast')) continue;
+        const msg = m.message;
+        const text =
+          msg.conversation ||
+          msg.extendedTextMessage?.text ||
+          msg.imageMessage?.caption ||
+          msg.videoMessage?.caption ||
+          '';
+        if (!text || !String(text).trim()) continue;
+
+        const driverPhone = jid.split('@')[0].split(':')[0];
+        const payload = {
+          station_phone: phone,
+          driver_phone: driverPhone,
+          text: String(text),
+          wa_message_id: m.key?.id || null,
+          direction: 'incoming',
+        };
+        try {
+          await fetch(WEBHOOK_URL, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              ...(WEBHOOK_SECRET ? { 'x-bridge-secret': WEBHOOK_SECRET } : {}),
+            },
+            body: JSON.stringify(payload),
+          });
+        } catch (err) {
+          logger.error({ phone, err: err?.message }, 'webhook forward failed');
+        }
+      } catch (err) {
+        logger.error({ phone, err: err?.message }, 'messages.upsert handler error');
+      }
+    }
+  });
+
   sock.ev.on('connection.update', async (u) => {
     const { connection, lastDisconnect, isNewLogin, qr } = u;
 
-    if (connection === 'connecting') {
-      s.pairingReady = true;
-    }
+    if (connection === 'connecting') s.pairingReady = true;
 
     if (connection === 'open' || isNewLogin) {
       setStatus(s, 'connected', { lastError: null, pairingCode: null });
@@ -158,13 +171,10 @@ async function createSocket(phone, { forceReset } = {}) {
       } else {
         setStatus(s, 'failed', { lastError: `${code ?? '?'}: ${msg}` });
       }
-
       s.pairingReady = false;
     }
 
-    if (qr) {
-      logger.warn({ phone }, 'unexpected QR fallback during pair flow');
-    }
+    if (qr) logger.warn({ phone }, 'unexpected QR fallback during pair flow');
   });
 
   return s;
@@ -172,20 +182,16 @@ async function createSocket(phone, { forceReset } = {}) {
 
 async function pair(phone, { forceReset } = {}) {
   const s = ensureSession(phone);
-
   if (s.pairingPromise) return s.pairingPromise;
 
   s.pairingPromise = (async () => {
-    if (!s.sock || forceReset) {
-      await createSocket(phone, { forceReset });
-    }
+    if (!s.sock || forceReset) await createSocket(phone, { forceReset });
 
     if (s.sock?.authState?.creds?.registered) {
       setStatus(s, 'connected');
       return { alreadyConnected: true, status: 'connected' };
     }
 
-    // Wait up to 15s for the socket to become pairing-ready.
     const deadline = Date.now() + 15_000;
     while (!s.pairingReady && Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 200));
@@ -200,28 +206,15 @@ async function pair(phone, { forceReset } = {}) {
 
     const expiresAt = new Date(Date.now() + 3 * 60_000).toISOString();
     setStatus(s, 'pairing_code_ready', {
-      pairingCode: code,
-      codeExpiresAt: expiresAt,
-      lastError: null,
+      pairingCode: code, codeExpiresAt: expiresAt, lastError: null,
     });
 
-    return {
-      pairingCode: code,
-      codeExpiresAt: expiresAt,
-      status: 'pairing_code_ready',
-    };
+    return { pairingCode: code, codeExpiresAt: expiresAt, status: 'pairing_code_ready' };
   })();
 
-  try {
-    return await s.pairingPromise;
-  } finally {
-    s.pairingPromise = null;
-  }
+  try { return await s.pairingPromise; }
+  finally { s.pairingPromise = null; }
 }
-
-// ---------------------------------------------------------------------------
-// HTTP layer
-// ---------------------------------------------------------------------------
 
 const app = express();
 app.use(express.json({ limit: '256kb' }));
@@ -249,18 +242,13 @@ app.get('/status/:phone', (req, res) => {
   const s = sessions.get(req.params.phone);
   if (!s) return res.json({ status: 'not_started', phone: req.params.phone });
   res.json({
-    phone: s.phone,
-    status: s.status,
-    lastError: s.lastError,
-    codeExpiresAt: s.codeExpiresAt,
-    lastUpdate: s.lastUpdate,
+    phone: s.phone, status: s.status, lastError: s.lastError,
+    codeExpiresAt: s.codeExpiresAt, lastUpdate: s.lastUpdate,
   });
 });
 
 app.post('/pair', async (req, res) => {
-  const phone = String(
-    req.body?.phone || req.body?.session || req.body?.phoneNumber || ''
-  ).replace(/\D/g, '');
+  const phone = String(req.body?.phone || req.body?.session || req.body?.phoneNumber || '').replace(/\D/g, '');
   const forceReset = !!req.body?.forceReset;
   if (!phone) return res.status(400).json({ error: 'phone required' });
   try {
@@ -273,9 +261,7 @@ app.post('/pair', async (req, res) => {
 });
 
 async function logoutHandler(req, res) {
-  const phone = String(
-    req.params.phone || req.query.session || req.body?.session || ''
-  ).replace(/\D/g, '');
+  const phone = String(req.params.phone || req.query.session || req.body?.session || '').replace(/\D/g, '');
   if (!phone) return res.status(400).json({ error: 'phone required' });
   const s = sessions.get(phone);
   if (s) {
@@ -295,15 +281,10 @@ app.post('/reset', logoutHandler);
 app.post('/send', async (req, res) => {
   const { jid, text, session } = req.body || {};
   const phone = String(session || '').replace(/\D/g, '');
-  if (!phone || !jid || !text) {
-    return res.status(400).json({ error: 'jid, text, session required' });
-  }
+  if (!phone || !jid || !text) return res.status(400).json({ error: 'jid, text, session required' });
   const s = sessions.get(phone);
   if (!s || s.status !== 'connected') {
-    return res.status(409).json({
-      error: 'session_missing',
-      status: s?.status ?? 'not_started',
-    });
+    return res.status(409).json({ error: 'session_missing', status: s?.status ?? 'not_started' });
   }
   try {
     await s.sock.sendMessage(jid, { text });
@@ -312,8 +293,7 @@ app.post('/send', async (req, res) => {
     res.status(500).json({ ok: false, error: e?.message || String(e) });
   }
 });
-// List all WhatsApp groups the connected session participates in.
-// Read-only operation — does not mutate any session state.
+
 app.get('/groups', async (req, res) => {
   const phone = String(req.query.session || req.query.phone || '').replace(/\D/g, '');
   if (!phone) return res.status(400).json({ error: 'session required' });
