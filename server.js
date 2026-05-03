@@ -110,7 +110,9 @@ async function createSocket(phone, { forceReset } = {}) {
 
   sock.ev.on('creds.update', saveCreds);
 
-  // Forward INCOMING 1:1 messages to Lovable Cloud webhook
+  // ---------------------------------------------------------------------------
+  // Forward INCOMING 1:1 messages from drivers to the Lovable Cloud webhook.
+  // ---------------------------------------------------------------------------
   sock.ev.on('messages.upsert', async (ev) => {
     if (!WEBHOOK_URL) return;
     if (ev.type !== 'notify') return;
@@ -120,6 +122,7 @@ async function createSocket(phone, { forceReset } = {}) {
         if (m.key?.fromMe) continue;
         const jid = m.key?.remoteJid || '';
         if (!jid || jid.endsWith('@g.us') || jid.endsWith('@broadcast')) continue;
+
         const msg = m.message;
         const text =
           msg.conversation ||
@@ -129,10 +132,34 @@ async function createSocket(phone, { forceReset } = {}) {
           '';
         if (!text || !String(text).trim()) continue;
 
-        const driverPhone = jid.split('@')[0].split(':')[0];
+        // WhatsApp now often returns @lid (linked-id) instead of @s.whatsapp.net.
+        // The LID is NOT a phone number — never forward it as driver_phone.
+        // Try to recover the real phone number (PN) from Baileys 6.7+ fields.
+        let driverPhone = '';
+        if (jid.endsWith('@s.whatsapp.net')) {
+          driverPhone = jid.split('@')[0].split(':')[0];
+        } else if (jid.endsWith('@lid')) {
+          const senderPn = m.key?.senderPn || m.senderPn || '';
+          if (senderPn && typeof senderPn === 'string' && senderPn.includes('@')) {
+            driverPhone = senderPn.split('@')[0].split(':')[0];
+          }
+        }
+        // Validate: only forward plausible phone numbers (Israeli or international,
+        // 9-13 digits, not the 15-digit WhatsApp LID).
+        const digits = String(driverPhone || '').replace(/\D/g, '');
+        const looksLikePhone =
+          digits.length >= 9 && digits.length <= 13 &&
+          (digits.startsWith('972') || digits.startsWith('0') || digits.length <= 11);
+        if (!looksLikePhone) {
+          logger.warn(
+            { phone, jid, senderPn: m.key?.senderPn || null, msgId: m.key?.id },
+            'skip inbound: could not resolve real phone from JID'
+          );
+          continue;
+        }
         const payload = {
           station_phone: phone,
-          driver_phone: driverPhone,
+          driver_phone: digits,
           text: String(text),
           wa_message_id: m.key?.id || null,
           direction: 'incoming',
@@ -357,8 +384,7 @@ app.listen(PORT, () => {
 });
 
 // ---------------------------------------------------------------------------
-// Auto-restore: on boot, scan persistent auth dir and re-create sockets for
-// any phone that has registered creds.
+// Auto-restore: re-create sockets for registered sessions on boot.
 // ---------------------------------------------------------------------------
 async function restoreSessionsOnBoot() {
   const baseDir = path.join(AUTH_ROOT, 'auth');
