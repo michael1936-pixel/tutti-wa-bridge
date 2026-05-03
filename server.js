@@ -8,541 +8,423 @@ import path from "node:path";
 import crypto from "node:crypto";
 
 const {
+  default: makeWASocketDefault,
+  makeWASocket: makeWASocketNamed,
   useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion
 } = baileys;
 
-const makeWASocket =
-  baileys.default?.default ||
-  baileys.default ||
-  baileys.makeWASocket;
+const makeWASocket = makeWASocketNamed || makeWASocketDefault;
 
-if (typeof makeWASocket !== "function") {
-  console.error("❌ makeWASocket was not found as a function.");
-  console.error("Available Baileys exports:", Object.keys(baileys));
-  process.exit(1);
-}
+const logger = pino({ level: process.env.LOG_LEVEL || "info" });
+
+// ============================================================
+// 🛡️ שכבה 1: מאזיני שגיאות גלובליים — מונעים קריסת התהליך
+// ============================================================
+process.on("uncaughtException", (err) => {
+  logger.error(
+    { err: err?.message, stack: err?.stack },
+    "uncaughtException — keeping process alive"
+  );
+});
+process.on("unhandledRejection", (reason) => {
+  logger.error(
+    { reason: reason instanceof Error ? reason.message : String(reason) },
+    "unhandledRejection — keeping process alive"
+  );
+});
+
+const PORT = Number(process.env.PORT) || 3000;
+const SESSION_ROOT = process.env.SESSION_ROOT || "/app/data/sessions";
+const API_KEY = process.env.API_KEY || "";
+const WEBHOOK_URL = process.env.WEBHOOK_URL || "";
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "";
+const DEFAULT_STATION_ID = process.env.DEFAULT_STATION_ID || "";
+
+await fs.mkdir(SESSION_ROOT, { recursive: true });
 
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
 
-const PORT = Number(process.env.PORT || 3000);
-const API_KEY = process.env.WHATSAPP_VPS_API_KEY || "";
-const WEBHOOK_SECRET = process.env.WA_BRIDGE_WEBHOOK_SECRET || "";
-const WEBHOOK_URL = process.env.WEBHOOK_URL || process.env.LOVABLE_WEBHOOK_URL || "";
-const DEFAULT_STATION_ID = process.env.DEFAULT_STATION_ID || "";
-const SESSION_ROOT =
-  process.env.SESSION_ROOT ||
-  process.env.WHATSAPP_SESSION_ROOT ||
-  path.join(process.cwd(), "data", "sessions");
-
-const logger = pino({ level: process.env.LOG_LEVEL || "info" });
-const sessions = new Map();
-
-await fs.mkdir(SESSION_ROOT, { recursive: true });
-
-function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
-
-function normalizePhone(value) {
-  const raw = String(value || "").trim();
-  let digits = raw.replace(/\D/g, "");
-  if (!digits) return "";
-  if (digits.startsWith("00")) digits = digits.slice(2);
-  if (digits.startsWith("972")) return digits;
-  if (digits.startsWith("0")) return `972${digits.slice(1)}`;
-  if (digits.length === 9 && digits.startsWith("5")) return `972${digits}`;
-  return digits;
-}
-
-function normalizeSession(value) {
-  const phone = normalizePhone(value);
-  if (phone) return phone;
-  return String(value || "default").replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 80);
-}
-
-function sessionDir(session) { return path.join(SESSION_ROOT, normalizeSession(session)); }
-
-function safeEqual(a, b) {
-  const aa = Buffer.from(String(a || ""));
-  const bb = Buffer.from(String(b || ""));
-  if (aa.length !== bb.length) return false;
-  if (aa.length === 0) return false;
-  return crypto.timingSafeEqual(aa, bb);
-}
-
-function getProvidedApiKey(req) {
-  const headerKey = req.get("x-api-key") || req.get("X-Api-Key") || "";
-  const auth = req.get("authorization") || "";
-  const bearer = auth.replace(/^Bearer\s+/i, "");
-  return headerKey || bearer || "";
-}
-
-function requireAuth(req, res, next) {
-  if (!API_KEY) {
-    return res.status(503).json({ ok: false, error: "api_key_not_configured" });
-  }
-  const provided = getProvidedApiKey(req);
-  if (!safeEqual(provided, API_KEY)) {
+// API key middleware
+app.use((req, res, next) => {
+  if (req.path === "/health") return next();
+  if (!API_KEY) return next();
+  const provided = req.header("x-api-key") || req.query.api_key;
+  if (provided !== API_KEY) {
     return res.status(401).json({ ok: false, error: "unauthorized" });
   }
   next();
-}
-
-function jidToPhone(jid) {
-  return String(jid || "").split("@")[0].split(":")[0].replace(/\D/g, "");
-}
-
-function phoneToJid(phoneOrJid) {
-  const value = String(phoneOrJid || "").trim();
-  if (value.includes("@")) return value;
-  return `${normalizePhone(value)}@s.whatsapp.net`;
-}
-
-function getTextFromMessage(message) {
-  const m = message?.message;
-  if (!m) return "";
-  const u =
-    m.ephemeralMessage?.message ||
-    m.viewOnceMessage?.message ||
-    m.viewOnceMessageV2?.message ||
-    m.documentWithCaptionMessage?.message ||
-    m;
-  return (
-    u.conversation ||
-    u.extendedTextMessage?.text ||
-    u.imageMessage?.caption ||
-    u.videoMessage?.caption ||
-    u.documentMessage?.caption ||
-    u.buttonsResponseMessage?.selectedDisplayText ||
-    u.buttonsResponseMessage?.selectedButtonId ||
-    u.listResponseMessage?.title ||
-    u.templateButtonReplyMessage?.selectedDisplayText ||
-    u.templateButtonReplyMessage?.selectedId ||
-    ""
-  ).toString().trim();
-}
-
-async function postWebhook(payload) {
-  if (!WEBHOOK_URL || !DEFAULT_STATION_ID || !payload?.text) return;
-  const headers = { "Content-Type": "application/json" };
-  if (WEBHOOK_SECRET) headers["x-bridge-secret"] = WEBHOOK_SECRET;
-  try {
-    const r = await fetch(WEBHOOK_URL, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({
-        station_id: DEFAULT_STATION_ID,
-        driver_phone: payload.driver_phone,
-        text: payload.text,
-        wa_message_id: payload.wa_message_id || null,
-        direction: payload.direction || "incoming"
-      })
-    });
-    if (!r.ok) {
-      const text = await r.text().catch(() => "");
-      logger.warn({ status: r.status, body: text.slice(0, 300) }, "Webhook non-OK");
-    }
-  } catch (error) {
-    logger.warn({ error: error?.message || String(error) }, "Webhook failed");
-  }
-}
-
-function publicSessionStatus(record) {
-  if (!record) return { ok: false, connected: false, status: "not_found", hasQR: false };
-  return {
-    ok: true,
-    session: record.session,
-    phone: record.phone,
-    status: record.status,
-    connected: record.status === "connected",
-    hasQR: false,
-    pairingCodeReady: record.status === "pairing_code_ready",
-    lastError: record.lastError || null,
-    connectedAt: record.connectedAt || null,
-    lastSeenAt: record.lastSeenAt || null,
-    codeExpiresAt: record.codeExpiresAt || null
-  };
-}
-
-async function closeSocket(record) {
-  if (!record?.sock) return;
-  try { record.sock.ev?.removeAllListeners?.(); } catch (_) {}
-  try { record.sock.end?.(new Error("closed by bridge")); } catch (_) {}
-  try { record.sock.ws?.close?.(); } catch (_) {}
-  record.sock = null;
-}
-
-async function resetSession(session, deleteFiles = true) {
-  const id = normalizeSession(session);
-  const record = sessions.get(id);
-  if (record) {
-    await closeSocket(record);
-    sessions.delete(id);
-  }
-  if (deleteFiles) {
-    await fs.rm(sessionDir(id), { recursive: true, force: true });
-  }
-  return { ok: true, session: id, deletedFiles: deleteFiles };
-}
-
-async function startSocket(sessionValue, phoneValue) {
-  const session = normalizeSession(sessionValue);
-  const phone = normalizePhone(phoneValue || session);
-  const existing = sessions.get(session);
-
-  if (existing?.starting) return existing.starting;
-  if (existing?.sock && existing.status !== "disconnected") return existing;
-
-  const record = existing || {
-    session, phone, sock: null,
-    status: "starting", lastError: null,
-    connectedAt: null, lastSeenAt: null,
-    codeExpiresAt: null, starting: null, registered: false
-  };
-  sessions.set(session, record);
-
-  const starting = (async () => {
-    const dir = sessionDir(session);
-    await fs.mkdir(dir, { recursive: true });
-    const { state, saveCreds } = await useMultiFileAuthState(dir);
-
-    let version;
-    try {
-      const latest = await fetchLatestBaileysVersion();
-      version = latest.version;
-    } catch (error) {
-      logger.warn({ error: error?.message || String(error) }, "Baileys version fetch failed");
-    }
-
-    record.status = state.creds?.registered ? "connecting" : "pairing";
-    record.registered = Boolean(state.creds?.registered);
-
-    const sock = makeWASocket({
-      version,
-      auth: state,
-      logger: pino({ level: "silent" }),
-      printQRInTerminal: false,
-      markOnlineOnConnect: false,
-      syncFullHistory: false,
-      generateHighQualityLinkPreview: false,
-      browser: ["Windows", "Chrome", "114.0.5735.198"],
-      getMessage: async () => undefined
-    });
-
-    record.sock = sock;
-    sock.ev.on("creds.update", saveCreds);
-
-    sock.ev.on("connection.update", async (update) => {
-      const { connection, lastDisconnect } = update;
-      if (connection === "open") {
-        record.status = "connected";
-        record.connectedAt = new Date().toISOString();
-        record.lastSeenAt = new Date().toISOString();
-        record.lastError = null;
-        record.registered = true;
-        logger.info({ session }, "WhatsApp connected");
-      }
-      if (connection === "connecting" && record.status !== "pairing_code_ready") {
-        record.status = "connecting";
-      }
-      if (connection === "close") {
-        const boom = new Boom(lastDisconnect?.error);
-        const statusCode = boom?.output?.statusCode;
-        const message = lastDisconnect?.error?.message || boom?.message || "connection closed";
-
-        record.status = "disconnected";
-        record.lastError = message;
-        record.sock = null;
-        logger.warn({ session, statusCode, message }, "WhatsApp connection closed");
-
-        const shouldNotReconnect =
-          statusCode === DisconnectReason.loggedOut ||
-          statusCode === DisconnectReason.badSession ||
-          statusCode === 401;
-
-        if (!shouldNotReconnect && record.registered) {
-          setTimeout(() => {
-            startSocket(session, phone).catch((e) =>
-              logger.error({ session, error: e?.message || String(e) }, "Reconnect failed")
-            );
-          }, 4000);
-        }
-      }
-    });
-
-    sock.ev.on("messages.upsert", async ({ messages }) => {
-      for (const msg of messages || []) {
-        try {
-          const remoteJid = msg?.key?.remoteJid || "";
-          if (!remoteJid || remoteJid === "status@broadcast" || remoteJid.endsWith("@g.us")) continue;
-          const text = getTextFromMessage(msg);
-          if (!text) continue;
-          const fromMe = Boolean(msg?.key?.fromMe);
-          const driverPhone = jidToPhone(remoteJid);
-          if (!driverPhone) continue;
-          await postWebhook({
-            direction: fromMe ? "outgoing" : "incoming",
-            driver_phone: driverPhone,
-            text,
-            wa_message_id: msg?.key?.id || null
-          });
-        } catch (error) {
-          logger.warn({ error: error?.message || String(error) }, "Incoming msg failed");
-        }
-      }
-    });
-
-    return record;
-  })();
-
-  record.starting = starting;
-  try { return await starting; }
-  finally { record.starting = null; }
-}
-
-async function waitForSocketReady(record, timeoutMs = 8000) {
-  const started = Date.now();
-  while (Date.now() - started < timeoutMs) {
-    if (record.sock && typeof record.sock.requestPairingCode === "function") return true;
-    if (record.lastError && !record.sock) return false;
-    await sleep(200);
-  }
-  return Boolean(record.sock);
-}
-
-async function waitForConnected(record, timeoutMs = 10000) {
-  const started = Date.now();
-  while (Date.now() - started < timeoutMs) {
-    if (record.status === "connected" && record.sock) return true;
-    await sleep(500);
-  }
-  return false;
-}
-
-async function createPairingCode({ phone, session, forceReset }) {
-  if (forceReset) await resetSession(session, true);
-
-  const record = await startSocket(session, phone);
-
-  if (record.status === "connected" || (record.registered && record.sock)) {
-    return { ok: true, alreadyConnected: true, status: "connected", session, phone };
-  }
-
-  const ready = await waitForSocketReady(record, 8000);
-  if (!ready || !record.sock) {
-    throw new Error(record.lastError || "socket_not_available");
-  }
-
-  if (typeof record.sock.requestPairingCode !== "function") {
-    throw new Error("requestPairingCode is not available on this Baileys socket");
-  }
-
-  const pairingCode = await record.sock.requestPairingCode(phone);
-  record.status = "pairing_code_ready";
-  record.codeExpiresAt = new Date(Date.now() + 3 * 60 * 1000).toISOString();
-  record.lastError = null;
-
-  return {
-    ok: true,
-    alreadyConnected: false,
-    status: "pairing_code_ready",
-    session, phone,
-    pairingCode, code: pairingCode,
-    codeExpiresAt: record.codeExpiresAt
-  };
-}
-
-// --- Routes ---
-
-app.get("/", (_req, res) =>
-  res.json({ ok: true, service: "wa-bridge", message: "WhatsApp bridge is running" })
-);
-
-app.get("/health", (_req, res) =>
-  res.json({
-    ok: true, service: "wa-bridge", status: "healthy",
-    time: new Date().toISOString(),
-    uptime: process.uptime(),
-    sessions: Array.from(sessions.values()).map((s) => ({
-      session: s.session, phone: s.phone, status: s.status,
-      connected: s.status === "connected",
-      lastSeenAt: s.lastSeenAt || null, lastError: s.lastError || null
-    }))
-  })
-);
-
-const STALE_ERROR_RE =
-  /qr\s*refs|attempts\s*ended|connection\s*closed|socket|stream|timed?\s*out|408|restart\s*required/i;
-
-app.post("/pair", requireAuth, async (req, res) => {
-  const phone = normalizePhone(req.body?.phone);
-  const session = normalizeSession(req.body?.session || phone);
-  const explicitForce = Boolean(req.body?.forceReset);
-
-  if (!phone) return res.status(400).json({ ok: false, error: "phone_required" });
-
-  // ⭐ AUTO-RESET if existing session is in a stale failed state
-  const existing = sessions.get(session);
-  let forceReset = explicitForce;
-  if (
-    !forceReset &&
-    existing &&
-    existing.status === "disconnected" &&
-    existing.lastError &&
-    STALE_ERROR_RE.test(existing.lastError)
-  ) {
-    logger.info(
-      { session, lastError: existing.lastError },
-      "Auto-resetting stale session before pair"
-    );
-    forceReset = true;
-  }
-
-  try {
-    let result;
-    try {
-      result = await createPairingCode({ phone, session, forceReset });
-    } catch (error) {
-      const message = error?.message || String(error);
-      if (!forceReset && STALE_ERROR_RE.test(message)) {
-        logger.warn({ session, message }, "Pair failed, retrying with reset");
-        await resetSession(session, true);
-        await sleep(2500);
-        result = await createPairingCode({ phone, session, forceReset: false });
-      } else {
-        throw error;
-      }
-    }
-    return res.json(result);
-  } catch (error) {
-    const message = error?.message || String(error);
-    logger.error({ session, phone, message }, "Pairing failed");
-    return res.status(502).json({
-      ok: false, error: "pair_failed", message, step: "requestPairingCode"
-    });
-  }
 });
 
-app.get("/status", requireAuth, async (req, res) => {
-  const sessionQuery = req.query.session ? normalizeSession(req.query.session) : "";
-  if (sessionQuery) return res.json(publicSessionStatus(sessions.get(sessionQuery)));
-  return res.json({
+// ============================================================
+// State
+// ============================================================
+const sessions = new Map(); // sessionId -> { sock, status, lastError, qr, pairingCode, startedAt }
+
+function sessionDir(sessionId) {
+  return path.join(SESSION_ROOT, sessionId.replace(/[^0-9a-zA-Z_-]/g, "_"));
+}
+
+// ============================================================
+// 🛡️ שכבה 3: עטיפות בטוחות
+// ============================================================
+async function safeCloseSocket(sessionId) {
+  try {
+    const entry = sessions.get(sessionId);
+    if (!entry?.sock) return;
+    try { entry.sock.ws?.removeAllListeners(); } catch {}
+    try { entry.sock.ev?.removeAllListeners(); } catch {}
+    try { await entry.sock.logout?.(); } catch {}
+    try { entry.sock.end?.(undefined); } catch {}
+  } catch (err) {
+    logger.warn({ session: sessionId, err: err?.message }, "safeCloseSocket swallowed");
+  }
+}
+
+async function resetSession(sessionId, { wipe = false } = {}) {
+  try {
+    await safeCloseSocket(sessionId);
+    sessions.delete(sessionId);
+    if (wipe) {
+      try {
+        await fs.rm(sessionDir(sessionId), { recursive: true, force: true });
+      } catch (err) {
+        logger.warn({ session: sessionId, err: err?.message }, "wipe failed");
+      }
+    }
+  } catch (err) {
+    logger.warn({ session: sessionId, err: err?.message }, "resetSession swallowed");
+  }
+}
+
+// ============================================================
+// Webhook
+// ============================================================
+async function postWebhook(payload) {
+  if (!WEBHOOK_URL) return;
+  try {
+    const body = JSON.stringify(payload);
+    const sig = WEBHOOK_SECRET
+      ? crypto.createHmac("sha256", WEBHOOK_SECRET).update(body).digest("hex")
+      : "";
+    await fetch(WEBHOOK_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(sig ? { "x-signature": sig } : {})
+      },
+      body
+    });
+  } catch (err) {
+    logger.warn({ err: err?.message }, "webhook post failed");
+  }
+}
+
+// ============================================================
+// Create / restore socket
+// ============================================================
+async function startSocket(sessionId, { phoneNumber } = {}) {
+  await resetSession(sessionId, { wipe: false });
+
+  const dir = sessionDir(sessionId);
+  await fs.mkdir(dir, { recursive: true });
+
+  const { state, saveCreds } = await useMultiFileAuthState(dir);
+  const { version } = await fetchLatestBaileysVersion();
+
+  const sock = makeWASocket({
+    version,
+    auth: state,
+    logger: logger.child({ session: sessionId }),
+    printQRInTerminal: false,
+    browser: ["Lovable Bridge", "Chrome", "120.0.0"],
+    syncFullHistory: false,
+    markOnlineOnConnect: false
+  });
+
+  const entry = {
+    sock,
+    status: "connecting",
+    lastError: null,
+    qr: null,
+    pairingCode: null,
+    startedAt: Date.now()
+  };
+  sessions.set(sessionId, entry);
+
+  // ============================================================
+  // 🛡️ שכבה 2: מאזיני error על ה-WebSocket וה-Baileys events
+  // ============================================================
+  try {
+    sock.ws?.on?.("error", (err) => {
+      logger.warn(
+        { session: sessionId, err: err?.message },
+        "WebSocket error swallowed"
+      );
+      const e = sessions.get(sessionId);
+      if (e) e.lastError = err?.message || "ws_error";
+    });
+  } catch (err) {
+    logger.warn({ err: err?.message }, "ws error listener attach failed");
+  }
+
+  try {
+    sock.ev?.on?.("error", (err) => {
+      logger.warn(
+        { session: sessionId, err: err?.message },
+        "Baileys ev error swallowed"
+      );
+    });
+  } catch {}
+
+  sock.ev.on("creds.update", saveCreds);
+
+  // ============================================================
+  // Pairing code (if requested and not registered)
+  // ============================================================
+  if (phoneNumber && !state.creds.registered) {
+    try {
+      // Wait briefly for the socket to be ready
+      await new Promise((r) => setTimeout(r, 1500));
+      const cleaned = String(phoneNumber).replace(/\D/g, "");
+      const code = await sock.requestPairingCode(cleaned);
+      entry.pairingCode = code;
+      logger.info({ session: sessionId, code }, "pairing code generated");
+    } catch (err) {
+      logger.error(
+        { session: sessionId, err: err?.message },
+        "requestPairingCode failed"
+      );
+      entry.lastError = err?.message || "pairing_failed";
+    }
+  }
+
+  // ============================================================
+  // 🛡️ שכבה 4: connection.update — תיקון restart loop
+  // ============================================================
+  sock.ev.on("connection.update", async (update) => {
+    try {
+      const { connection, lastDisconnect, qr } = update;
+      const e = sessions.get(sessionId);
+      if (!e) return;
+
+      if (qr) e.qr = qr;
+
+      if (connection === "open") {
+        e.status = "open";
+        e.lastError = null;
+        logger.info({ session: sessionId }, "WhatsApp connected");
+        await postWebhook({
+          type: "connection.open",
+          sessionId,
+          timestamp: Date.now()
+        });
+        return;
+      }
+
+      if (connection === "close") {
+        const statusCode =
+          new Boom(lastDisconnect?.error)?.output?.statusCode ||
+          lastDisconnect?.error?.output?.statusCode;
+        const reason =
+          lastDisconnect?.error?.message || "connection_closed";
+        e.status = "closed";
+        e.lastError = reason;
+
+        logger.warn(
+          { session: sessionId, statusCode, reason },
+          "Connection Closed"
+        );
+
+        await postWebhook({
+          type: "connection.close",
+          sessionId,
+          statusCode,
+          reason,
+          timestamp: Date.now()
+        });
+
+        // 428 = session conflict during pairing — DO NOT wipe creds, retry
+        if (statusCode === 428) {
+          logger.info(
+            { session: sessionId },
+            "428 — keeping creds, reconnecting in 3s"
+          );
+          setTimeout(() => {
+            startSocket(sessionId).catch((err) =>
+              logger.error(
+                { session: sessionId, err: err?.message },
+                "reconnect after 428 failed"
+              )
+            );
+          }, 3000);
+          return;
+        }
+
+        // Logged out → wipe and stop
+        if (statusCode === DisconnectReason.loggedOut) {
+          logger.info({ session: sessionId }, "Logged out — wiping session");
+          await resetSession(sessionId, { wipe: true });
+          return;
+        }
+
+        // Other transient → reconnect without wipe
+        const shouldReconnect =
+          statusCode !== DisconnectReason.forbidden &&
+          statusCode !== DisconnectReason.badSession;
+
+        if (shouldReconnect) {
+          setTimeout(() => {
+            startSocket(sessionId).catch((err) =>
+              logger.error(
+                { session: sessionId, err: err?.message },
+                "reconnect failed"
+              )
+            );
+          }, 5000);
+        } else {
+          logger.warn(
+            { session: sessionId, statusCode },
+            "Not reconnecting — wiping"
+          );
+          await resetSession(sessionId, { wipe: true });
+        }
+      }
+    } catch (err) {
+      logger.error(
+        { session: sessionId, err: err?.message },
+        "connection.update handler swallowed"
+      );
+    }
+  });
+
+  // Forward incoming messages to webhook
+  sock.ev.on("messages.upsert", async (m) => {
+    try {
+      await postWebhook({
+        type: "messages.upsert",
+        sessionId,
+        data: m,
+        timestamp: Date.now()
+      });
+    } catch (err) {
+      logger.warn({ err: err?.message }, "messages.upsert webhook failed");
+    }
+  });
+
+  return entry;
+}
+
+// ============================================================
+// HTTP routes
+// ============================================================
+app.get("/health", (req, res) => {
+  const list = [];
+  for (const [id, s] of sessions.entries()) {
+    list.push({
+      sessionId: id,
+      status: s.status,
+      lastError: s.lastError,
+      hasPairingCode: Boolean(s.pairingCode),
+      uptimeMs: Date.now() - s.startedAt
+    });
+  }
+  res.json({
     ok: true,
-    sessions: Array.from(sessions.values()).map(publicSessionStatus)
+    uptimeSec: Math.round(process.uptime()),
+    sessions: list
   });
 });
 
-app.get("/status/:session", requireAuth, async (req, res) => {
-  const session = normalizeSession(req.params.session);
-  return res.json(publicSessionStatus(sessions.get(session)));
-});
-
-app.get("/groups", requireAuth, async (req, res) => {
-  const session = normalizeSession(req.query.session || req.query.sessionId || "");
-  if (!session) return res.status(400).json({ ok: false, error: "session_required" });
-
-  const record = sessions.get(session) || (await startSocket(session, session));
-  const connected = await waitForConnected(record, 8000);
-
-  if (!connected || !record.sock) {
-    return res.status(409).json({
-      ok: false, error: "session_not_connected",
-      status: record.status, lastError: record.lastError || null
-    });
-  }
-
+app.post("/pair", async (req, res) => {
   try {
-    const groupsMap = await record.sock.groupFetchAllParticipating();
-    const groups = Object.values(groupsMap || {}).map((g) => ({
-      jid: g.id, id: g.id,
-      name: g.subject || g.name || g.id,
-      subject: g.subject || g.name || g.id,
-      participants: Array.isArray(g.participants) ? g.participants.length : null,
-      size: Array.isArray(g.participants) ? g.participants.length : null,
-      announce: Boolean(g.announce)
-    }));
-    return res.json({ ok: true, groups });
-  } catch (error) {
-    return res.status(502).json({
-      ok: false, error: "groups_failed", message: error?.message || String(error)
+    const { sessionId, phoneNumber } = req.body || {};
+    const sid = sessionId || phoneNumber;
+    if (!sid || !phoneNumber) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "sessionId and phoneNumber required" });
+    }
+    await startSocket(sid, { phoneNumber });
+    // give pairing code a moment to be generated
+    await new Promise((r) => setTimeout(r, 2500));
+    const entry = sessions.get(sid);
+    return res.json({
+      ok: true,
+      sessionId: sid,
+      pairingCode: entry?.pairingCode || null,
+      status: entry?.status || "unknown",
+      lastError: entry?.lastError || null
     });
+  } catch (err) {
+    logger.error({ err: err?.message }, "/pair failed");
+    res.status(500).json({ ok: false, error: err?.message || "pair_failed" });
   }
 });
 
-app.post("/send", requireAuth, async (req, res) => {
-  const session = normalizeSession(
-    req.body?.session || req.body?.sessionId || req.query?.session || ""
-  );
-  const jid = phoneToJid(req.body?.jid || req.body?.to || req.body?.phone || "");
-  const text = String(req.body?.text || req.body?.message || "").trim();
-
-  if (!session) return res.status(400).json({ ok: false, error: "session_required" });
-  if (!jid || jid === "@s.whatsapp.net") return res.status(400).json({ ok: false, error: "jid_required" });
-  if (!text) return res.status(400).json({ ok: false, error: "text_required" });
-
-  const record = sessions.get(session) || (await startSocket(session, session));
-  const connected = await waitForConnected(record, 10000);
-
-  if (!connected || !record.sock) {
-    return res.status(409).json({
-      ok: false, error: "session_not_connected",
-      status: record.status, lastError: record.lastError || null
+app.get("/status/:sessionId", (req, res) => {
+  const entry = sessions.get(req.params.sessionId);
+  if (!entry) {
+    return res.json({
+      ok: true,
+      status: "not_started",
+      lastError: null,
+      pairingCode: null
     });
   }
+  res.json({
+    ok: true,
+    status: entry.status,
+    lastError: entry.lastError,
+    pairingCode: entry.pairingCode,
+    hasQR: Boolean(entry.qr)
+  });
+});
 
+app.post("/logout/:sessionId", async (req, res) => {
+  await resetSession(req.params.sessionId, { wipe: true });
+  res.json({ ok: true });
+});
+
+app.post("/send", async (req, res) => {
   try {
-    const sent = await record.sock.sendMessage(jid, { text });
-    return res.json({ ok: true, session, jid, messageId: sent?.key?.id || null });
-  } catch (error) {
-    return res.status(502).json({
-      ok: false, error: "send_failed", message: error?.message || String(error)
-    });
+    const { sessionId, to, text } = req.body || {};
+    if (!sessionId || !to || !text) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "sessionId, to, text required" });
+    }
+    const entry = sessions.get(sessionId);
+    if (!entry || entry.status !== "open") {
+      return res
+        .status(409)
+        .json({ ok: false, error: "session_not_open" });
+    }
+    const jid = to.includes("@") ? to : `${to.replace(/\D/g, "")}@s.whatsapp.net`;
+    const result = await entry.sock.sendMessage(jid, { text });
+    res.json({ ok: true, id: result?.key?.id || null });
+  } catch (err) {
+    logger.error({ err: err?.message }, "/send failed");
+    res.status(500).json({ ok: false, error: err?.message || "send_failed" });
   }
 });
 
-app.post("/logout", requireAuth, async (req, res) => {
-  const session = normalizeSession(
-    req.query.session || req.body?.session || req.body?.sessionId || ""
-  );
-  if (!session) return res.status(400).json({ ok: false, error: "session_required" });
-  return res.json(await resetSession(session, true));
+app.use((req, res) => {
+  res.status(404).json({ ok: false, error: "not_found", path: req.path });
 });
-
-app.post("/reset", requireAuth, async (req, res) => {
-  const session = normalizeSession(
-    req.query.session || req.body?.session || req.body?.sessionId || ""
-  );
-
-  if (session) return res.json(await resetSession(session, true));
-
-  for (const id of Array.from(sessions.keys())) {
-    await resetSession(id, true);
-  }
-  try {
-    await fs.rm(SESSION_ROOT, { recursive: true, force: true });
-    await fs.mkdir(SESSION_ROOT, { recursive: true });
-  } catch (_) {}
-  return res.json({ ok: true, resetAll: true });
-});
-
-app.post("/session/:session/logout", requireAuth, async (req, res) => {
-  return res.json(await resetSession(normalizeSession(req.params.session), true));
-});
-
-app.delete("/session/:session", requireAuth, async (req, res) => {
-  return res.json(await resetSession(normalizeSession(req.params.session), true));
-});
-
-app.use((req, res) => res.status(404).json({ ok: false, error: "not_found", path: req.path }));
 
 app.listen(PORT, () => {
-  logger.info({
-    port: PORT,
-    sessionRoot: SESSION_ROOT,
-    apiKeyConfigured: Boolean(API_KEY),
-    webhookConfigured: Boolean(WEBHOOK_URL),
-    defaultStationConfigured: Boolean(DEFAULT_STATION_ID)
-  }, "WhatsApp bridge started");
+  logger.info(
+    {
+      port: PORT,
+      sessionRoot: SESSION_ROOT,
+      apiKeyConfigured: Boolean(API_KEY),
+      webhookConfigured: Boolean(WEBHOOK_URL),
+      defaultStationConfigured: Boolean(DEFAULT_STATION_ID)
+    },
+    "WhatsApp bridge started"
+  );
 });
