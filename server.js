@@ -1,93 +1,101 @@
-import express from 'express';
-import * as baileysPkg from '@whiskeysockets/baileys';
-import { Boom } from '@hapi/boom';
-import pino from 'pino';
-import qrcode from 'qrcode-terminal';
-import fs from 'fs';
-import path from 'path';
+// WhatsApp Bridge for Lovable
+// Routes: /health, /status, /groups, /send, /pair, /session/:session
+import express from "express";
+import P from "pino";
+import qrcode from "qrcode";
+import fs from "fs";
+import path from "path";
 
-// ✅ זיהוי חכם של makeWASocket מכל וריאציות הייצוא של Baileys
+// --- Resilient Baileys import (handles default/named export drift) ---
+import * as BaileysAll from "@whiskeysockets/baileys";
+const Baileys = BaileysAll.default ?? BaileysAll;
 const makeWASocket =
-  (typeof baileysPkg.makeWASocket === 'function' && baileysPkg.makeWASocket) ||
-  (typeof baileysPkg.default === 'function' && baileysPkg.default) ||
-  (baileysPkg.default && typeof baileysPkg.default.makeWASocket === 'function' && baileysPkg.default.makeWASocket);
-
-if (typeof makeWASocket !== 'function') {
-  console.error('❌ makeWASocket not found. Available keys:', Object.keys(baileysPkg));
-  if (baileysPkg.default) {
-    console.error('   default keys:', Object.keys(baileysPkg.default));
-  }
-  throw new Error('makeWASocket is not a function — check @whiskeysockets/baileys version');
-}
-
+  Baileys.makeWASocket ??
+  Baileys.default ??
+  BaileysAll.makeWASocket ??
+  BaileysAll.default;
 const {
   useMultiFileAuthState,
-  DisconnectReason,
   fetchLatestBaileysVersion,
-} =
-  baileysPkg.default && typeof baileysPkg.default === 'object'
-    ? { ...baileysPkg, ...baileysPkg.default }
-    : baileysPkg;
+  DisconnectReason,
+  Browsers,
+} = Baileys;
 
-// ─── Setup ────────────────────────────────────────────────────
-const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
-const API_KEY = process.env.API_KEY || '';
-const app = express();
-app.use(express.json({ limit: '2mb' }));
-
-const sessions = new Map(); // sessionId -> { sock, status, qr }
-
-function requireApiKey(req, res, next) {
-  if (!API_KEY) return next();
-  const key = req.headers['x-api-key'] || req.query.api_key;
-  if (key !== API_KEY) return res.status(401).json({ error: 'unauthorized' });
-  next();
+if (typeof makeWASocket !== "function") {
+  console.error("FATAL: makeWASocket not found in baileys exports", Object.keys(BaileysAll));
+  process.exit(1);
 }
 
-// ─── Session management ───────────────────────────────────────
-async function startSession(sessionId) {
-  const dir = path.join('./auth', sessionId);
-  fs.mkdirSync(dir, { recursive: true });
+const PORT = process.env.PORT || 3000;
+const API_KEY =
+  process.env.WHATSAPP_VPS_API_KEY ||
+  process.env.BRIDGE_API_KEY ||
+  process.env.API_KEY ||
+  "";
+const AUTH_ROOT = process.env.AUTH_ROOT || "./auth";
+fs.mkdirSync(AUTH_ROOT, { recursive: true });
 
+const app = express();
+app.use(express.json({ limit: "1mb" }));
+
+// --- Auth middleware (skip /health and / for Railway healthcheck) ---
+app.use((req, res, next) => {
+  if (req.path === "/health" || req.path === "/") return next();
+  if (!API_KEY) return next();
+  const provided = req.header("x-api-key") || req.header("X-Api-Key");
+  if (provided !== API_KEY) return res.status(401).json({ ok: false, error: "unauthorized" });
+  next();
+});
+
+// --- Session registry ---
+const sessions = new Map(); // sessionId -> { sock, status, qr, pairingCode }
+
+function normJid(input) {
+  if (!input) return null;
+  let s = String(input).trim();
+  if (s.includes("@")) return s; // already a JID
+  const digits = s.replace(/\D/g, "");
+  if (!digits) return null;
+  // Group JIDs are numeric+@g.us; default individual JIDs to s.whatsapp.net
+  return `${digits}@s.whatsapp.net`;
+}
+
+async function startSession(sessionId) {
+  if (sessions.has(sessionId) && sessions.get(sessionId).status === "connected") {
+    return sessions.get(sessionId);
+  }
+  const dir = path.join(AUTH_ROOT, sessionId);
+  fs.mkdirSync(dir, { recursive: true });
   const { state, saveCreds } = await useMultiFileAuthState(dir);
   const { version } = await fetchLatestBaileysVersion();
 
   const sock = makeWASocket({
     version,
     auth: state,
+    logger: P({ level: "warn" }),
     printQRInTerminal: false,
-    logger: pino({ level: 'silent' }),
-    browser: ['Lovable Bridge', 'Chrome', '1.0'],
+    browser: Browsers.appropriate("Lovable"),
   });
 
-  const entry = { sock, status: 'connecting', qr: null };
+  const entry = { sock, status: "connecting", qr: null, pairingCode: null };
   sessions.set(sessionId, entry);
 
-  sock.ev.on('creds.update', saveCreds);
-
-  sock.ev.on('connection.update', (update) => {
-    const { connection, lastDisconnect, qr } = update;
+  sock.ev.on("creds.update", saveCreds);
+  sock.ev.on("connection.update", async (u) => {
+    const { connection, lastDisconnect, qr } = u;
     if (qr) {
-      entry.qr = qr;
-      entry.status = 'qr';
-      qrcode.generate(qr, { small: true });
-      logger.info(`📱 QR ready for ${sessionId}`);
+      entry.qr = await qrcode.toDataURL(qr);
+      entry.status = "qr_pending";
     }
-    if (connection === 'open') {
-      entry.status = 'connected';
+    if (connection === "open") {
+      entry.status = "connected";
       entry.qr = null;
-      logger.info(`✅ Session ${sessionId} connected`);
     }
-    if (connection === 'close') {
-      const code = new Boom(lastDisconnect?.error)?.output?.statusCode;
-      const shouldReconnect = code !== DisconnectReason.loggedOut;
-      entry.status = 'disconnected';
-      logger.warn({ code }, `⚠️ ${sessionId} closed`);
-      if (shouldReconnect) {
-        setTimeout(() => startSession(sessionId).catch(() => {}), 3000);
-      } else {
-        try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
-        sessions.delete(sessionId);
+    if (connection === "close") {
+      const code = lastDisconnect?.error?.output?.statusCode;
+      entry.status = "disconnected";
+      if (code !== DisconnectReason.loggedOut) {
+        setTimeout(() => startSession(sessionId).catch(() => {}), 2500);
       }
     }
   });
@@ -95,78 +103,96 @@ async function startSession(sessionId) {
   return entry;
 }
 
-// ─── Routes ───────────────────────────────────────────────────
-app.get('/health', (_req, res) => res.json({ ok: true, sessions: [...sessions.keys()] }));
+// Auto-resume any pre-existing session dirs on boot
+for (const dir of fs.readdirSync(AUTH_ROOT)) {
+  if (fs.existsSync(path.join(AUTH_ROOT, dir, "creds.json"))) {
+    startSession(dir).catch((e) => console.error("resume", dir, e?.message));
+  }
+}
 
-app.post('/session/start', requireApiKey, async (req, res) => {
-  const sessionId = req.body?.sessionId || req.body?.session;
-  if (!sessionId) return res.status(400).json({ error: 'sessionId required' });
+// --- Routes ---
+app.get("/", (_req, res) => res.json({ ok: true, service: "wa-bridge" }));
+app.get("/health", (_req, res) =>
+  res.json({ ok: true, sessions: [...sessions.keys()] })
+);
+
+app.get("/status", async (req, res) => {
+  const session = String(req.query.session || "");
+  if (!session) return res.json({ ok: true, sessions: [...sessions.keys()] });
+  const entry = sessions.get(session) || (await startSession(session));
+  res.json({
+    ok: true,
+    connected: entry.status === "connected",
+    hasQR: !!entry.qr,
+    qr: entry.qr,
+    status: entry.status,
+  });
+});
+
+app.get("/session/:session", async (req, res) => {
+  const session = req.params.session;
+  const entry = sessions.get(session) || (await startSession(session));
+  res.json({ status: entry.status, hasQR: !!entry.qr });
+});
+
+app.get("/groups", async (req, res) => {
+  const session = String(req.query.session || "");
+  if (!session) return res.status(400).json({ ok: false, error: "missing session" });
+  const entry = sessions.get(session);
+  if (!entry || entry.status !== "connected") {
+    return res.status(409).json({ ok: false, error: "session not connected", status: entry?.status || "missing" });
+  }
   try {
-    const entry = sessions.get(sessionId) || (await startSession(sessionId));
-    res.json({ sessionId, status: entry.status, qr: entry.qr });
+    const all = await entry.sock.groupFetchAllParticipating();
+    const groups = Object.values(all).map((g) => ({
+      jid: g.id,
+      name: g.subject,
+      participants: g.participants?.length ?? null,
+      announce: !!g.announce,
+    }));
+    res.json({ ok: true, groups });
   } catch (e) {
-    logger.error({ e: e.message }, 'session/start failed');
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ ok: false, error: e?.message || String(e) });
   }
 });
 
-app.get('/session/:id/status', requireApiKey, (req, res) => {
-  const entry = sessions.get(req.params.id);
-  if (!entry) return res.status(404).json({ error: 'not found' });
-  res.json({ status: entry.status, qr: entry.qr });
-});
-
-app.post('/session/:id/logout', requireApiKey, async (req, res) => {
-  const entry = sessions.get(req.params.id);
-  if (!entry) return res.status(404).json({ error: 'not found' });
-  try { await entry.sock.logout(); } catch {}
-  sessions.delete(req.params.id);
-  try { fs.rmSync(path.join('./auth', req.params.id), { recursive: true, force: true }); } catch {}
-  res.json({ ok: true });
-});
-
-// ✅ /send — תאימות לשני פורמטים: { sessionId|session, jid|to, message|text }
-app.post('/send', requireApiKey, async (req, res) => {
-  const body = req.body || {};
-  const sessionId = body.sessionId || body.session;
-  const jid = body.jid || body.to;
-  const message = body.message ?? body.text;
-
-  if (!sessionId || !jid || message === undefined || message === null) {
-    return res.status(400).json({
-      error: 'sessionId, jid and message are required',
-      received: { sessionId: !!sessionId, jid: !!jid, message: message !== undefined },
-    });
+app.post("/send", async (req, res) => {
+  const b = req.body || {};
+  const session = b.session || b.sessionId;
+  const jid = normJid(b.jid || b.to);
+  const text = b.text || b.message;
+  if (!session || !jid || !text) {
+    return res.status(400).json({ ok: false, error: "missing session/jid/text" });
   }
-
-  const entry = sessions.get(sessionId);
-  if (!entry || entry.status !== 'connected') {
-    return res.status(409).json({ error: 'session not connected', status: entry?.status || 'missing' });
+  const entry = sessions.get(session);
+  if (!entry || entry.status !== "connected") {
+    return res.status(409).json({ ok: false, error: "session not connected", status: entry?.status || "missing" });
   }
-
   try {
-    const target = String(jid).includes('@') ? jid : `${String(jid).replace(/\D/g, '')}@s.whatsapp.net`;
-    const payload = typeof message === 'string' ? { text: message } : message;
-    const result = await entry.sock.sendMessage(target, payload);
-    res.json({ ok: true, id: result?.key?.id || null });
+    await entry.sock.sendMessage(jid, { text });
+    res.json({ ok: true });
   } catch (e) {
-    logger.error({ e: e.message }, 'send failed');
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ ok: false, error: e?.message || String(e) });
   }
 });
 
-app.use((err, _req, res, _next) => res.status(500).json({ error: err.message }));
-
-// ─── Boot ─────────────────────────────────────────────────────
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, '0.0.0.0', () => {
-  logger.info(`🚀 Bridge listening on :${PORT}`);
-  if (fs.existsSync('./auth')) {
-    for (const dir of fs.readdirSync('./auth')) {
-      logger.info(`Restoring session ${dir}`);
-      startSession(dir).catch((e) =>
-        logger.error({ e: e.message }, `restore ${dir} failed`)
-      );
+app.post("/pair", async (req, res) => {
+  const { phone, session } = req.body || {};
+  const sid = session || phone;
+  if (!sid || !phone) return res.status(400).json({ ok: false, error: "missing phone/session" });
+  const entry = await startSession(sid);
+  if (entry.status === "connected") return res.json({ ok: true, alreadyConnected: true });
+  try {
+    // Wait briefly for socket to be ready
+    for (let i = 0; i < 20 && !entry.sock?.requestPairingCode; i++) {
+      await new Promise((r) => setTimeout(r, 250));
     }
+    const code = await entry.sock.requestPairingCode(String(phone).replace(/\D/g, ""));
+    entry.pairingCode = code;
+    res.json({ ok: true, code });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e?.message || String(e), stage: "requestPairingCode" });
   }
 });
+
+app.listen(PORT, () => console.log(`Bridge listening on :${PORT}`));
