@@ -1,696 +1,867 @@
 import express from "express";
+import cors from "cors";
 import pino from "pino";
-import path from "node:path";
+import { Boom } from "@hapi/boom";
+import * as baileys from "@whiskeysockets/baileys";
 import fs from "node:fs/promises";
-import { fileURLToPath } from "node:url";
+import path from "node:path";
+import crypto from "node:crypto";
 
-import makeWASocket, {
+const {
+  useMultiFileAuthState,
   DisconnectReason,
-  fetchLatestBaileysVersion,
-  makeCacheableSignalKeyStore,
-  useMultiFileAuthState
-} from "@whiskeysockets/baileys";
+  fetchLatestBaileysVersion
+} = baileys;
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+/**
+ * IMPORTANT:
+ * This fixes the common Railway/CommonJS/ESM issue:
+ * "makeWASocket is not a function"
+ */
+const makeWASocket =
+  baileys.default?.default ||
+  baileys.default ||
+  baileys.makeWASocket;
 
-const PORT = Number(process.env.PORT || 3000);
-
-const API_KEY =
-  process.env.API_KEY ||
-  process.env.BRIDGE_API_KEY ||
-  process.env.WHATSAPP_VPS_API_KEY ||
-  process.env.WA_BRIDGE_API_KEY ||
-  "";
-
-const SESSIONS_DIR =
-  process.env.SESSIONS_DIR || path.join(__dirname, "sessions");
-
-const log = pino({
-  level: process.env.LOG_LEVEL || "info"
-});
+if (typeof makeWASocket !== "function") {
+  console.error("❌ makeWASocket was not found as a function.");
+  console.error("Available Baileys exports:", Object.keys(baileys));
+  process.exit(1);
+}
 
 const app = express();
 
-app.use(
-  express.json({
-    limit: "1mb"
-  })
-);
+app.use(cors());
+app.use(express.json({ limit: "2mb" }));
 
+const PORT = Number(process.env.PORT || 3000);
+
+/**
+ * Required Railway variables:
+ *
+ * WHATSAPP_VPS_API_KEY
+ * WA_BRIDGE_WEBHOOK_SECRET
+ * WEBHOOK_URL
+ *
+ * Optional:
+ * SESSION_ROOT=/data/sessions
+ * DEFAULT_STATION_ID=<station uuid>
+ */
+const API_KEY = process.env.WHATSAPP_VPS_API_KEY || "";
+const WEBHOOK_SECRET = process.env.WA_BRIDGE_WEBHOOK_SECRET || "";
+const WEBHOOK_URL =
+  process.env.WEBHOOK_URL ||
+  process.env.LOVABLE_WEBHOOK_URL ||
+  "";
+
+const DEFAULT_STATION_ID = process.env.DEFAULT_STATION_ID || "";
+
+const SESSION_ROOT =
+  process.env.SESSION_ROOT ||
+  process.env.WHATSAPP_SESSION_ROOT ||
+  path.join(process.cwd(), "data", "sessions");
+
+const logger = pino({ level: process.env.LOG_LEVEL || "info" });
+
+/**
+ * In-memory session registry.
+ * Key: session id, usually the phone number in international format.
+ */
 const sessions = new Map();
 
-function nowIso() {
-  return new Date().toISOString();
-}
+await fs.mkdir(SESSION_ROOT, { recursive: true });
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function normalizePhone(input) {
-  const raw = String(input || "").trim();
+function normalizePhone(value) {
+  const raw = String(value || "").trim();
   let digits = raw.replace(/\D/g, "");
 
-  if (!digits) {
-    return "";
-  }
+  if (!digits) return "";
 
   if (digits.startsWith("00")) {
     digits = digits.slice(2);
   }
 
-  if (digits.startsWith("0") && digits.length >= 9) {
-    digits = `972${digits.slice(1)}`;
+  if (digits.startsWith("972")) {
+    return digits;
+  }
+
+  if (digits.startsWith("0")) {
+    return `972${digits.slice(1)}`;
+  }
+
+  if (digits.length === 9 && digits.startsWith("5")) {
+    return `972${digits}`;
   }
 
   return digits;
 }
 
-function sanitizeSessionId(input) {
-  const value = String(input || "").trim();
-
-  if (!value) {
-    return "default";
-  }
-
+function normalizeSession(value) {
   const phone = normalizePhone(value);
-  const base = phone || value;
+  if (phone) return phone;
 
-  return (
-    base
-      .toLowerCase()
-      .replace(/[^a-z0-9_-]/g, "_")
-      .replace(/_+/g, "_")
-      .slice(0, 80) || "default"
-  );
+  return String(value || "default")
+    .replace(/[^a-zA-Z0-9_-]/g, "_")
+    .slice(0, 80);
 }
 
-function getRequestedSessionId(req) {
-  const fromBody =
-    req.body?.sessionId ||
-    req.body?.session_id ||
-    req.body?.phone ||
-    req.body?.number;
+function sessionDir(session) {
+  return path.join(SESSION_ROOT, normalizeSession(session));
+}
 
-  const fromQuery =
-    req.query?.sessionId ||
-    req.query?.session_id ||
-    req.query?.phone ||
-    req.query?.number;
+function safeEqual(a, b) {
+  const aa = Buffer.from(String(a || ""));
+  const bb = Buffer.from(String(b || ""));
 
-  return sanitizeSessionId(fromBody || fromQuery || "default");
+  if (aa.length !== bb.length) return false;
+  if (aa.length === 0) return false;
+
+  return crypto.timingSafeEqual(aa, bb);
 }
 
 function getProvidedApiKey(req) {
-  const auth = req.get("authorization") || "";
-
-  if (auth.toLowerCase().startsWith("bearer ")) {
-    return auth.slice(7).trim();
-  }
-
-  return (
+  const headerKey =
     req.get("x-api-key") ||
-    req.get("x-bridge-api-key") ||
-    req.get("apikey") ||
-    req.query?.apiKey ||
-    req.query?.api_key ||
-    ""
-  );
+    req.get("X-Api-Key") ||
+    "";
+
+  const auth = req.get("authorization") || "";
+  const bearer = auth.replace(/^Bearer\s+/i, "");
+
+  return headerKey || bearer || "";
 }
 
-function requireApiKey(req, res, next) {
+function requireAuth(req, res, next) {
   if (!API_KEY) {
-    return res.status(500).json({
+    return res.status(503).json({
       ok: false,
-      error: "server_missing_api_key",
-      message:
-        "API key is not configured on Railway. Add API_KEY in Railway Variables."
+      error: "api_key_not_configured",
+      message: "WHATSAPP_VPS_API_KEY is missing on Railway"
     });
   }
 
-  const provided = String(getProvidedApiKey(req) || "");
+  const provided = getProvidedApiKey(req);
 
-  if (provided !== API_KEY) {
+  if (!safeEqual(provided, API_KEY)) {
     return res.status(401).json({
       ok: false,
       error: "unauthorized"
     });
   }
 
-  return next();
+  next();
 }
 
-function parseForceReset(req) {
-  const value =
-    req.body?.forceReset ??
-    req.body?.force_reset ??
-    req.query?.forceReset ??
-    req.query?.force_reset ??
-    false;
+function jidToPhone(jid) {
+  const clean = String(jid || "")
+    .split("@")[0]
+    .split(":")[0]
+    .replace(/\D/g, "");
 
-  return value === true || value === "true" || value === "1" || value === 1;
+  return clean;
 }
 
-function authDirForSession(sessionId) {
-  return path.join(SESSIONS_DIR, sessionId);
-}
+function phoneToJid(phoneOrJid) {
+  const value = String(phoneOrJid || "").trim();
 
-async function ensureSessionsDir() {
-  await fs.mkdir(SESSIONS_DIR, {
-    recursive: true
-  });
-}
-
-async function wipeAuth(sessionId) {
-  const safeId = sanitizeSessionId(sessionId);
-  const dir = authDirForSession(safeId);
-
-  const existing = sessions.get(safeId);
-
-  if (existing?.sock) {
-    try {
-      existing.sock.ev.removeAllListeners("creds.update");
-      existing.sock.ev.removeAllListeners("connection.update");
-    } catch (_e) {
-      // ignore listener cleanup errors
-    }
-
-    try {
-      existing.sock.end?.();
-    } catch (_e) {
-      // ignore socket close errors
-    }
+  if (value.includes("@")) {
+    return value;
   }
 
-  sessions.delete(safeId);
-
-  await fs.rm(dir, {
-    recursive: true,
-    force: true
-  });
-
-  log.info({ sessionId: safeId }, "auth folder wiped");
+  const phone = normalizePhone(value);
+  return `${phone}@s.whatsapp.net`;
 }
 
-async function createOrGetSession(sessionId) {
-  const safeId = sanitizeSessionId(sessionId);
-  const existing = sessions.get(safeId);
+function getTextFromMessage(message) {
+  const m = message?.message;
+  if (!m) return "";
 
-  if (existing?.sock && existing?.state) {
+  const unwrapped =
+    m.ephemeralMessage?.message ||
+    m.viewOnceMessage?.message ||
+    m.viewOnceMessageV2?.message ||
+    m.documentWithCaptionMessage?.message ||
+    m;
+
+  return (
+    unwrapped.conversation ||
+    unwrapped.extendedTextMessage?.text ||
+    unwrapped.imageMessage?.caption ||
+    unwrapped.videoMessage?.caption ||
+    unwrapped.documentMessage?.caption ||
+    unwrapped.buttonsResponseMessage?.selectedDisplayText ||
+    unwrapped.buttonsResponseMessage?.selectedButtonId ||
+    unwrapped.listResponseMessage?.title ||
+    unwrapped.templateButtonReplyMessage?.selectedDisplayText ||
+    unwrapped.templateButtonReplyMessage?.selectedId ||
+    ""
+  ).toString().trim();
+}
+
+async function postWebhook(payload) {
+  if (!WEBHOOK_URL) return;
+  if (!DEFAULT_STATION_ID) return;
+  if (!payload?.text) return;
+
+  const body = {
+    station_id: DEFAULT_STATION_ID,
+    driver_phone: payload.driver_phone,
+    text: payload.text,
+    wa_message_id: payload.wa_message_id || null,
+    direction: payload.direction || "incoming"
+  };
+
+  const headers = {
+    "Content-Type": "application/json"
+  };
+
+  if (WEBHOOK_SECRET) {
+    headers["x-bridge-secret"] = WEBHOOK_SECRET;
+  }
+
+  try {
+    const r = await fetch(WEBHOOK_URL, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body)
+    });
+
+    if (!r.ok) {
+      const text = await r.text().catch(() => "");
+      logger.warn(
+        {
+          status: r.status,
+          body: text.slice(0, 300)
+        },
+        "Webhook returned non-OK response"
+      );
+    }
+  } catch (error) {
+    logger.warn(
+      {
+        error: error instanceof Error ? error.message : String(error)
+      },
+      "Failed to post webhook"
+    );
+  }
+}
+
+function publicSessionStatus(record) {
+  if (!record) {
+    return {
+      ok: false,
+      connected: false,
+      status: "not_found",
+      hasQR: false
+    };
+  }
+
+  return {
+    ok: true,
+    session: record.session,
+    phone: record.phone,
+    status: record.status,
+    connected: record.status === "connected",
+    hasQR: false,
+    pairingCodeReady: record.status === "pairing_code_ready",
+    lastError: record.lastError || null,
+    connectedAt: record.connectedAt || null,
+    lastSeenAt: record.lastSeenAt || null,
+    codeExpiresAt: record.codeExpiresAt || null
+  };
+}
+
+async function closeSocket(record) {
+  if (!record?.sock) return;
+
+  try {
+    record.sock.ev?.removeAllListeners?.();
+  } catch (_) {}
+
+  try {
+    record.sock.end?.(new Error("socket closed by bridge"));
+  } catch (_) {}
+
+  try {
+    record.sock.ws?.close?.();
+  } catch (_) {}
+
+  record.sock = null;
+}
+
+async function resetSession(session, deleteFiles = true) {
+  const id = normalizeSession(session);
+  const record = sessions.get(id);
+
+  if (record) {
+    await closeSocket(record);
+    sessions.delete(id);
+  }
+
+  if (deleteFiles) {
+    await fs.rm(sessionDir(id), {
+      recursive: true,
+      force: true
+    });
+  }
+
+  return {
+    ok: true,
+    session: id,
+    deletedFiles: deleteFiles
+  };
+}
+
+async function startSocket(sessionValue, phoneValue) {
+  const session = normalizeSession(sessionValue);
+  const phone = normalizePhone(phoneValue || session);
+
+  const existing = sessions.get(session);
+
+  if (existing?.starting) {
+    return existing.starting;
+  }
+
+  if (existing?.sock) {
     return existing;
   }
 
-  if (existing?.connectingPromise) {
-    return existing.connectingPromise;
-  }
+  const record =
+    existing ||
+    {
+      session,
+      phone,
+      sock: null,
+      status: "starting",
+      lastError: null,
+      connectedAt: null,
+      lastSeenAt: null,
+      codeExpiresAt: null,
+      starting: null,
+      registered: false
+    };
 
-  const session = existing || {
-    id: safeId,
-    sock: null,
-    state: null,
-    saveCreds: null,
-    status: "initializing",
-    pairingCode: null,
-    pairingCodeAt: 0,
-    lastError: null,
-    lastDisconnectReason: null,
-    connectingPromise: null
-  };
+  sessions.set(session, record);
 
-  sessions.set(safeId, session);
+  const starting = (async () => {
+    const dir = sessionDir(session);
+    await fs.mkdir(dir, { recursive: true });
 
-  session.connectingPromise = (async () => {
-    await ensureSessionsDir();
+    const { state, saveCreds } = await useMultiFileAuthState(dir);
 
-    const authDir = authDirForSession(safeId);
+    let version;
+    try {
+      const latest = await fetchLatestBaileysVersion();
+      version = latest.version;
+    } catch (error) {
+      logger.warn(
+        {
+          error: error instanceof Error ? error.message : String(error)
+        },
+        "Could not fetch latest Baileys version, using bundled default"
+      );
+      version = undefined;
+    }
 
-    const { state, saveCreds } = await useMultiFileAuthState(authDir);
-    const { version } = await fetchLatestBaileysVersion();
-
-    const childLogger = log.child({
-      sessionId: safeId
-    });
+    record.status = state.creds?.registered ? "connecting" : "pairing";
+    record.registered = Boolean(state.creds?.registered);
 
     const sock = makeWASocket({
       version,
-      logger: childLogger,
+      auth: state,
+      logger: pino({ level: "silent" }),
       printQRInTerminal: false,
-      browser: ["Windows", "Chrome", "114.0.5735.198"],
       markOnlineOnConnect: false,
-      connectTimeoutMs: 60_000,
-      defaultQueryTimeoutMs: 60_000,
-      keepAliveIntervalMs: 20_000,
-      generateHighQualityLinkPreview: false,
       syncFullHistory: false,
-      auth: {
-        creds: state.creds,
-        keys: makeCacheableSignalKeyStore(state.keys, childLogger)
-      }
+      generateHighQualityLinkPreview: false,
+      browser: ["Windows", "Chrome", "114.0.5735.198"],
+      getMessage: async () => undefined
     });
 
-    session.sock = sock;
-    session.state = state;
-    session.saveCreds = saveCreds;
-    session.status = state.creds?.registered ? "registered" : "pairing_required";
-    session.lastError = null;
+    record.sock = sock;
 
     sock.ev.on("creds.update", saveCreds);
 
-    sock.ev.on("connection.update", (update) => {
-      const { connection, lastDisconnect, qr } = update;
+    sock.ev.on("connection.update", async (update) => {
+      const { connection, lastDisconnect } = update;
 
-      if (qr) {
-        session.status = "qr_received";
+      if (connection === "open") {
+        record.status = "connected";
+        record.connectedAt = new Date().toISOString();
+        record.lastSeenAt = new Date().toISOString();
+        record.lastError = null;
+        record.registered = true;
+
+        logger.info(
+          {
+            session
+          },
+          "WhatsApp connected"
+        );
       }
 
       if (connection === "connecting") {
-        session.status = "connecting";
-      }
-
-      if (connection === "open") {
-        session.status = "open";
-        session.lastError = null;
-        session.lastDisconnectReason = null;
-
-        log.info(
-          {
-            sessionId: safeId,
-            registered: Boolean(session.state?.creds?.registered)
-          },
-          "whatsapp connection open"
-        );
+        if (record.status !== "pairing_code_ready") {
+          record.status = "connecting";
+        }
       }
 
       if (connection === "close") {
-        const statusCode =
-          lastDisconnect?.error?.output?.statusCode ||
-          lastDisconnect?.error?.status ||
-          null;
-
-        session.lastDisconnectReason = statusCode;
-        session.status =
-          statusCode === DisconnectReason.loggedOut
-            ? "logged_out"
-            : "disconnected";
-
-        session.lastError =
+        const boom = new Boom(lastDisconnect?.error);
+        const statusCode = boom?.output?.statusCode;
+        const message =
           lastDisconnect?.error?.message ||
-          lastDisconnect?.error?.toString?.() ||
+          boom?.message ||
           "connection closed";
 
-        log.warn(
+        record.status = "disconnected";
+        record.lastError = message;
+        record.sock = null;
+
+        logger.warn(
           {
-            sessionId: safeId,
+            session,
             statusCode,
-            error: session.lastError
+            message
           },
-          "whatsapp connection closed"
+          "WhatsApp connection closed"
         );
 
-        session.sock = null;
+        const shouldNotReconnect =
+          statusCode === DisconnectReason.loggedOut ||
+          statusCode === DisconnectReason.badSession ||
+          statusCode === 401;
 
-        if (statusCode === DisconnectReason.loggedOut) {
-          session.status = "logged_out";
+        if (!shouldNotReconnect && record.registered) {
+          setTimeout(() => {
+            startSocket(session, phone).catch((error) => {
+              logger.error(
+                {
+                  session,
+                  error: error instanceof Error ? error.message : String(error)
+                },
+                "Reconnect failed"
+              );
+            });
+          }, 4000);
         }
       }
     });
 
-    log.info(
-      {
-        sessionId: safeId,
-        registered: Boolean(state.creds?.registered)
-      },
-      "session initialized"
-    );
+    sock.ev.on("messages.upsert", async ({ messages }) => {
+      for (const msg of messages || []) {
+        try {
+          const remoteJid = msg?.key?.remoteJid || "";
 
-    return session;
+          if (!remoteJid) continue;
+          if (remoteJid === "status@broadcast") continue;
+          if (remoteJid.endsWith("@g.us")) continue;
+
+          const text = getTextFromMessage(msg);
+          if (!text) continue;
+
+          const fromMe = Boolean(msg?.key?.fromMe);
+          const driverPhone = jidToPhone(remoteJid);
+
+          if (!driverPhone) continue;
+
+          await postWebhook({
+            direction: fromMe ? "outgoing" : "incoming",
+            driver_phone: driverPhone,
+            text,
+            wa_message_id: msg?.key?.id || null
+          });
+        } catch (error) {
+          logger.warn(
+            {
+              error: error instanceof Error ? error.message : String(error)
+            },
+            "Failed to handle incoming WhatsApp message"
+          );
+        }
+      }
+    });
+
+    return record;
   })();
 
+  record.starting = starting;
+
   try {
-    return await session.connectingPromise;
+    return await starting;
   } finally {
-    session.connectingPromise = null;
+    record.starting = null;
   }
 }
 
-async function waitForSocketReady(session, timeoutMs = 5000) {
-  const start = Date.now();
+async function waitForConnected(record, timeoutMs = 10000) {
+  const started = Date.now();
 
-  while (Date.now() - start < timeoutMs) {
-    if (!session.sock) {
-      return false;
-    }
-
-    if (
-      session.status === "open" ||
-      session.status === "pairing_required" ||
-      session.status === "connecting" ||
-      session.status === "qr_received"
-    ) {
+  while (Date.now() - started < timeoutMs) {
+    if (record.status === "connected" && record.sock) {
       return true;
     }
 
-    await sleep(150);
+    await sleep(500);
   }
 
-  return Boolean(session.sock);
+  return false;
 }
 
-function jidFromInput({ jid, phone, number, groupJid }) {
-  const direct = jid || groupJid;
-
-  if (direct) {
-    return String(direct).trim();
+async function createPairingCode({ phone, session, forceReset }) {
+  if (forceReset) {
+    await resetSession(session, true);
   }
 
-  const digits = normalizePhone(phone || number);
+  const record = await startSocket(session, phone);
 
-  if (!digits) {
-    return "";
+  if (record.status === "connected" || record.registered) {
+    return {
+      ok: true,
+      alreadyConnected: true,
+      status: "connected",
+      session,
+      phone
+    };
   }
 
-  return `${digits}@s.whatsapp.net`;
-}
+  await sleep(1800);
 
-function publicSessionState(session) {
+  if (!record.sock) {
+    throw new Error(record.lastError || "socket_not_available");
+  }
+
+  if (typeof record.sock.requestPairingCode !== "function") {
+    throw new Error("requestPairingCode is not available on this Baileys socket");
+  }
+
+  const pairingCode = await record.sock.requestPairingCode(phone);
+
+  record.status = "pairing_code_ready";
+  record.codeExpiresAt = new Date(Date.now() + 3 * 60 * 1000).toISOString();
+  record.lastError = null;
+
   return {
-    id: session.id,
-    status: session.status,
-    registered: Boolean(session.state?.creds?.registered),
-    hasSocket: Boolean(session.sock),
-    lastError: session.lastError || null,
-    lastDisconnectReason: session.lastDisconnectReason || null
+    ok: true,
+    alreadyConnected: false,
+    status: "pairing_code_ready",
+    session,
+    phone,
+    pairingCode,
+    code: pairingCode,
+    codeExpiresAt: record.codeExpiresAt
   };
 }
 
 app.get("/", (_req, res) => {
-  res.status(200).json({
+  res.json({
     ok: true,
     service: "wa-bridge",
-    time: nowIso()
+    message: "WhatsApp bridge is running"
   });
 });
 
 app.get("/health", (_req, res) => {
-  res.status(200).json({
+  res.json({
     ok: true,
-    status: "healthy",
     service: "wa-bridge",
+    status: "healthy",
+    time: new Date().toISOString(),
     uptime: process.uptime(),
-    time: nowIso()
+    sessions: Array.from(sessions.values()).map((s) => ({
+      session: s.session,
+      phone: s.phone,
+      status: s.status,
+      connected: s.status === "connected",
+      lastSeenAt: s.lastSeenAt || null,
+      lastError: s.lastError || null
+    }))
   });
 });
 
-app.head("/health", (_req, res) => {
-  res.sendStatus(200);
-});
+app.post("/pair", requireAuth, async (req, res) => {
+  const phone = normalizePhone(req.body?.phone);
+  const session = normalizeSession(req.body?.session || phone);
+  const forceReset = Boolean(req.body?.forceReset);
 
-app.get("/status", requireApiKey, async (req, res) => {
-  const sessionId = getRequestedSessionId(req);
-  const session = sessions.get(sessionId);
-
-  res.status(200).json({
-    ok: true,
-    session: session
-      ? publicSessionState(session)
-      : {
-          id: sessionId,
-          status: "not_initialized",
-          registered: false,
-          hasSocket: false,
-          lastError: null,
-          lastDisconnectReason: null
-        }
-  });
-});
-
-app.all("/pair", requireApiKey, async (req, res) => {
-  try {
-    const phone =
-      req.body?.phone ||
-      req.body?.number ||
-      req.query?.phone ||
-      req.query?.number ||
-      "";
-
-    const normalizedPhone = normalizePhone(phone);
-
-    if (!normalizedPhone) {
-      return res.status(400).json({
-        ok: false,
-        error: "missing_phone",
-        message: "Pass phone/number with country code, for example 9725..."
-      });
-    }
-
-    const sessionId = getRequestedSessionId(req);
-    const forceReset = parseForceReset(req);
-
-    if (forceReset) {
-      await wipeAuth(sessionId);
-    }
-
-    const session = await createOrGetSession(sessionId);
-    await waitForSocketReady(session, 7000);
-
-    const registered = Boolean(session.state?.creds?.registered);
-
-    if (registered) {
-      return res.status(200).json({
-        ok: true,
-        registered: true,
-        session: publicSessionState(session),
-        message: "WhatsApp session is already registered. Pairing code not requested."
-      });
-    }
-
-    if (!session.sock) {
-      return res.status(503).json({
-        ok: false,
-        error: "socket_not_ready",
-        session: publicSessionState(session)
-      });
-    }
-
-    const cachedCodeAgeMs = Date.now() - Number(session.pairingCodeAt || 0);
-
-    if (session.pairingCode && cachedCodeAgeMs < 90_000) {
-      return res.status(200).json({
-        ok: true,
-        registered: false,
-        pairingCode: session.pairingCode,
-        code: session.pairingCode,
-        cached: true,
-        session: publicSessionState(session)
-      });
-    }
-
-    const code = await session.sock.requestPairingCode(normalizedPhone);
-
-    session.pairingCode = code;
-    session.pairingCodeAt = Date.now();
-    session.status = "pairing_code_created";
-
-    return res.status(200).json({
-      ok: true,
-      registered: false,
-      pairingCode: code,
-      code,
-      cached: false,
-      session: publicSessionState(session)
+  if (!phone) {
+    return res.status(400).json({
+      ok: false,
+      error: "phone_required"
     });
-  } catch (e) {
-    log.error(
+  }
+
+  try {
+    let result;
+
+    try {
+      result = await createPairingCode({
+        phone,
+        session,
+        forceReset
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+
+      /**
+       * Baileys sometimes closes a stale socket while requesting a pairing code.
+       * In that case, reset once and retry.
+       */
+      if (!forceReset && /connection\s*closed|socket|stream/i.test(message)) {
+        logger.warn(
+          {
+            session,
+            message
+          },
+          "Pairing failed once, resetting and retrying"
+        );
+
+        await resetSession(session, true);
+        await sleep(2500);
+
+        result = await createPairingCode({
+          phone,
+          session,
+          forceReset: false
+        });
+      } else {
+        throw error;
+      }
+    }
+
+    return res.json(result);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+
+    logger.error(
       {
-        err: e?.stack || e?.message || String(e)
+        session,
+        phone,
+        message
       },
-      "pair failed"
+      "Pairing failed"
     );
 
     return res.status(502).json({
       ok: false,
       error: "pair_failed",
-      message: e?.message || String(e),
+      message,
       step: "requestPairingCode"
     });
   }
 });
 
-app.post("/send", requireApiKey, async (req, res) => {
-  try {
-    const sessionId = getRequestedSessionId(req);
+app.get("/status", requireAuth, async (req, res) => {
+  const sessionQuery = req.query.session ? normalizeSession(req.query.session) : "";
 
-    const text = String(req.body?.text || req.body?.message || "").trim();
-
-    if (!text) {
-      return res.status(400).json({
-        ok: false,
-        error: "missing_text"
-      });
-    }
-
-    const jid = jidFromInput({
-      jid: req.body?.jid,
-      groupJid: req.body?.groupJid || req.body?.group_jid,
-      phone: req.body?.phone,
-      number: req.body?.number
-    });
-
-    if (!jid) {
-      return res.status(400).json({
-        ok: false,
-        error: "missing_recipient",
-        message: "Pass jid/groupJid or phone/number."
-      });
-    }
-
-    const session = await createOrGetSession(sessionId);
-
-    if (!session.state?.creds?.registered) {
-      return res.status(409).json({
-        ok: false,
-        error: "not_registered",
-        message: "WhatsApp session is not paired yet.",
-        session: publicSessionState(session)
-      });
-    }
-
-    if (!session.sock) {
-      return res.status(503).json({
-        ok: false,
-        error: "socket_not_ready",
-        session: publicSessionState(session)
-      });
-    }
-
-    const result = await session.sock.sendMessage(jid, {
-      text
-    });
-
-    return res.status(200).json({
-      ok: true,
-      jid,
-      result
-    });
-  } catch (e) {
-    log.error(
-      {
-        err: e?.stack || e?.message || String(e)
-      },
-      "send failed"
-    );
-
-    return res.status(502).json({
-      ok: false,
-      error: "send_failed",
-      message: e?.message || String(e)
-    });
+  if (sessionQuery) {
+    return res.json(publicSessionStatus(sessions.get(sessionQuery)));
   }
+
+  return res.json({
+    ok: true,
+    sessions: Array.from(sessions.values()).map(publicSessionStatus)
+  });
 });
 
-app.get("/groups", requireApiKey, async (req, res) => {
+app.get("/status/:session", requireAuth, async (req, res) => {
+  const session = normalizeSession(req.params.session);
+  return res.json(publicSessionStatus(sessions.get(session)));
+});
+
+app.get("/groups", requireAuth, async (req, res) => {
+  const session = normalizeSession(req.query.session || req.query.sessionId || "");
+
+  if (!session) {
+    return res.status(400).json({
+      ok: false,
+      error: "session_required"
+    });
+  }
+
+  const record = sessions.get(session) || (await startSocket(session, session));
+
+  const connected = await waitForConnected(record, 8000);
+
+  if (!connected || !record.sock) {
+    return res.status(409).json({
+      ok: false,
+      error: "session_not_connected",
+      status: record.status,
+      lastError: record.lastError || null
+    });
+  }
+
   try {
-    const sessionId = getRequestedSessionId(req);
-    const session = await createOrGetSession(sessionId);
-
-    if (!session.state?.creds?.registered) {
-      return res.status(409).json({
-        ok: false,
-        error: "not_registered",
-        message: "WhatsApp session is not paired yet.",
-        session: publicSessionState(session)
-      });
-    }
-
-    if (!session.sock) {
-      return res.status(503).json({
-        ok: false,
-        error: "socket_not_ready",
-        session: publicSessionState(session)
-      });
-    }
-
-    const map = await session.sock.groupFetchAllParticipating();
-
-    const groups = Object.values(map || {}).map((group) => ({
+    const groupsMap = await record.sock.groupFetchAllParticipating();
+    const groups = Object.values(groupsMap || {}).map((group) => ({
       jid: group.id,
-      name: group.subject,
-      subject: group.subject,
-      participantsCount: Array.isArray(group.participants)
+      id: group.id,
+      name: group.subject || group.name || group.id,
+      subject: group.subject || group.name || group.id,
+      participants: Array.isArray(group.participants)
         ? group.participants.length
-        : undefined
+        : null,
+      size: Array.isArray(group.participants)
+        ? group.participants.length
+        : null,
+      announce: Boolean(group.announce)
     }));
 
-    return res.status(200).json({
+    return res.json({
       ok: true,
       groups
     });
-  } catch (e) {
-    log.error(
-      {
-        err: e?.stack || e?.message || String(e)
-      },
-      "groups failed"
-    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
 
     return res.status(502).json({
       ok: false,
       error: "groups_failed",
-      message: e?.message || String(e)
+      message
     });
   }
 });
 
-app.all("/logout", requireApiKey, async (req, res) => {
-  try {
-    const sessionId = getRequestedSessionId(req);
-    const safeId = sanitizeSessionId(sessionId);
-    const session = sessions.get(safeId);
+app.post("/send", requireAuth, async (req, res) => {
+  const session = normalizeSession(
+    req.body?.session ||
+      req.body?.sessionId ||
+      req.query?.session ||
+      ""
+  );
 
-    if (session?.sock) {
-      try {
-        await session.sock.logout();
-      } catch (_e) {
-        // Continue and wipe local auth even if WhatsApp logout fails
-      }
-    }
+  const jid = phoneToJid(
+    req.body?.jid ||
+      req.body?.to ||
+      req.body?.phone ||
+      ""
+  );
 
-    await wipeAuth(safeId);
+  const text = String(req.body?.text || req.body?.message || "").trim();
 
-    return res.status(200).json({
-      ok: true,
-      sessionId: safeId,
-      message: "Logged out and auth folder deleted."
-    });
-  } catch (e) {
-    return res.status(500).json({
+  if (!session) {
+    return res.status(400).json({
       ok: false,
-      error: "logout_failed",
-      message: e?.message || String(e)
+      error: "session_required"
+    });
+  }
+
+  if (!jid || jid === "@s.whatsapp.net") {
+    return res.status(400).json({
+      ok: false,
+      error: "jid_required"
+    });
+  }
+
+  if (!text) {
+    return res.status(400).json({
+      ok: false,
+      error: "text_required"
+    });
+  }
+
+  const record = sessions.get(session) || (await startSocket(session, session));
+
+  const connected = await waitForConnected(record, 10000);
+
+  if (!connected || !record.sock) {
+    return res.status(409).json({
+      ok: false,
+      error: "session_not_connected",
+      status: record.status,
+      lastError: record.lastError || null
+    });
+  }
+
+  try {
+    const sent = await record.sock.sendMessage(jid, { text });
+
+    return res.json({
+      ok: true,
+      session,
+      jid,
+      messageId: sent?.key?.id || null
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+
+    return res.status(502).json({
+      ok: false,
+      error: "send_failed",
+      message
     });
   }
 });
 
-app.all("/reset", requireApiKey, async (req, res) => {
-  try {
-    const sessionId = getRequestedSessionId(req);
-    const safeId = sanitizeSessionId(sessionId);
+app.post("/logout", requireAuth, async (req, res) => {
+  const session = normalizeSession(
+    req.query.session ||
+      req.body?.session ||
+      req.body?.sessionId ||
+      ""
+  );
 
-    await wipeAuth(safeId);
-
-    return res.status(200).json({
-      ok: true,
-      sessionId: safeId,
-      message: "Auth folder deleted."
-    });
-  } catch (e) {
-    return res.status(500).json({
+  if (!session) {
+    return res.status(400).json({
       ok: false,
-      error: "reset_failed",
-      message: e?.message || String(e)
+      error: "session_required"
     });
   }
+
+  const result = await resetSession(session, true);
+  return res.json(result);
+});
+
+app.post("/reset", requireAuth, async (req, res) => {
+  const session = normalizeSession(
+    req.query.session ||
+      req.body?.session ||
+      req.body?.sessionId ||
+      ""
+  );
+
+  if (session) {
+    const result = await resetSession(session, true);
+    return res.json(result);
+  }
+
+  const all = Array.from(sessions.keys());
+
+  for (const id of all) {
+    await resetSession(id, true);
+  }
+
+  try {
+    await fs.rm(SESSION_ROOT, {
+      recursive: true,
+      force: true
+    });
+    await fs.mkdir(SESSION_ROOT, {
+      recursive: true
+    });
+  } catch (_) {}
+
+  return res.json({
+    ok: true,
+    resetAll: true
+  });
+});
+
+app.post("/session/:session/logout", requireAuth, async (req, res) => {
+  const session = normalizeSession(req.params.session);
+  const result = await resetSession(session, true);
+  return res.json(result);
+});
+
+app.delete("/session/:session", requireAuth, async (req, res) => {
+  const session = normalizeSession(req.params.session);
+  const result = await resetSession(session, true);
+  return res.json(result);
 });
 
 app.use((req, res) => {
@@ -701,48 +872,15 @@ app.use((req, res) => {
   });
 });
 
-app.use((err, _req, res, _next) => {
-  log.error(
-    {
-      err: err?.stack || err?.message || String(err)
-    },
-    "unhandled express error"
-  );
-
-  res.status(500).json({
-    ok: false,
-    error: "internal_error",
-    message: err?.message || String(err)
-  });
-});
-
-process.on("unhandledRejection", (reason) => {
-  log.error(
-    {
-      err: reason?.stack || reason?.message || String(reason)
-    },
-    "unhandled rejection"
-  );
-});
-
-process.on("uncaughtException", (err) => {
-  log.fatal(
-    {
-      err: err?.stack || err?.message || String(err)
-    },
-    "uncaught exception"
-  );
-
-  process.exit(1);
-});
-
-app.listen(PORT, "0.0.0.0", () => {
-  log.info(
+app.listen(PORT, () => {
+  logger.info(
     {
       port: PORT,
-      sessionsDir: SESSIONS_DIR,
-      hasApiKey: Boolean(API_KEY)
+      sessionRoot: SESSION_ROOT,
+      apiKeyConfigured: Boolean(API_KEY),
+      webhookConfigured: Boolean(WEBHOOK_URL),
+      defaultStationConfigured: Boolean(DEFAULT_STATION_ID)
     },
-    "bridge up"
+    "WhatsApp bridge started"
   );
 });
