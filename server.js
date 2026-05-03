@@ -34,9 +34,15 @@ function ensureSession(phone) {
   let s = sessions.get(phone);
   if (!s) {
     s = {
-      phone, status: 'not_started', lastError: null,
-      pairingCode: null, codeExpiresAt: null, sock: null,
-      pairingReady: false, pairingPromise: null, lastUpdate: Date.now(),
+      phone,
+      status: 'not_started',
+      lastError: null,
+      pairingCode: null,
+      codeExpiresAt: null,
+      sock: null,
+      pairingReady: false,
+      pairingPromise: null,
+      lastUpdate: Date.now(),
     };
     sessions.set(phone, s);
   }
@@ -104,7 +110,7 @@ async function createSocket(phone, { forceReset } = {}) {
 
   sock.ev.on('creds.update', saveCreds);
 
-  // ----- Forward INCOMING 1:1 driver messages to Lovable Cloud webhook -----
+  // Forward INCOMING 1:1 messages to Lovable Cloud webhook
   sock.ev.on('messages.upsert', async (ev) => {
     if (!WEBHOOK_URL) return;
     if (ev.type !== 'notify') return;
@@ -152,7 +158,9 @@ async function createSocket(phone, { forceReset } = {}) {
   sock.ev.on('connection.update', async (u) => {
     const { connection, lastDisconnect, isNewLogin, qr } = u;
 
-    if (connection === 'connecting') s.pairingReady = true;
+    if (connection === 'connecting') {
+      s.pairingReady = true;
+    }
 
     if (connection === 'open' || isNewLogin) {
       setStatus(s, 'connected', { lastError: null, pairingCode: null });
@@ -171,10 +179,13 @@ async function createSocket(phone, { forceReset } = {}) {
       } else {
         setStatus(s, 'failed', { lastError: `${code ?? '?'}: ${msg}` });
       }
+
       s.pairingReady = false;
     }
 
-    if (qr) logger.warn({ phone }, 'unexpected QR fallback during pair flow');
+    if (qr) {
+      logger.warn({ phone }, 'unexpected QR fallback during pair flow');
+    }
   });
 
   return s;
@@ -182,10 +193,13 @@ async function createSocket(phone, { forceReset } = {}) {
 
 async function pair(phone, { forceReset } = {}) {
   const s = ensureSession(phone);
+
   if (s.pairingPromise) return s.pairingPromise;
 
   s.pairingPromise = (async () => {
-    if (!s.sock || forceReset) await createSocket(phone, { forceReset });
+    if (!s.sock || forceReset) {
+      await createSocket(phone, { forceReset });
+    }
 
     if (s.sock?.authState?.creds?.registered) {
       setStatus(s, 'connected');
@@ -206,15 +220,28 @@ async function pair(phone, { forceReset } = {}) {
 
     const expiresAt = new Date(Date.now() + 3 * 60_000).toISOString();
     setStatus(s, 'pairing_code_ready', {
-      pairingCode: code, codeExpiresAt: expiresAt, lastError: null,
+      pairingCode: code,
+      codeExpiresAt: expiresAt,
+      lastError: null,
     });
 
-    return { pairingCode: code, codeExpiresAt: expiresAt, status: 'pairing_code_ready' };
+    return {
+      pairingCode: code,
+      codeExpiresAt: expiresAt,
+      status: 'pairing_code_ready',
+    };
   })();
 
-  try { return await s.pairingPromise; }
-  finally { s.pairingPromise = null; }
+  try {
+    return await s.pairingPromise;
+  } finally {
+    s.pairingPromise = null;
+  }
 }
+
+// ---------------------------------------------------------------------------
+// HTTP layer
+// ---------------------------------------------------------------------------
 
 const app = express();
 app.use(express.json({ limit: '256kb' }));
@@ -242,8 +269,11 @@ app.get('/status/:phone', (req, res) => {
   const s = sessions.get(req.params.phone);
   if (!s) return res.json({ status: 'not_started', phone: req.params.phone });
   res.json({
-    phone: s.phone, status: s.status, lastError: s.lastError,
-    codeExpiresAt: s.codeExpiresAt, lastUpdate: s.lastUpdate,
+    phone: s.phone,
+    status: s.status,
+    lastError: s.lastError,
+    codeExpiresAt: s.codeExpiresAt,
+    lastUpdate: s.lastUpdate,
   });
 });
 
@@ -321,4 +351,41 @@ app.get('/groups', async (req, res) => {
 
 app.listen(PORT, () => {
   logger.info({ port: PORT, authRoot: AUTH_ROOT }, 'whatsapp bridge listening');
+  restoreSessionsOnBoot().catch((err) =>
+    logger.error({ err: err?.message }, 'restore on boot crashed')
+  );
 });
+
+// ---------------------------------------------------------------------------
+// Auto-restore: on boot, scan persistent auth dir and re-create sockets for
+// any phone that has registered creds.
+// ---------------------------------------------------------------------------
+async function restoreSessionsOnBoot() {
+  const baseDir = path.join(AUTH_ROOT, 'auth');
+  let entries = [];
+  try {
+    entries = await fs.promises.readdir(baseDir, { withFileTypes: true });
+  } catch (err) {
+    logger.info({ baseDir, err: err?.message }, 'no auth dir to restore');
+    return;
+  }
+  const phones = entries
+    .filter((e) => e.isDirectory() && /^\d{6,}$/.test(e.name))
+    .map((e) => e.name);
+
+  logger.info({ count: phones.length, phones }, 'auto-restore start');
+
+  for (const phone of phones) {
+    try {
+      const credsPath = path.join(baseDir, phone, 'creds.json');
+      const raw = await fs.promises.readFile(credsPath, 'utf8').catch(() => null);
+      if (!raw) continue;
+      const creds = JSON.parse(raw);
+      if (!creds?.registered) continue;
+      await createSocket(phone);
+      logger.info({ phone }, 'auto-restored session');
+    } catch (err) {
+      logger.error({ phone, err: err?.message }, 'auto-restore failed');
+    }
+  }
+}
