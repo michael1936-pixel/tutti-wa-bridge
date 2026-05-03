@@ -1,13 +1,14 @@
 {
-  "name": "whatsapp-bridge-multisession",
+  "name": "tutti-wa-bridge",
   "version": "2.0.0",
   "type": "module",
-  "main": "index.js",
+  "main": "server.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node server.js"
   },
   "dependencies": {
     "@whiskeysockets/baileys": "^6.7.9",
+    "@hapi/boom": "^10.0.1",
     "express": "^4.19.2",
     "pino": "^9.4.0",
     "qrcode": "^1.5.4"
