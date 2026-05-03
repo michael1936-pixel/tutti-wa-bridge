@@ -5,6 +5,7 @@
     "startCommand": "node server.js",
     "healthcheckPath": "/health",
     "healthcheckTimeout": 30,
-    "restartPolicyType": "ON_FAILURE"
+    "restartPolicyType": "ON_FAILURE",
+    "restartPolicyMaxRetries": 5
   }
 }
