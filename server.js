@@ -6,155 +6,156 @@ import qrcode from 'qrcode-terminal';
 import fs from 'fs';
 import path from 'path';
 
-// ✅ תמיכה גם ב-default export וגם ב-named export של Baileys
-const makeWASocket = baileysPkg.default ?? baileysPkg.makeWASocket;
-const { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = baileysPkg;
+// ✅ זיהוי חכם של makeWASocket מכל וריאציות הייצוא של Baileys
+const makeWASocket =
+  (typeof baileysPkg.makeWASocket === 'function' && baileysPkg.makeWASocket) ||
+  (typeof baileysPkg.default === 'function' && baileysPkg.default) ||
+  (baileysPkg.default && typeof baileysPkg.default.makeWASocket === 'function' && baileysPkg.default.makeWASocket);
 
-const logger = pino({ level: 'info' });
-const app = express();
-app.use(express.json({ limit: '10mb' }));
-
-const API_KEY = process.env.BRIDGE_API_KEY || process.env.API_KEY;
-const WEBHOOK_URL = process.env.LOVABLE_WEBHOOK_URL;
-const WEBHOOK_SECRET = process.env.LOVABLE_WEBHOOK_SECRET || process.env.WA_BRIDGE_WEBHOOK_SECRET;
-
-const sessions = {};
-
-// ─── Auth middleware ──────────────────────────────────────────
-function requireApiKey(req, res, next) {
-  const key = req.headers['x-api-key'] || req.headers['authorization']?.replace('Bearer ', '');
-  if (!API_KEY || key !== API_KEY) {
-    return res.status(401).json({ error: 'unauthorized' });
+if (typeof makeWASocket !== 'function') {
+  console.error('❌ makeWASocket not found. Available keys:', Object.keys(baileysPkg));
+  if (baileysPkg.default) {
+    console.error('   default keys:', Object.keys(baileysPkg.default));
   }
+  throw new Error('makeWASocket is not a function — check @whiskeysockets/baileys version');
+}
+
+const {
+  useMultiFileAuthState,
+  DisconnectReason,
+  fetchLatestBaileysVersion,
+} =
+  baileysPkg.default && typeof baileysPkg.default === 'object'
+    ? { ...baileysPkg, ...baileysPkg.default }
+    : baileysPkg;
+
+// ─── Setup ────────────────────────────────────────────────────
+const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
+const API_KEY = process.env.API_KEY || '';
+const app = express();
+app.use(express.json({ limit: '2mb' }));
+
+const sessions = new Map(); // sessionId -> { sock, status, qr }
+
+function requireApiKey(req, res, next) {
+  if (!API_KEY) return next();
+  const key = req.headers['x-api-key'] || req.query.api_key;
+  if (key !== API_KEY) return res.status(401).json({ error: 'unauthorized' });
   next();
 }
 
-// ─── Start / restore a WhatsApp session ───────────────────────
+// ─── Session management ───────────────────────────────────────
 async function startSession(sessionId) {
-  if (sessions[sessionId]?.sock) {
-    logger.info(`Session ${sessionId} already running`);
-    return sessions[sessionId].sock;
-  }
+  const dir = path.join('./auth', sessionId);
+  fs.mkdirSync(dir, { recursive: true });
 
-  const authDir = path.join('./auth', sessionId);
-  fs.mkdirSync(authDir, { recursive: true });
-
-  const { state, saveCreds } = await useMultiFileAuthState(authDir);
-  const { version } = await fetchLatestBaileysVersion().catch(() => ({ version: undefined }));
+  const { state, saveCreds } = await useMultiFileAuthState(dir);
+  const { version } = await fetchLatestBaileysVersion();
 
   const sock = makeWASocket({
+    version,
     auth: state,
     printQRInTerminal: false,
     logger: pino({ level: 'silent' }),
-    version,
-    browser: ['LovableBridge', 'Chrome', '120.0.0'],
+    browser: ['Lovable Bridge', 'Chrome', '1.0'],
   });
 
-  sessions[sessionId] = { sock, status: 'connecting', qr: null };
+  const entry = { sock, status: 'connecting', qr: null };
+  sessions.set(sessionId, entry);
 
   sock.ev.on('creds.update', saveCreds);
 
   sock.ev.on('connection.update', (update) => {
     const { connection, lastDisconnect, qr } = update;
     if (qr) {
-      sessions[sessionId].qr = qr;
+      entry.qr = qr;
+      entry.status = 'qr';
       qrcode.generate(qr, { small: true });
-      logger.info(`QR for ${sessionId} ready`);
+      logger.info(`📱 QR ready for ${sessionId}`);
     }
     if (connection === 'open') {
-      sessions[sessionId].status = 'connected';
-      sessions[sessionId].qr = null;
+      entry.status = 'connected';
+      entry.qr = null;
       logger.info(`✅ Session ${sessionId} connected`);
     }
     if (connection === 'close') {
       const code = new Boom(lastDisconnect?.error)?.output?.statusCode;
       const shouldReconnect = code !== DisconnectReason.loggedOut;
-      sessions[sessionId].status = 'disconnected';
-      logger.warn(`Session ${sessionId} closed (code=${code}). reconnect=${shouldReconnect}`);
-      delete sessions[sessionId].sock;
-      if (shouldReconnect) setTimeout(() => startSession(sessionId), 3000);
+      entry.status = 'disconnected';
+      logger.warn({ code }, `⚠️ ${sessionId} closed`);
+      if (shouldReconnect) {
+        setTimeout(() => startSession(sessionId).catch(() => {}), 3000);
+      } else {
+        try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
+        sessions.delete(sessionId);
+      }
     }
   });
 
-  sock.ev.on('messages.upsert', async (m) => {
-    if (!WEBHOOK_URL) return;
-    try {
-      await fetch(WEBHOOK_URL, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-webhook-secret': WEBHOOK_SECRET || '',
-        },
-        body: JSON.stringify({ sessionId, payload: m }),
-      });
-    } catch (e) {
-      logger.error({ e: e.message }, 'webhook failed');
-    }
-  });
-
-  return sock;
+  return entry;
 }
 
 // ─── Routes ───────────────────────────────────────────────────
-app.post('/session/:id/start', requireApiKey, async (req, res) => {
+app.get('/health', (_req, res) => res.json({ ok: true, sessions: [...sessions.keys()] }));
+
+app.post('/session/start', requireApiKey, async (req, res) => {
+  const sessionId = req.body?.sessionId || req.body?.session;
+  if (!sessionId) return res.status(400).json({ error: 'sessionId required' });
   try {
-    await startSession(req.params.id);
-    res.json({ ok: true, status: sessions[req.params.id]?.status });
+    const entry = sessions.get(sessionId) || (await startSession(sessionId));
+    res.json({ sessionId, status: entry.status, qr: entry.qr });
   } catch (e) {
+    logger.error({ e: e.message }, 'session/start failed');
     res.status(500).json({ error: e.message });
   }
 });
 
-app.get('/session/:id/qr', requireApiKey, (req, res) => {
-  const s = sessions[req.params.id];
-  if (!s) return res.status(404).json({ error: 'no session' });
-  res.json({ status: s.status, qr: s.qr });
+app.get('/session/:id/status', requireApiKey, (req, res) => {
+  const entry = sessions.get(req.params.id);
+  if (!entry) return res.status(404).json({ error: 'not found' });
+  res.json({ status: entry.status, qr: entry.qr });
 });
 
-// ✅ /send — מקבל גם { sessionId, jid, message } וגם { session, jid, text }
+app.post('/session/:id/logout', requireApiKey, async (req, res) => {
+  const entry = sessions.get(req.params.id);
+  if (!entry) return res.status(404).json({ error: 'not found' });
+  try { await entry.sock.logout(); } catch {}
+  sessions.delete(req.params.id);
+  try { fs.rmSync(path.join('./auth', req.params.id), { recursive: true, force: true }); } catch {}
+  res.json({ ok: true });
+});
+
+// ✅ /send — תאימות לשני פורמטים: { sessionId|session, jid|to, message|text }
 app.post('/send', requireApiKey, async (req, res) => {
   const body = req.body || {};
   const sessionId = body.sessionId || body.session;
   const jid = body.jid || body.to;
   const message = body.message ?? body.text;
 
-  if (!sessionId || !jid || !message) {
+  if (!sessionId || !jid || message === undefined || message === null) {
     return res.status(400).json({
-      error: 'missing fields',
-      required: 'sessionId|session, jid|to, message|text',
-      received: Object.keys(body),
+      error: 'sessionId, jid and message are required',
+      received: { sessionId: !!sessionId, jid: !!jid, message: message !== undefined },
     });
   }
 
-  try {
-    if (!sessions[sessionId]?.sock) await startSession(sessionId);
-    const sock = sessions[sessionId]?.sock;
-    if (!sock) return res.status(503).json({ error: 'session not ready' });
+  const entry = sessions.get(sessionId);
+  if (!entry || entry.status !== 'connected') {
+    return res.status(409).json({ error: 'session not connected', status: entry?.status || 'missing' });
+  }
 
+  try {
+    const target = String(jid).includes('@') ? jid : `${String(jid).replace(/\D/g, '')}@s.whatsapp.net`;
     const payload = typeof message === 'string' ? { text: message } : message;
-    const result = await sock.sendMessage(jid, payload);
-    res.json({ ok: true, id: result?.key?.id });
+    const result = await entry.sock.sendMessage(target, payload);
+    res.json({ ok: true, id: result?.key?.id || null });
   } catch (e) {
     logger.error({ e: e.message }, 'send failed');
     res.status(500).json({ error: e.message });
   }
 });
 
-// ─── Healthcheck endpoints (Railway בודק את /status) ─────────
-app.get('/status', (req, res) => {
-  res.json({
-    ok: true,
-    uptime: process.uptime(),
-    sessions: Object.keys(sessions).map((id) => ({
-      id,
-      status: sessions[id]?.status,
-    })),
-    time: new Date().toISOString(),
-  });
-});
-
-app.get('/health', (req, res) => res.json({ ok: true }));
-app.get('/', (req, res) => res.json({ ok: true, service: 'wa-bridge' }));
+app.use((err, _req, res, _next) => res.status(500).json({ error: err.message }));
 
 // ─── Boot ─────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
