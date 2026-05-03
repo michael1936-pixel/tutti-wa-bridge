@@ -312,6 +312,32 @@ app.post('/send', async (req, res) => {
     res.status(500).json({ ok: false, error: e?.message || String(e) });
   }
 });
+// List all WhatsApp groups the connected session participates in.
+// Read-only operation — does not mutate any session state.
+app.get('/groups', async (req, res) => {
+  const phone = String(req.query.session || req.query.phone || '').replace(/\D/g, '');
+  if (!phone) return res.status(400).json({ error: 'session required' });
+  const s = sessions.get(phone);
+  if (!s || s.status !== 'connected' || !s.sock) {
+    return res.status(409).json({ error: 'session_missing', status: s?.status ?? 'not_started' });
+  }
+  try {
+    const all = await s.sock.groupFetchAllParticipating();
+    const groups = Object.values(all || {}).map((g) => ({
+      jid: g.id,
+      name: g.subject || '',
+      participants: Array.isArray(g.participants) ? g.participants.length : null,
+      size: typeof g.size === 'number'
+        ? g.size
+        : Array.isArray(g.participants) ? g.participants.length : null,
+      announce: !!g.announce,
+    }));
+    res.json({ ok: true, groups });
+  } catch (e) {
+    logger.error({ phone, err: e?.message }, 'groups fetch failed');
+    res.status(500).json({ ok: false, error: e?.message || String(e) });
+  }
+});
 
 app.listen(PORT, () => {
   logger.info({ port: PORT, authRoot: AUTH_ROOT }, 'whatsapp bridge listening');
