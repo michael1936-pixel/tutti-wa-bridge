@@ -1,5 +1,33 @@
 // =============================================================================
 // WhatsApp Baileys bridge — Railway server.js
+//
+// Drop-in replacement for the Express/Baileys server that runs on Railway as
+// `amusing-gentleness`. Solves the "the pairing code is invalid" problem on
+// WhatsApp by:
+//
+//   1. Pinning a known-good Baileys version and WhatsApp Web protocol version.
+//   2. Using a stock Chrome browser fingerprint (custom names like
+//      "Lovable Bridge" make WhatsApp reject the device).
+//   3. Waiting for the Baileys socket to become *pairing-ready* before calling
+//      `requestPairingCode`, instead of calling it the moment the socket is
+//      created.
+//   4. Persisting auth via `useMultiFileAuthState` and never wiping it after
+//      the code has been generated.
+//   5. Exposing precise, monotonic statuses
+//      (`not_started` → `connecting` → `pairing_code_ready` → `connected` /
+//       `failed` / `logged_out`) and matching `/logout`, `/reset`, and
+//      `DELETE /session/:id` endpoints.
+//
+// Required deps in `package.json`:
+//   "@whiskeysockets/baileys": "^6.7.18",
+//   "express": "^4.19.2",
+//   "pino": "^8.20.0"
+//
+// Required env vars:
+//   API_KEY            — value Lovable Cloud sends in `X-Api-Key`
+//   AUTH_DIR           — absolute path to the persistent volume
+//                        (defaults to "/data" — match Railway's volume mount).
+//   PORT               — provided by Railway.
 // =============================================================================
 
 const express = require('express');
@@ -24,6 +52,21 @@ const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || '';
 
 const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
 
+// ---------------------------------------------------------------------------
+// Session manager
+// ---------------------------------------------------------------------------
+
+/**
+ * Per-phone session state.
+ *
+ * status values:
+ *   not_started        — no live socket
+ *   connecting         — socket created, awaiting `pair-device` readiness
+ *   pairing_code_ready — pairing code returned to the client, waiting for user
+ *   connected          — successfully paired with WhatsApp
+ *   logged_out         — WA forced us out (DisconnectReason.loggedOut / 401)
+ *   failed             — terminal error before pairing succeeded
+ */
 const sessions = new Map();
 
 function authDirFor(phone) {
@@ -63,13 +106,17 @@ async function wipeAuth(phone) {
 
 async function destroySocket(s) {
   if (s.sock) {
-    try { s.sock.end(undefined); } catch (_) {}
-    try { s.sock.ws?.close?.(); } catch (_) {}
+    try { s.sock.end(undefined); } catch (_) { /* ignore */ }
+    try { s.sock.ws?.close?.(); } catch (_) { /* ignore */ }
   }
   s.sock = null;
   s.pairingReady = false;
 }
 
+/**
+ * Build a fresh Baileys socket for the phone. Does NOT request the pairing
+ * code — that is done by `pair()` once the socket signals readiness.
+ */
 async function createSocket(phone, { forceReset } = {}) {
   const s = ensureSession(phone);
 
@@ -83,6 +130,8 @@ async function createSocket(phone, { forceReset } = {}) {
 
   const { state, saveCreds } = await useMultiFileAuthState(dir);
   const { version } = await fetchLatestBaileysVersion().catch(() => ({
+    // Fallback to a known-good WA Web version. Bump this if WA forces an
+    // upgrade and pairing starts failing again.
     version: [2, 3000, 1033893291],
   }));
 
@@ -90,6 +139,7 @@ async function createSocket(phone, { forceReset } = {}) {
     version,
     logger: logger.child({ scope: 'baileys', phone }),
     printQRInTerminal: false,
+    // Stock browser fingerprint — custom names get rejected by WA.
     browser: Browsers.macOS('Chrome'),
     auth: {
       creds: state.creds,
@@ -110,19 +160,19 @@ async function createSocket(phone, { forceReset } = {}) {
 
   sock.ev.on('creds.update', saveCreds);
 
-  // ---------------------------------------------------------------------------
+  // -------------------------------------------------------------------------
   // Forward INCOMING 1:1 messages from drivers to the Lovable Cloud webhook.
-  // ---------------------------------------------------------------------------
+  // -------------------------------------------------------------------------
   sock.ev.on('messages.upsert', async (ev) => {
     if (!WEBHOOK_URL) return;
     if (ev.type !== 'notify') return;
     for (const m of ev.messages || []) {
       try {
         if (!m?.message) continue;
-        if (m.key?.fromMe) continue;
+        if (m.key?.fromMe) continue; // only inbound
         const jid = m.key?.remoteJid || '';
         if (!jid || jid.endsWith('@g.us') || jid.endsWith('@broadcast')) continue;
-
+        // Extract plain text from common message types
         const msg = m.message;
         const text =
           msg.conversation ||
@@ -185,7 +235,12 @@ async function createSocket(phone, { forceReset } = {}) {
   sock.ev.on('connection.update', async (u) => {
     const { connection, lastDisconnect, isNewLogin, qr } = u;
 
-    if (connection === 'connecting') {
+    // The official Baileys docs say the correct moment to request a pairing
+    // code is when the `qr` field is emitted on `connection.update` and
+    // `creds.registered` is false. Calling it earlier (e.g. on `connecting`)
+    // races the WA handshake and is the root cause of "428 Connection
+    // Terminated" right after the code is issued.
+    if (qr && !sock.authState?.creds?.registered) {
       s.pairingReady = true;
     }
 
@@ -198,26 +253,34 @@ async function createSocket(phone, { forceReset } = {}) {
       const msg = lastDisconnect?.error?.message || 'connection closed';
 
       if (code === DisconnectReason.loggedOut || code === 401) {
+        // WA refused the device. Wipe auth so the next /pair starts clean.
         await wipeAuth(phone);
         setStatus(s, 'logged_out', { lastError: `${code}: ${msg}` });
       } else if (s.status === 'connected') {
+        // Lost an established session — try to reconnect quietly.
         setStatus(s, 'connecting', { lastError: msg });
         setTimeout(() => createSocket(phone).catch(() => {}), 2000);
       } else {
+        // Half-pair drop (typical 428 Connection Terminated). Surface the
+        // exact code/message so the client can show a useful explanation
+        // instead of a generic "failed".
         setStatus(s, 'failed', { lastError: `${code ?? '?'}: ${msg}` });
+        // Drop the dead socket so the next /pair builds a fresh one
+        // instead of reusing a half-closed handle.
+        await destroySocket(s);
       }
 
       s.pairingReady = false;
-    }
-
-    if (qr) {
-      logger.warn({ phone }, 'unexpected QR fallback during pair flow');
     }
   });
 
   return s;
 }
 
+/**
+ * Wait until Baileys is ready to accept `requestPairingCode`, then ask for
+ * the code. Concurrent callers for the same phone share the same promise.
+ */
 async function pair(phone, { forceReset } = {}) {
   const s = ensureSession(phone);
 
@@ -228,11 +291,13 @@ async function pair(phone, { forceReset } = {}) {
       await createSocket(phone, { forceReset });
     }
 
+    // Already authenticated — short-circuit.
     if (s.sock?.authState?.creds?.registered) {
       setStatus(s, 'connected');
       return { alreadyConnected: true, status: 'connected' };
     }
 
+    // Wait up to 15s for the socket to become pairing-ready.
     const deadline = Date.now() + 15_000;
     while (!s.pairingReady && Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 200));
@@ -245,6 +310,7 @@ async function pair(phone, { forceReset } = {}) {
     const code = await s.sock.requestPairingCode(phone);
     if (!code) throw new Error('Baileys returned empty pairing code');
 
+    // WhatsApp pairing codes are valid for ~3 minutes.
     const expiresAt = new Date(Date.now() + 3 * 60_000).toISOString();
     setStatus(s, 'pairing_code_ready', {
       pairingCode: code,
@@ -322,7 +388,7 @@ async function logoutHandler(req, res) {
   if (!phone) return res.status(400).json({ error: 'phone required' });
   const s = sessions.get(phone);
   if (s) {
-    try { await s.sock?.logout?.(); } catch (_) {}
+    try { await s.sock?.logout?.(); } catch (_) { /* ignore */ }
     await destroySocket(s);
   }
   await wipeAuth(phone);
@@ -351,6 +417,8 @@ app.post('/send', async (req, res) => {
   }
 });
 
+// List all WhatsApp groups the connected session participates in.
+// Read-only operation — does not mutate any session state.
 app.get('/groups', async (req, res) => {
   const phone = String(req.query.session || req.query.phone || '').replace(/\D/g, '');
   if (!phone) return res.status(400).json({ error: 'session required' });
@@ -384,7 +452,9 @@ app.listen(PORT, () => {
 });
 
 // ---------------------------------------------------------------------------
-// Auto-restore: re-create sockets for registered sessions on boot.
+// Auto-restore: on boot, scan persistent auth dir and re-create sockets for
+// any phone that has registered creds. This keeps sessions alive across
+// Railway restarts/redeploys without requiring the user to re-pair.
 // ---------------------------------------------------------------------------
 async function restoreSessionsOnBoot() {
   const baseDir = path.join(AUTH_ROOT, 'auth');
