@@ -64,6 +64,11 @@ const API_KEY = process.env.API_KEY || '';
 const AUTH_ROOT = process.env.AUTH_DIR || '/data';
 const WEBHOOK_URL = process.env.WEBHOOK_URL || '';
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || '';
+// Build marker so we can confirm Railway picked up the latest server.js.
+// Surfaced via /diag and printed once on startup. Bump this string when you
+// redeploy a behavioral change so you can read the version straight from
+// Railway logs.
+const BRIDGE_BUILD = 'inbound-lid-forward-v3-2026-05-05';
 // By default we never send to @lid — it's a known cause of "Waiting for this
 // message" on Baileys 6.x. Set WA_ALLOW_LID_SEND=true to opt back in for
 // experiments.
@@ -145,6 +150,36 @@ function lookupLidPhone(stationPhone, lidJid) {
     return null;
   }
   return e.phone;
+}
+
+// Aggressive multi-field extractor: try EVERY known Baileys field that may
+// carry the peer's real phone number (PN). Returns digits only, or '' if none.
+// Critical for LID-only chats where m.key.senderPn is missing.
+function extractRealPhoneDigits(stationPhone, m) {
+  const candidates = [
+    m?.key?.senderPn,
+    m?.senderPn,
+    m?.key?.participantPn,
+    m?.participantPn,
+    m?.key?.remoteJidAlt,
+    m?.key?.participantAlt,
+    m?.key?.remoteJid,
+    m?.participant,
+    m?.key?.participant,
+  ];
+  for (const c of candidates) {
+    if (!c || typeof c !== 'string') continue;
+    if (c.endsWith('@lid') || c.endsWith('@g.us') || c.endsWith('@broadcast')) continue;
+    const head = c.split('@')[0].split(':')[0].replace(/\D/g, '');
+    if (head.length >= 9 && head.length <= 13) return head;
+  }
+  // Try cached LID -> phone mapping learned from prior senderPn events.
+  const jid = m?.key?.remoteJid || '';
+  if (jid.endsWith('@lid')) {
+    const cached = lookupLidPhone(stationPhone, jid);
+    if (cached) return cached;
+  }
+  return '';
 }
 
 function preferredOutgoingJid(stationPhone, fallbackJid) {
@@ -655,34 +690,56 @@ async function createSocket(phone, { forceReset } = {}) {
     // Successful decrypt — clear failure counter for this peer.
     s.inboundDecryptFails.delete(jid);
 
-        // WhatsApp now often returns @lid (linked-id) instead of @s.whatsapp.net.
-        // The LID is NOT a phone number — never forward it as driver_phone.
-        // Try to recover the real phone number (PN) from Baileys 6.7+ fields.
-        let driverPhone = '';
-        if (jid.endsWith('@s.whatsapp.net')) {
-          driverPhone = jid.split('@')[0].split(':')[0];
-        } else if (jid.endsWith('@lid')) {
-          const senderPn = m.key?.senderPn || m.senderPn || '';
-          if (senderPn && typeof senderPn === 'string' && senderPn.includes('@')) {
-            driverPhone = senderPn.split('@')[0].split(':')[0];
-          } else {
-            // Fallback: maybe we already learned this LID's real phone from
-            // a previous decryption-failure event that DID carry senderPn.
-            const cached = lookupLidPhone(phone, jid);
-            if (cached) driverPhone = cached;
-          }
-        }
-        // Validate: only forward plausible phone numbers (Israeli or international,
-        // 9-13 digits, not the 15-digit WhatsApp LID).
-        const digits = String(driverPhone || '').replace(/\D/g, '');
+        // WhatsApp often returns @lid (linked-id) instead of @s.whatsapp.net.
+        // Try EVERY known Baileys field for the real phone (PN).
+        const digits = extractRealPhoneDigits(phone, m);
         const looksLikePhone =
           digits.length >= 9 && digits.length <= 13 &&
           (digits.startsWith('972') || digits.startsWith('0') || digits.length <= 11);
+
+        // No phone resolvable from the JID — but we still have plaintext.
+        // Forward to webhook as a LID-only request so the dispatcher at least
+        // sees that a driver tried to take the ride.
         if (!looksLikePhone) {
           logger.warn(
-            { phone, jid, senderPn: m.key?.senderPn || null, msgId: m.key?.id },
-            'skip inbound: could not resolve real phone from JID'
+            {
+              phone,
+              jid,
+              senderPn: m.key?.senderPn || null,
+              participantPn: m.key?.participantPn || null,
+              remoteJidAlt: m.key?.remoteJidAlt || null,
+              participantAlt: m.key?.participantAlt || null,
+              keyFields: m.key ? Object.keys(m.key) : null,
+              msgId: m.key?.id,
+              text: String(text).slice(0, 200),
+            },
+            'lid_phone_resolution_failed'
           );
+          if (WEBHOOK_URL) {
+            try {
+              const resp = await fetch(WEBHOOK_URL, {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  ...(WEBHOOK_SECRET ? { 'x-bridge-secret': WEBHOOK_SECRET } : {}),
+                },
+                body: JSON.stringify({
+                  station_phone: phone,
+                  driver_lid: jid,
+                  text: String(text),
+                  wa_message_id: m.key?.id || null,
+                  direction: 'incoming',
+                }),
+              });
+              const respText = await resp.text().catch(() => '');
+              logger.info(
+                { phone, jid, msgId: m.key?.id, status: resp.status, body: respText.slice(0, 300) },
+                'lid_only_forwarded'
+              );
+            } catch (err) {
+              logger.error({ phone, err: err?.message }, 'lid_only_forward_failed');
+            }
+          }
           return;
         }
         // If we DID resolve a real phone alongside an @lid jid, persist the
@@ -953,6 +1010,7 @@ app.get('/diag', (_req, res) => {
   }));
   res.json({
     ok: true,
+    bridge_build: BRIDGE_BUILD,
     baileys_pkg_version: BAILEYS_PKG_VERSION,
     webhook_url_configured: !!WEBHOOK_URL,
     webhook_secret_configured: !!WEBHOOK_SECRET,
@@ -1122,7 +1180,7 @@ app.post('/debug-forward-inbound', async (req, res) => {
 app.listen(PORT, () => {
   // (debug endpoint registered above)
   logger.info(
-    { port: PORT, authRoot: AUTH_ROOT, baileys_pkg_version: BAILEYS_PKG_VERSION },
+    { port: PORT, authRoot: AUTH_ROOT, baileys_pkg_version: BAILEYS_PKG_VERSION, bridge_build: BRIDGE_BUILD },
     'whatsapp bridge listening'
   );
   restoreSessionsOnBoot().catch((err) =>
