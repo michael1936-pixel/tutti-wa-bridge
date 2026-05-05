@@ -447,6 +447,11 @@ async function createSocket(phone, { forceReset } = {}) {
   // -------------------------------------------------------------------------
   // Decryption-failure tracker (jid -> {count, ts}) for inbound peers.
   if (!s.inboundDecryptFails) s.inboundDecryptFails = new Map();
+  // Debounce uploadPreKeys (max once per 5 minutes per session).
+  if (!s.lastPreKeyUploadAt) s.lastPreKeyUploadAt = 0;
+  // Track which peers we've already nudged ("we couldn't read your message")
+  // so we don't spam them on every retry.
+  if (!s.notifiedDecryptFail) s.notifiedDecryptFail = new Map();
 
   // Shared forwarder used by both messages.upsert and messages.update
   // (because retried/re-delivered messages arrive on `update`).
@@ -522,15 +527,95 @@ async function createSocket(phone, { forceReset } = {}) {
         } catch (err) {
           logger.error({ phone, jid, err: err?.message }, 'inbound_assertSessions failed');
         }
-        // Try to upload fresh prekeys so a follow-up retry from WA can
-        // build a new session (PreKeyError "Invalid PreKey ID" recovery).
+        // Try to upload a LARGE batch of fresh prekeys so a follow-up retry
+        // from WA can build a new session (PreKeyError "Invalid PreKey ID"
+        // recovery). Debounced to once per 5 min per session — calling this
+        // on every failed message floods WhatsApp and triggers rate limits.
         try {
-          if (typeof sock.uploadPreKeys === 'function') {
-            await sock.uploadPreKeys(5);
-            logger.warn({ phone }, 'inbound_uploadPreKeys_done');
+          if (typeof sock.uploadPreKeys === 'function' && (now - s.lastPreKeyUploadAt) > 5 * 60_000) {
+            await sock.uploadPreKeys(30);
+            s.lastPreKeyUploadAt = now;
+            logger.warn({ phone, batch: 30 }, 'inbound_uploadPreKeys_done');
           }
         } catch (err) {
           logger.error({ phone, err: err?.message }, 'inbound_uploadPreKeys failed');
+        }
+        // After 2+ failures from same peer in the window: try to wipe the
+        // poisoned Signal session entirely so the next inbound forces a
+        // brand-new handshake (this is the only thing that fixes
+        // "Invalid PreKey ID" when WA keeps re-using the same dead prekey).
+        if (cur.count >= 2) {
+          try {
+            const wipeKeys = {};
+            for (const t of targets) {
+              const tDigits = String(t.split('@')[0] || '').replace(/\D/g, '');
+              if (!tDigits) continue;
+              // Wipe primary device session + a few common device ids.
+              wipeKeys[`${tDigits}.0`] = null;
+              wipeKeys[`${tDigits}.1`] = null;
+              wipeKeys[`${tDigits}.2`] = null;
+            }
+            if (Object.keys(wipeKeys).length && sock.authState?.keys?.set) {
+              await sock.authState.keys.set({ session: wipeKeys });
+              logger.warn({ phone, jid, wiped: Object.keys(wipeKeys) }, 'signal_session_wiped');
+            }
+          } catch (err) {
+            logger.error({ phone, jid, err: err?.message }, 'signal_session_wipe_failed');
+          }
+        }
+        // After N failures: send the driver a courtesy message so they know
+        // to resend AND so our outbound encrypt resets the ratchet on their
+        // side. Throttled to once per hour per peer.
+        if (cur.count >= 2) {
+          const senderPnRaw = m.key?.senderPn || m.senderPn || '';
+          let pnDigits = '';
+          if (typeof senderPnRaw === 'string' && senderPnRaw.includes('@')) {
+            pnDigits = senderPnRaw.split('@')[0].split(':')[0].replace(/\D/g, '');
+          } else if (jid.endsWith('@s.whatsapp.net')) {
+            pnDigits = jid.split('@')[0].split(':')[0].replace(/\D/g, '');
+          } else {
+            const cached = lookupLidPhone(phone, jid);
+            if (cached) pnDigits = cached;
+          }
+          if (pnDigits && pnDigits.length >= 9) {
+            const lastNotice = s.notifiedDecryptFail.get(pnDigits) || 0;
+            if (now - lastNotice > 60 * 60_000) {
+              s.notifiedDecryptFail.set(pnDigits, now);
+              try {
+                const targetForSend = jid.endsWith('@lid')
+                  ? jid
+                  : `${pnDigits}@s.whatsapp.net`;
+                await sendAndCache(phone, targetForSend, {
+                  text: '📵 לא הצלחנו לקרוא את ההודעה האחרונה שלך עקב תקלת הצפנה זמנית. אנא שלח שוב את קוד הנסיעה. תודה!',
+                });
+                logger.warn({ phone, driver_phone: pnDigits }, 'decryption_notice_sent_to_driver');
+              } catch (err) {
+                logger.error({ phone, driver_phone: pnDigits, err: err?.message }, 'decryption_notice_send_failed');
+              }
+            }
+            // Notify the dispatcher app via webhook even though we have no
+            // plaintext — at least they'll see "someone tried to reach you".
+            try {
+              await fetch(WEBHOOK_URL, {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  ...(WEBHOOK_SECRET ? { 'x-bridge-secret': WEBHOOK_SECRET } : {}),
+                },
+                body: JSON.stringify({
+                  station_phone: phone,
+                  driver_phone: pnDigits,
+                  text: '[הודעה לא פוענחה]',
+                  wa_message_id: m.key?.id || null,
+                  direction: 'incoming',
+                  decryption_failed: true,
+                }),
+              });
+              logger.warn({ phone, driver_phone: pnDigits }, 'decryption_notice_forwarded_to_app');
+            } catch (err) {
+              logger.error({ phone, err: err?.message }, 'decryption_notice_forward_failed');
+            }
+          }
         }
         // Ask WhatsApp to retransmit this exact message. Without this we
         // depend on the driver to manually resend, which never happens —
