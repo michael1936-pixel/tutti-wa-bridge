@@ -388,7 +388,10 @@ async function createSocket(phone, { forceReset } = {}) {
     keepAliveIntervalMs: 10_000,
     markOnlineOnConnect: false,
     syncFullHistory: false,
-    shouldSyncHistoryMessage: () => false,
+    // Allow history sync so that signal sessions/prekeys arrive promptly after
+    // connect — without this, the very first inbound pkmsg from a peer often
+    // can't be decrypted and we never see the driver's ride code.
+    shouldSyncHistoryMessage: () => true,
     generateHighQualityLinkPreview: false,
     // Critical: when WA asks us to resend (retry receipt), supply the
     // original message content. Without this the recipient sees
@@ -418,24 +421,88 @@ async function createSocket(phone, { forceReset } = {}) {
   // -------------------------------------------------------------------------
   // Forward INCOMING 1:1 messages from drivers to the Lovable Cloud webhook.
   // -------------------------------------------------------------------------
-  sock.ev.on('messages.upsert', async (ev) => {
+  // Decryption-failure tracker (jid -> {count, ts}) for inbound peers.
+  if (!s.inboundDecryptFails) s.inboundDecryptFails = new Map();
+
+  // Shared forwarder used by both messages.upsert and messages.update
+  // (because retried/re-delivered messages arrive on `update`).
+  async function forwardInbound(m) {
     if (!WEBHOOK_URL) return;
-    if (ev.type !== 'notify') return;
-    for (const m of ev.messages || []) {
-      try {
-        if (!m?.message) continue;
-        if (m.key?.fromMe) continue; // only inbound
-        const jid = m.key?.remoteJid || '';
-        if (!jid || jid.endsWith('@g.us') || jid.endsWith('@broadcast')) continue;
-        // Extract plain text from common message types
-        const msg = m.message;
-        const text =
-          msg.conversation ||
-          msg.extendedTextMessage?.text ||
-          msg.imageMessage?.caption ||
-          msg.videoMessage?.caption ||
-          '';
-        if (!text || !String(text).trim()) continue;
+    if (!m || m.key?.fromMe) return;
+    const jid = m.key?.remoteJid || '';
+    if (!jid || jid.endsWith('@g.us') || jid.endsWith('@broadcast')) return;
+
+    // ---- Decryption-failure detection -----------------------------------
+    // Baileys signals an undecryptable message via messageStubType=2
+    // (CIPHERTEXT) or by setting message=null while key/messageTimestamp
+    // exist. In both cases, no plaintext is available — auto-recover by
+    // forcing a fresh Signal session for that peer.
+    const stub = m.messageStubType;
+    const isCiphertextFail = stub === 2 || (m && !m.message && m.key?.id);
+    if (isCiphertextFail) {
+      logger.warn(
+        {
+          phone,
+          jid,
+          msgId: m.key?.id,
+          stub,
+          addressingMode: m.key?.addressingMode || null,
+          senderPn: m.key?.senderPn || null,
+        },
+        'decryption_failed'
+      );
+      const now = Date.now();
+      const cur = s.inboundDecryptFails.get(jid) || { count: 0, ts: now };
+      if (now - cur.ts > 60_000) { cur.count = 0; cur.ts = now; }
+      cur.count += 1;
+      s.inboundDecryptFails.set(jid, cur);
+      if (cur.count >= 1) {
+        // Try to rebuild BOTH the @lid jid and the matching @s.whatsapp.net
+        // jid (if we know the real phone via senderPn). WhatsApp's LID
+        // migration means the same logical peer can hold two distinct
+        // Signal sessions, and rebuilding only one leaves the other
+        // poisoned — which keeps decryption broken on retries.
+        const targets = new Set([jid]);
+        const senderPn = m.key?.senderPn || m.senderPn || '';
+        if (typeof senderPn === 'string' && senderPn.includes('@')) {
+          const pnDigits = senderPn.split('@')[0].split(':')[0].replace(/\D/g, '');
+          if (pnDigits.length >= 9) {
+            targets.add(`${pnDigits}@s.whatsapp.net`);
+          }
+        }
+        try {
+          await sock.assertSessions(Array.from(targets), true);
+          logger.warn({ phone, jid, targets: Array.from(targets), count: cur.count }, 'inbound_assertSessions_forced');
+        } catch (err) {
+          logger.error({ phone, jid, err: err?.message }, 'inbound_assertSessions failed');
+        }
+        // Try to upload fresh prekeys so a follow-up retry from WA can
+        // build a new session (PreKeyError "Invalid PreKey ID" recovery).
+        try {
+          if (typeof sock.uploadPreKeys === 'function') {
+            await sock.uploadPreKeys(5);
+            logger.warn({ phone }, 'inbound_uploadPreKeys_done');
+          }
+        } catch (err) {
+          logger.error({ phone, err: err?.message }, 'inbound_uploadPreKeys failed');
+        }
+        if (cur.count >= 3) s.inboundDecryptFails.delete(jid);
+      }
+      return;
+    }
+
+    if (!m.message) return;
+    const msg = m.message;
+    const text =
+      msg.conversation ||
+      msg.extendedTextMessage?.text ||
+      msg.imageMessage?.caption ||
+      msg.videoMessage?.caption ||
+      '';
+    if (!text || !String(text).trim()) return;
+
+    // Successful decrypt — clear failure counter for this peer.
+    s.inboundDecryptFails.delete(jid);
 
         // WhatsApp now often returns @lid (linked-id) instead of @s.whatsapp.net.
         // The LID is NOT a phone number — never forward it as driver_phone.
@@ -460,7 +527,7 @@ async function createSocket(phone, { forceReset } = {}) {
             { phone, jid, senderPn: m.key?.senderPn || null, msgId: m.key?.id },
             'skip inbound: could not resolve real phone from JID'
           );
-          continue;
+          return;
         }
         // Remember which JID flavor (@lid vs @s.whatsapp.net) this peer used,
         // so we can reply via the same JID and avoid forking the Signal session.
@@ -473,7 +540,8 @@ async function createSocket(phone, { forceReset } = {}) {
           direction: 'incoming',
         };
         try {
-          await fetch(WEBHOOK_URL, {
+          logger.info({ phone, jid, driver_phone: digits, msgId: m.key?.id }, 'webhook_forward_attempt');
+          const resp = await fetch(WEBHOOK_URL, {
             method: 'POST',
             headers: {
               'Content-Type': 'application/json',
@@ -481,9 +549,21 @@ async function createSocket(phone, { forceReset } = {}) {
             },
             body: JSON.stringify(payload),
           });
+          const respText = await resp.text().catch(() => '');
+          logger.info(
+            { phone, jid, driver_phone: digits, status: resp.status, body: respText.slice(0, 300) },
+            'webhook_forward_result'
+          );
         } catch (err) {
           logger.error({ phone, err: err?.message }, 'webhook forward failed');
         }
+  }
+
+  sock.ev.on('messages.upsert', async (ev) => {
+    if (ev.type !== 'notify') return;
+    for (const m of ev.messages || []) {
+      try {
+        await forwardInbound(m);
       } catch (err) {
         logger.error({ phone, err: err?.message }, 'messages.upsert handler error');
       }
@@ -544,6 +624,21 @@ async function createSocket(phone, { forceReset } = {}) {
   sock.ev.on('messages.update', async (updates) => {
     for (const u of updates || []) {
       try {
+        // If WA re-delivered a previously failed inbound message after our
+        // retry/assertSessions, the update carries a decrypted `message`.
+        // Forward it to the webhook just like a fresh upsert.
+        if (!u?.key?.fromMe && u?.update?.message) {
+          try {
+            await forwardInbound({
+              key: u.key,
+              message: u.update.message,
+              messageTimestamp: u.update.messageTimestamp,
+            });
+          } catch (err) {
+            logger.error({ phone, err: err?.message }, 'inbound_update_forward failed');
+          }
+        }
+
         const stub = u?.update?.messageStubType;
         const isRetry =
           stub === 2 /* CIPHERTEXT */ ||
