@@ -455,6 +455,25 @@ async function createSocket(phone, { forceReset } = {}) {
     if (!m || m.key?.fromMe) return;
     const jid = m.key?.remoteJid || '';
     if (!jid || jid.endsWith('@g.us') || jid.endsWith('@broadcast')) return;
+    // Status broadcasts come on a separate JID — never forward, never count
+    // toward decryption-failure stats. They're a known noise source.
+    if (jid === 'status@broadcast' || jid.startsWith('status@')) return;
+
+    // Loud, unconditional log for every PRIVATE inbound message we see, so
+    // we can tell the difference between "WhatsApp never delivered it" and
+    // "we received it but couldn't decrypt/forward".
+    logger.info(
+      {
+        phone,
+        jid,
+        msgId: m.key?.id,
+        senderPn: m.key?.senderPn || null,
+        addressingMode: m.key?.addressingMode || null,
+        hasMessage: !!m.message,
+        stub: m.messageStubType || null,
+      },
+      'private_inbound_raw_received'
+    );
 
     // ---- Decryption-failure detection -----------------------------------
     // Baileys signals an undecryptable message via messageStubType=2
@@ -977,7 +996,46 @@ app.get('/groups', async (req, res) => {
   }
 });
 
+// Debug-only: simulate a private inbound message hitting our webhook, without
+// involving WhatsApp/Baileys at all. Lets us isolate "is the webhook path
+// itself working" from "is Baileys decrypting the driver's message".
+// Protected by API_KEY (the global middleware enforces this).
+app.post('/debug-forward-inbound', async (req, res) => {
+  if (!WEBHOOK_URL) return res.status(500).json({ error: 'WEBHOOK_URL not configured' });
+  const stationPhone = String(req.body?.station_phone || '').replace(/\D/g, '');
+  const driverPhone = String(req.body?.driver_phone || '').replace(/\D/g, '');
+  const text = String(req.body?.text || '');
+  if (!stationPhone || !driverPhone || !text) {
+    return res.status(400).json({ error: 'station_phone, driver_phone, text required' });
+  }
+  const payload = {
+    station_phone: stationPhone,
+    driver_phone: driverPhone,
+    text,
+    wa_message_id: `debug-${Date.now()}`,
+    direction: 'incoming',
+  };
+  try {
+    logger.info({ stationPhone, driverPhone, text }, 'debug_forward_inbound_attempt');
+    const resp = await fetch(WEBHOOK_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(WEBHOOK_SECRET ? { 'x-bridge-secret': WEBHOOK_SECRET } : {}),
+      },
+      body: JSON.stringify(payload),
+    });
+    const body = await resp.text().catch(() => '');
+    logger.info({ status: resp.status, body: body.slice(0, 500) }, 'debug_forward_inbound_result');
+    res.json({ ok: resp.ok, status: resp.status, body });
+  } catch (e) {
+    logger.error({ err: e?.message }, 'debug_forward_inbound failed');
+    res.status(500).json({ ok: false, error: e?.message || String(e) });
+  }
+});
+
 app.listen(PORT, () => {
+  // (debug endpoint registered above)
   logger.info(
     { port: PORT, authRoot: AUTH_ROOT, baileys_pkg_version: BAILEYS_PKG_VERSION },
     'whatsapp bridge listening'
