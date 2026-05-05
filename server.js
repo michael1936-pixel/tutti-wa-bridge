@@ -123,6 +123,30 @@ function rememberInboundJid(stationPhone, peerPhone, jid) {
   lastInboundJid.set(`${stationPhone}:${peerPhone}`, { jid, ts: Date.now() });
 }
 
+// Persistent map from a peer's @lid to their real phone number, learned from
+// senderPn fields on inbound messages. Lets us recover the real phone even
+// when the very next inbound message from the same peer doesn't carry
+// senderPn (which is the trigger for "skip inbound: could not resolve real
+// phone from JID" we keep seeing in logs).
+const lidToPhone = new Map(); // `${stationPhone}:${lid}` -> { phone, ts }
+const LID_TO_PHONE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7d
+
+function rememberLidPhone(stationPhone, lidJid, phoneDigits) {
+  if (!stationPhone || !lidJid || !phoneDigits) return;
+  if (!lidJid.endsWith('@lid')) return;
+  lidToPhone.set(`${stationPhone}:${lidJid}`, { phone: phoneDigits, ts: Date.now() });
+}
+
+function lookupLidPhone(stationPhone, lidJid) {
+  const e = lidToPhone.get(`${stationPhone}:${lidJid}`);
+  if (!e) return null;
+  if (Date.now() - e.ts > LID_TO_PHONE_TTL_MS) {
+    lidToPhone.delete(`${stationPhone}:${lidJid}`);
+    return null;
+  }
+  return e.phone;
+}
+
 function preferredOutgoingJid(stationPhone, fallbackJid) {
   // fallbackJid may be a bare phone, a phone@s.whatsapp.net, or a group jid.
   if (!fallbackJid) return fallbackJid;
@@ -468,6 +492,9 @@ async function createSocket(phone, { forceReset } = {}) {
           const pnDigits = senderPn.split('@')[0].split(':')[0].replace(/\D/g, '');
           if (pnDigits.length >= 9) {
             targets.add(`${pnDigits}@s.whatsapp.net`);
+            // Remember this LID↔PN mapping so future inbound messages from
+            // the same @lid that arrive without senderPn can still resolve.
+            if (jid.endsWith('@lid')) rememberLidPhone(phone, jid, pnDigits);
           }
         }
         try {
@@ -485,6 +512,26 @@ async function createSocket(phone, { forceReset } = {}) {
           }
         } catch (err) {
           logger.error({ phone, err: err?.message }, 'inbound_uploadPreKeys failed');
+        }
+        // Ask WhatsApp to retransmit this exact message. Without this we
+        // depend on the driver to manually resend, which never happens —
+        // they assume the message was delivered. Bounded to 1 attempt per
+        // message id; sendRetryRequest only exists on Baileys 6.7+/7.x.
+        try {
+          if (typeof sock.sendRetryRequest === 'function') {
+            const node = {
+              tag: 'message',
+              attrs: {
+                from: jid,
+                id: m.key?.id || '',
+                ...(m.key?.participant ? { participant: m.key.participant } : {}),
+              },
+            };
+            await sock.sendRetryRequest(node, true);
+            logger.warn({ phone, jid, msgId: m.key?.id }, 'retry_request_sent');
+          }
+        } catch (err) {
+          logger.error({ phone, jid, err: err?.message }, 'retry_request_failed');
         }
         if (cur.count >= 3) s.inboundDecryptFails.delete(jid);
       }
@@ -514,6 +561,11 @@ async function createSocket(phone, { forceReset } = {}) {
           const senderPn = m.key?.senderPn || m.senderPn || '';
           if (senderPn && typeof senderPn === 'string' && senderPn.includes('@')) {
             driverPhone = senderPn.split('@')[0].split(':')[0];
+          } else {
+            // Fallback: maybe we already learned this LID's real phone from
+            // a previous decryption-failure event that DID carry senderPn.
+            const cached = lookupLidPhone(phone, jid);
+            if (cached) driverPhone = cached;
           }
         }
         // Validate: only forward plausible phone numbers (Israeli or international,
@@ -529,6 +581,9 @@ async function createSocket(phone, { forceReset } = {}) {
           );
           return;
         }
+        // If we DID resolve a real phone alongside an @lid jid, persist the
+        // mapping for future messages that may not carry senderPn.
+        if (jid.endsWith('@lid') && digits) rememberLidPhone(phone, jid, digits);
         // Remember which JID flavor (@lid vs @s.whatsapp.net) this peer used,
         // so we can reply via the same JID and avoid forking the Signal session.
         rememberInboundJid(phone, digits, jid);
@@ -778,6 +833,28 @@ app.get('/health', (_req, res) => {
   res.json({
     ok: true,
     sessions: Array.from(sessions.keys()),
+    uptimeSec: Math.round(process.uptime()),
+  });
+});
+
+// Diagnostics — does NOT leak secrets, only reports what's configured.
+// Use this from a browser/curl to verify the bridge can talk to Lovable Cloud.
+app.get('/diag', (_req, res) => {
+  const sessionsInfo = Array.from(sessions.entries()).map(([phone, s]) => ({
+    phone,
+    status: s.status,
+    lastError: s.lastError,
+    lastUpdate: s.lastUpdate,
+    lidMappingCount: Array.from(lidToPhone.keys()).filter((k) => k.startsWith(`${phone}:`)).length,
+  }));
+  res.json({
+    ok: true,
+    baileys_pkg_version: BAILEYS_PKG_VERSION,
+    webhook_url_configured: !!WEBHOOK_URL,
+    webhook_secret_configured: !!WEBHOOK_SECRET,
+    api_key_configured: !!API_KEY,
+    auth_root: AUTH_ROOT,
+    sessions: sessionsInfo,
     uptimeSec: Math.round(process.uptime()),
   });
 });
