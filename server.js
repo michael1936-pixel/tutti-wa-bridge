@@ -19,7 +19,7 @@
 //      `DELETE /session/:id` endpoints.
 //
 // Required deps in `package.json`:
-//   "@whiskeysockets/baileys": "^6.7.18",
+//   "@whiskeysockets/baileys": "^6.7.21",
 //   "express": "^4.19.2",
 //   "pino": "^8.20.0"
 //
@@ -30,27 +30,49 @@
 //   PORT               — provided by Railway.
 // =============================================================================
 
-const express = require('express');
-const pino = require('pino');
-const path = require('path');
-const fs = require('fs');
+import express from 'express';
+import pino from 'pino';
+import path from 'path';
+import fs from 'fs';
+import { fileURLToPath } from 'url';
+import { createRequire } from 'module';
 
-const {
-  default: makeWASocket,
+import makeWASocket, {
   useMultiFileAuthState,
   fetchLatestBaileysVersion,
   Browsers,
   DisconnectReason,
   makeCacheableSignalKeyStore,
-} = require('@whiskeysockets/baileys');
+  generateMessageIDV2,
+} from 'baileys';
+
+const require = createRequire(import.meta.url);
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// Print the actually-installed Baileys version on startup so we can confirm
+// after redeploy that Railway picked up the latest npm release.
+let BAILEYS_PKG_VERSION = 'unknown';
+try {
+  BAILEYS_PKG_VERSION = require('baileys/package.json').version || 'unknown';
+} catch (_) {
+  try { BAILEYS_PKG_VERSION = require('@whiskeysockets/baileys/package.json').version || 'unknown'; } catch (_) {}
+}
 
 const PORT = Number(process.env.PORT || 3000);
 const API_KEY = process.env.API_KEY || '';
 const AUTH_ROOT = process.env.AUTH_DIR || '/data';
 const WEBHOOK_URL = process.env.WEBHOOK_URL || '';
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || '';
+// By default we never send to @lid — it's a known cause of "Waiting for this
+// message" on Baileys 6.x. Set WA_ALLOW_LID_SEND=true to opt back in for
+// experiments.
+const ALLOW_LID_SEND = String(process.env.WA_ALLOW_LID_SEND || '').toLowerCase() === 'true';
 
 const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
+// Quieter logger for Baileys internals so Railway logs don't get flooded
+// with raw Signal session payloads (pubKey/privKey/pendingPreKey dumps).
+const baileysLogger = pino({ level: process.env.BAILEYS_LOG_LEVEL || 'warn' });
 
 // ---------------------------------------------------------------------------
 // Session manager
@@ -71,6 +93,192 @@ const sessions = new Map();
 
 function authDirFor(phone) {
   return path.join(AUTH_ROOT, 'auth', phone);
+}
+
+// ---------------------------------------------------------------------------
+// Outgoing message cache (per-phone) — needed for Baileys `getMessage`.
+//
+// When a recipient (especially iPhone / @lid users) misses our pkmsg, WA sends
+// us a "retry receipt". Baileys then calls `getMessage(key)` to re-encrypt and
+// resend the original content. If we return undefined, the recipient is stuck
+// on "Waiting for this message. This may take a while."
+//
+// We keep the last ~5000 outgoing messages per phone in memory, and persist
+// them to disk so a Railway restart doesn't break in-flight retries.
+// ---------------------------------------------------------------------------
+const OUTGOING_CACHE_LIMIT = 5000;
+const OUTGOING_CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24h
+const outgoingCache = new Map(); // phone -> Map<msgId, { content, ts }>
+const outgoingDirty = new Set(); // phones with unsaved cache changes
+
+// Last-known JID per (phone, peer-phone). When a peer sends us a message via
+// @lid, we want to reply via @lid too — replying via @s.whatsapp.net forks
+// the Signal session and is a known cause of "Waiting for this message".
+const lastInboundJid = new Map(); // `${stationPhone}:${peerPhone}` -> { jid, ts }
+const LAST_JID_TTL_MS = 6 * 60 * 60 * 1000; // 6h
+
+function rememberInboundJid(stationPhone, peerPhone, jid) {
+  if (!stationPhone || !peerPhone || !jid) return;
+  if (jid.endsWith('@g.us') || jid.endsWith('@broadcast')) return;
+  lastInboundJid.set(`${stationPhone}:${peerPhone}`, { jid, ts: Date.now() });
+}
+
+function preferredOutgoingJid(stationPhone, fallbackJid) {
+  // fallbackJid may be a bare phone, a phone@s.whatsapp.net, or a group jid.
+  if (!fallbackJid) return fallbackJid;
+  let jid = String(fallbackJid);
+  if (!jid.includes('@')) jid = `${jid.replace(/\D/g, '')}@s.whatsapp.net`;
+  if (jid.endsWith('@g.us') || jid.endsWith('@broadcast')) return jid;
+  // For private chats: default to @s.whatsapp.net using the real phone.
+  // Sending to @lid is a known trigger for "Waiting for this message" on
+  // Baileys 6.x, so we deliberately do NOT mirror inbound @lid unless the
+  // operator explicitly opts in via WA_ALLOW_LID_SEND.
+  const peerPhone = jid.split('@')[0].split(':')[0];
+  if (ALLOW_LID_SEND) {
+    const entry = lastInboundJid.get(`${stationPhone}:${peerPhone}`);
+    if (entry && Date.now() - entry.ts < LAST_JID_TTL_MS) {
+      return entry.jid;
+    }
+  }
+  // Force PN form even if the caller passed an @lid by mistake.
+  if (jid.endsWith('@lid')) return `${peerPhone}@s.whatsapp.net`;
+  return jid;
+}
+
+function outgoingCacheFile(phone) {
+  return path.join(authDirFor(phone), 'sent-cache.json');
+}
+
+function getOutgoingMap(phone) {
+  let m = outgoingCache.get(phone);
+  if (!m) {
+    m = new Map();
+    outgoingCache.set(phone, m);
+  }
+  return m;
+}
+
+async function loadOutgoingCache(phone) {
+  try {
+    const raw = await fs.promises.readFile(outgoingCacheFile(phone), 'utf8');
+    const obj = JSON.parse(raw);
+    const m = getOutgoingMap(phone);
+    const now = Date.now();
+    for (const [id, entry] of Object.entries(obj || {})) {
+      if (entry?.content && entry?.ts && now - entry.ts < OUTGOING_CACHE_TTL_MS) {
+        m.set(id, entry);
+      }
+    }
+    logger.info({ phone, size: m.size }, 'outgoing cache loaded');
+  } catch (_) { /* no file yet */ }
+}
+
+async function saveOutgoingCache(phone) {
+  if (!outgoingDirty.has(phone)) return;
+  outgoingDirty.delete(phone);
+  const m = outgoingCache.get(phone);
+  if (!m) return;
+  const obj = {};
+  for (const [id, entry] of m.entries()) obj[id] = entry;
+  try {
+    await fs.promises.mkdir(authDirFor(phone), { recursive: true });
+    await fs.promises.writeFile(outgoingCacheFile(phone), JSON.stringify(obj));
+  } catch (err) {
+    logger.warn({ phone, err: err?.message }, 'outgoing cache save failed');
+  }
+}
+
+function rememberOutgoing(phone, id, content) {
+  if (!id || !content) return;
+  const m = getOutgoingMap(phone);
+  m.set(id, { content, ts: Date.now() });
+  // Evict oldest entries past the limit (Map preserves insertion order).
+  while (m.size > OUTGOING_CACHE_LIMIT) {
+    const oldestKey = m.keys().next().value;
+    m.delete(oldestKey);
+  }
+  outgoingDirty.add(phone);
+  // Debounced persist — fire-and-forget.
+  setTimeout(() => { saveOutgoingCache(phone).catch(() => {}); }, 1000);
+}
+
+/**
+ * Send a text message and guarantee the cache is populated BEFORE the wire
+ * call returns — this prevents a race where WhatsApp asks for a retry
+ * (`getMessage`) before we had a chance to remember the message body.
+ *
+ * Generates the message id ourselves with generateMessageIDV2 so we can
+ * pre-cache the content and pass the same id to Baileys.
+ */
+async function sendAndCache(phone, jid, content) {
+  const session = sessions.get(phone);
+  if (!session?.sock) throw new Error('socket not ready');
+  const sock = session.sock;
+
+  const targetJid = preferredOutgoingJid(phone, jid);
+
+  // Build the proto.IMessage Baileys would generate so we can store it under
+  // our pre-allocated id. For a plain text message this is a single-field
+  // object; longer messages auto-promote to extendedTextMessage server-side
+  // but the conversation form is still a valid getMessage return value for
+  // text-only retries.
+  const protoContent = typeof content?.text === 'string'
+    ? (content.text.length > 0 ? { conversation: content.text } : { conversation: '' })
+    : null;
+
+  let messageId;
+  try {
+    messageId = generateMessageIDV2 ? generateMessageIDV2(sock.user?.id) : undefined;
+  } catch (_) { messageId = undefined; }
+
+  // Pre-cache so getMessage can find it even if WhatsApp issues a retry
+  // before sendMessage resolves.
+  if (messageId && protoContent) {
+    rememberOutgoing(phone, messageId, protoContent);
+  }
+
+  const trySend = async (id) => {
+    const sent = await sock.sendMessage(
+      targetJid,
+      content,
+      id ? { messageId: id } : undefined
+    );
+    const finalId = sent?.key?.id || id || null;
+    if (finalId && sent?.message) rememberOutgoing(phone, finalId, sent.message);
+    return { sent, finalId };
+  };
+
+  try {
+    const { finalId } = await trySend(messageId);
+    logger.info({ phone, jid: targetJid, msgId: finalId }, 'send_cached');
+    return { ok: true, id: finalId, jid: targetJid };
+  } catch (err) {
+    const msg = String(err?.message || '');
+    const looksSessionCorruption =
+      /no session|bad.?mac|invalid.?prekey|cipher|prekey|session/i.test(msg);
+    logger.warn({ phone, jid: targetJid, msgId: messageId, err: msg, retry: looksSessionCorruption }, 'send_failed');
+    if (!looksSessionCorruption) throw err;
+    // One-shot session refresh + retry. assertSessions(true) forces a fresh
+    // prekey bundle so the next encrypt uses a brand-new Signal session.
+    try {
+      logger.warn({ phone, jid: targetJid }, 'session_corruption_detected');
+      await sock.assertSessions([targetJid], true);
+    } catch (e2) {
+      logger.error({ phone, jid: targetJid, err: e2?.message }, 'assertSessions failed (pre-retry)');
+    }
+    let retryId;
+    try { retryId = generateMessageIDV2 ? generateMessageIDV2(sock.user?.id) : undefined; } catch (_) { retryId = undefined; }
+    if (retryId && protoContent) rememberOutgoing(phone, retryId, protoContent);
+    try {
+      logger.warn({ phone, jid: targetJid, msgId: retryId }, 'send_retry_attempt');
+      const { finalId } = await trySend(retryId);
+      logger.info({ phone, jid: targetJid, msgId: finalId }, 'send_retry_success');
+      return { ok: true, id: finalId, jid: targetJid, retried: true };
+    } catch (err2) {
+      logger.error({ phone, jid: targetJid, err: err2?.message }, 'send_retry_failed');
+      throw err2;
+    }
+  }
 }
 
 function ensureSession(phone) {
@@ -123,27 +331,57 @@ async function createSocket(phone, { forceReset } = {}) {
   if (forceReset) {
     await destroySocket(s);
     await wipeAuth(phone);
+    outgoingCache.delete(phone);
   }
 
   const dir = authDirFor(phone);
   await fs.promises.mkdir(dir, { recursive: true });
 
+  // Lazy-load disk-persisted outgoing cache once per process per phone.
+  if (!outgoingCache.has(phone)) {
+    await loadOutgoingCache(phone);
+  }
+
   const { state, saveCreds } = await useMultiFileAuthState(dir);
-  const { version } = await fetchLatestBaileysVersion().catch(() => ({
-    // Fallback to a known-good WA Web version. Bump this if WA forces an
-    // upgrade and pairing starts failing again.
-    version: [2, 3000, 1033893291],
-  }));
+  // Try to fetch the latest WhatsApp Web version with a 10s timeout. If the
+  // remote endpoint is unreachable, fall back to a known-good version and log
+  // it loudly so we know we're not running the freshest protocol.
+  const FALLBACK_WA_VERSION = [2, 3000, 1033893291];
+  let version = FALLBACK_WA_VERSION;
+  let versionSource = 'fallback';
+  let versionError = null;
+  try {
+    const result = await Promise.race([
+      fetchLatestBaileysVersion(),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 10_000)),
+    ]);
+    if (result?.version) {
+      version = result.version;
+      versionSource = result.isLatest === false ? 'remote-stale' : 'remote';
+    }
+  } catch (err) {
+    versionError = err?.message || String(err);
+  }
+  logger.info(
+    {
+      phone,
+      wa_web_version: version.join('.'),
+      source: versionSource,
+      baileys_pkg_version: BAILEYS_PKG_VERSION,
+      ...(versionError ? { error: versionError } : {}),
+    },
+    'wa_version_selected'
+  );
 
   const sock = makeWASocket({
     version,
-    logger: logger.child({ scope: 'baileys', phone }),
+    logger: baileysLogger.child({ scope: 'baileys', phone }),
     printQRInTerminal: false,
     // Stock browser fingerprint — custom names get rejected by WA.
     browser: Browsers.macOS('Chrome'),
     auth: {
       creds: state.creds,
-      keys: makeCacheableSignalKeyStore(state.keys, logger),
+      keys: makeCacheableSignalKeyStore(state.keys, baileysLogger),
     },
     connectTimeoutMs: 60_000,
     defaultQueryTimeoutMs: 60_000,
@@ -152,6 +390,23 @@ async function createSocket(phone, { forceReset } = {}) {
     syncFullHistory: false,
     shouldSyncHistoryMessage: () => false,
     generateHighQualityLinkPreview: false,
+    // Critical: when WA asks us to resend (retry receipt), supply the
+    // original message content. Without this the recipient sees
+    // "Waiting for this message. This may take a while."
+    getMessage: async (key) => {
+      try {
+        const m = outgoingCache.get(phone);
+        const entry = m?.get(key?.id);
+        if (entry?.content) {
+          logger.info({ phone, msgId: key?.id, jid: key?.remoteJid }, 'getMessage_hit');
+          return entry.content;
+        }
+        logger.warn({ phone, msgId: key?.id, jid: key?.remoteJid }, 'getMessage_miss');
+      } catch (err) {
+        logger.error({ phone, err: err?.message }, 'getMessage error');
+      }
+      return undefined;
+    },
   });
 
   s.sock = sock;
@@ -207,6 +462,9 @@ async function createSocket(phone, { forceReset } = {}) {
           );
           continue;
         }
+        // Remember which JID flavor (@lid vs @s.whatsapp.net) this peer used,
+        // so we can reply via the same JID and avoid forking the Signal session.
+        rememberInboundJid(phone, digits, jid);
         const payload = {
           station_phone: phone,
           driver_phone: digits,
@@ -271,6 +529,77 @@ async function createSocket(phone, { forceReset } = {}) {
       }
 
       s.pairingReady = false;
+    }
+  });
+
+
+  // -------------------------------------------------------------------------
+  // Self-heal "Waiting for this message" — when WA sends repeated retry
+  // receipts for outgoing messages to the same JID, the Signal session is
+  // out of sync. Force a fresh prekey fetch via assertSessions(force=true)
+  // so the NEXT outgoing message rebuilds the session and unsticks the
+  // recipient (existing stuck messages remain stuck — only future ones heal).
+  // -------------------------------------------------------------------------
+  if (!s.retryCounters) s.retryCounters = new Map(); // jid -> { count, ts }
+  sock.ev.on('messages.update', async (updates) => {
+    for (const u of updates || []) {
+      try {
+        const stub = u?.update?.messageStubType;
+        const isRetry =
+          stub === 2 /* CIPHERTEXT */ ||
+          u?.update?.status === 0 /* ERROR */ ||
+          (u?.update?.messageStubParameters || []).some?.((x) =>
+            String(x || '').toLowerCase().includes('retry')
+          );
+        if (!isRetry) continue;
+        const jid = u?.key?.remoteJid;
+        if (!jid || jid.endsWith('@g.us')) continue;
+        logger.warn({ phone, jid, msgId: u?.key?.id, stub, status: u?.update?.status }, 'retry_detected');
+        const now = Date.now();
+        const cur = s.retryCounters.get(jid) || { count: 0, ts: now };
+        if (now - cur.ts > 60_000) { cur.count = 0; cur.ts = now; }
+        cur.count += 1;
+        s.retryCounters.set(jid, cur);
+        if (cur.count >= 2) {
+          logger.warn({ phone, jid, count: cur.count }, 'assertSessions_forced');
+          try {
+            await sock.assertSessions([jid], true);
+          } catch (err) {
+            logger.error({ phone, jid, err: err?.message }, 'assertSessions failed');
+          }
+          s.retryCounters.delete(jid);
+        }
+      } catch (err) {
+        logger.error({ phone, err: err?.message }, 'messages.update handler error');
+      }
+    }
+  });
+
+  // Bad-acks / phash errors arrive as message-receipt.update too. These are
+  // strong signals that the recipient could not decrypt — bump the same
+  // retry counter so we converge to assertSessions.
+  sock.ev.on('message-receipt.update', async (receipts) => {
+    for (const r of receipts || []) {
+      try {
+        const recv = r?.receipt;
+        const type = String(recv?.type || '').toLowerCase();
+        const jid = r?.key?.remoteJid;
+        if (!jid || jid.endsWith('@g.us')) continue;
+        const isBad = type === 'retry' || type === 'error' || !!recv?.error || !!recv?.phash;
+        if (!isBad) continue;
+        logger.warn({ phone, jid, msgId: r?.key?.id, type }, 'bad_ack_detected');
+        const now = Date.now();
+        const cur = s.retryCounters.get(jid) || { count: 0, ts: now };
+        if (now - cur.ts > 60_000) { cur.count = 0; cur.ts = now; }
+        cur.count += 1;
+        s.retryCounters.set(jid, cur);
+        if (cur.count >= 2) {
+          try { await sock.assertSessions([jid], true); } catch (_) { /* ignore */ }
+          s.retryCounters.delete(jid);
+        }
+      } catch (err) {
+        logger.error({ phone, err: err?.message }, 'message-receipt.update handler error');
+      }
     }
   });
 
@@ -410,9 +739,41 @@ app.post('/send', async (req, res) => {
     return res.status(409).json({ error: 'session_missing', status: s?.status ?? 'not_started' });
   }
   try {
-    await s.sock.sendMessage(jid, { text });
-    res.json({ ok: true });
+    const out = await sendAndCache(phone, String(jid), { text: String(text) });
+    res.json({ ok: true, id: out.id, jid: out.jid });
   } catch (e) {
+    res.status(500).json({ ok: false, error: e?.message || String(e) });
+  }
+});
+
+
+// Force-rebuild the Signal session for a specific peer JID. Use this when
+// the recipient is stuck on "Waiting for this message" — assertSessions(true)
+// fetches a fresh prekey bundle so the next sendMessage uses a new session.
+app.post('/reset-peer', async (req, res) => {
+  const { session, jid, text } = req.body || {};
+  const phone = String(session || '').replace(/\D/g, '');
+  if (!phone || !jid) return res.status(400).json({ error: 'session and jid required' });
+  const s = sessions.get(phone);
+  if (!s || s.status !== 'connected' || !s.sock) {
+    return res.status(409).json({ error: 'session_missing', status: s?.status ?? 'not_started' });
+  }
+  // For a manual peer reset we deliberately ignore the LID/PN preference and
+  // force @s.whatsapp.net — that's the JID flavor the user typed in the UI.
+  let targetJid = String(jid);
+  if (!targetJid.includes('@')) {
+    targetJid = `${targetJid.replace(/\D/g, '')}@s.whatsapp.net`;
+  }
+  try {
+    await s.sock.assertSessions([targetJid], true);
+    let sentId = null;
+    if (text && String(text).trim()) {
+      const out = await sendAndCache(phone, targetJid, { text: String(text) });
+      sentId = out.id;
+    }
+    res.json({ ok: true, jid: targetJid, sentId });
+  } catch (e) {
+    logger.error({ phone, jid: targetJid, err: e?.message }, 'reset-peer failed');
     res.status(500).json({ ok: false, error: e?.message || String(e) });
   }
 });
@@ -445,7 +806,10 @@ app.get('/groups', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  logger.info({ port: PORT, authRoot: AUTH_ROOT }, 'whatsapp bridge listening');
+  logger.info(
+    { port: PORT, authRoot: AUTH_ROOT, baileys_pkg_version: BAILEYS_PKG_VERSION },
+    'whatsapp bridge listening'
+  );
   restoreSessionsOnBoot().catch((err) =>
     logger.error({ err: err?.message }, 'restore on boot crashed')
   );
