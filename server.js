@@ -68,7 +68,7 @@ const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || '';
 // Surfaced via /diag and printed once on startup. Bump this string when you
 // redeploy a behavioral change so you can read the version straight from
 // Railway logs.
-const BRIDGE_BUILD = 'inbound-lid-forward-v3-2026-05-05';
+const BRIDGE_BUILD = 'groups-participants-v2-2026-05-08';
 // By default we never send to @lid — it's a known cause of "Waiting for this
 // message" on Baileys 6.x. Set WA_ALLOW_LID_SEND=true to opt back in for
 // experiments.
@@ -1123,16 +1123,55 @@ app.get('/groups', async (req, res) => {
   }
   try {
     const all = await s.sock.groupFetchAllParticipating();
-    const groups = Object.values(all || {}).map((g) => ({
-      jid: g.id,
-      name: g.subject || '',
-      participants: Array.isArray(g.participants) ? g.participants.length : null,
-      size: typeof g.size === 'number'
-        ? g.size
-        : Array.isArray(g.participants) ? g.participants.length : null,
-      announce: !!g.announce,
-    }));
-    res.json({ ok: true, groups });
+    const includeParticipants = String(req.query.include || '').includes('participants');
+    let totalWithParticipants = 0;
+    let sampleParticipantId = null;
+    const groups = Object.values(all || {}).map((g) => {
+      const out = {
+        jid: g.id,
+        name: g.subject || '',
+        participants: Array.isArray(g.participants) ? g.participants.length : null,
+        size: typeof g.size === 'number'
+          ? g.size
+          : Array.isArray(g.participants) ? g.participants.length : null,
+        announce: !!g.announce,
+      };
+      if (includeParticipants && Array.isArray(g.participants)) {
+        // Extract every plausible identifier per participant. Different
+        // Baileys versions / LID rollouts populate different fields:
+        //   p.id              — JID (phone@s.whatsapp.net or <lid>@lid)
+        //   p.jid             — sometimes set instead of id
+        //   p.phoneNumber     — explicit PN when LID is in use
+        //   p.lid             — explicit LID alongside id=PN
+        // We collect digits-only forms of all of them so the caller can match
+        // by phone regardless of which field carries the real number.
+        const ids = new Set();
+        for (const p of g.participants) {
+          if (!p) continue;
+          const raw = [p.id, p.jid, p.phoneNumber, p.phone_number, p.pn, p.lid]
+            .filter((x) => typeof x === 'string' && x.length > 0);
+          for (const v of raw) {
+            const head = v.split('@')[0].split(':')[0].replace(/\D/g, '');
+            if (head) ids.add(head);
+          }
+        }
+        out.participantIds = [...ids];
+        if (out.participantIds.length > 0) {
+          totalWithParticipants += 1;
+          if (!sampleParticipantId) sampleParticipantId = out.participantIds[0];
+        }
+      }
+      return out;
+    });
+    res.json({
+      ok: true,
+      build: BRIDGE_BUILD,
+      participantsIncluded: includeParticipants,
+      totalGroups: groups.length,
+      totalWithParticipants,
+      sampleParticipantId,
+      groups,
+    });
   } catch (e) {
     logger.error({ phone, err: e?.message }, 'groups fetch failed');
     res.status(500).json({ ok: false, error: e?.message || String(e) });
