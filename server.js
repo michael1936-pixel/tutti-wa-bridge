@@ -64,11 +64,33 @@ const API_KEY = process.env.API_KEY || '';
 const AUTH_ROOT = process.env.AUTH_DIR || '/data';
 const WEBHOOK_URL = process.env.WEBHOOK_URL || '';
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || '';
+// Separate webhook for incoming GROUP messages (user WhatsApp feed).
+// When set, every text message received in a @g.us chat is forwarded so
+// Lovable Cloud can parse it and surface rides in OpenRides.
+const GROUP_FEED_WEBHOOK_URL = process.env.GROUP_FEED_WEBHOOK_URL || '';
+const GROUP_FEED_WEBHOOK_SECRET = process.env.GROUP_FEED_WEBHOOK_SECRET || '';
+
+// Lightweight in-memory cache for groupMetadata lookups so we don't hammer
+// WhatsApp on every inbound group message. 5 min TTL is plenty — group
+// renames are rare.
+const groupMetaCache = new Map(); // jid -> { meta, ts }
+const GROUP_META_TTL_MS = 5 * 60 * 1000;
+async function getCachedGroupMetadata(sock, jid) {
+  const e = groupMetaCache.get(jid);
+  if (e && Date.now() - e.ts < GROUP_META_TTL_MS) return e.meta;
+  try {
+    const meta = await sock.groupMetadata(jid);
+    groupMetaCache.set(jid, { meta, ts: Date.now() });
+    return meta;
+  } catch (_) {
+    return null;
+  }
+}
 // Build marker so we can confirm Railway picked up the latest server.js.
 // Surfaced via /diag and printed once on startup. Bump this string when you
 // redeploy a behavioral change so you can read the version straight from
 // Railway logs.
-const BRIDGE_BUILD = 'groups-participants-v2-2026-05-08';
+const BRIDGE_BUILD = 'group-feed-diag-v3-2026-05-17';
 // By default we never send to @lid — it's a known cause of "Waiting for this
 // message" on Baileys 6.x. Set WA_ALLOW_LID_SEND=true to opt back in for
 // experiments.
@@ -783,8 +805,157 @@ async function createSocket(phone, { forceReset } = {}) {
       } catch (err) {
         logger.error({ phone, err: err?.message }, 'messages.upsert handler error');
       }
+      try {
+        await forwardGroupInbound(m);
+      } catch (err) {
+        logger.error({ phone, err: err?.message }, 'group_feed forward handler error');
+      }
     }
   });
+
+  // -------------------------------------------------------------------------
+  // Group-feed forwarder — POSTs incoming @g.us text messages to Lovable
+  // Cloud's whatsapp-group-feed-inbound webhook. The webhook parses the
+  // text with Hebrew ride heuristics and inserts matches into
+  // user_whatsapp_feed_posts (shown in OpenRides).
+  // -------------------------------------------------------------------------
+  async function forwardGroupInbound(m) {
+    if (!m || m.key?.fromMe) return;
+    const jid = m.key?.remoteJid || '';
+    if (!jid || !jid.endsWith('@g.us')) return;
+
+    // Loud, unconditional log for every GROUP inbound we see, so we can tell
+    // the difference between "WhatsApp never delivered it", "we received but
+    // couldn't decrypt", and "we received but webhook URL is missing".
+    logger.info(
+      {
+        phone,
+        jid,
+        msgId: m.key?.id,
+        participant: m.key?.participant || m.participant || null,
+        senderPn: m.key?.senderPn || null,
+        addressingMode: m.key?.addressingMode || null,
+        hasMessage: !!m.message,
+        stub: m.messageStubType || null,
+        group_feed_webhook_configured: !!GROUP_FEED_WEBHOOK_URL,
+      },
+      'group_feed_raw_received'
+    );
+
+    if (!GROUP_FEED_WEBHOOK_URL) return;
+
+    // ---- Group decryption-failure detection -----------------------------
+    const stub = m.messageStubType;
+    const isCiphertextFail = stub === 2 || (m && !m.message && m.key?.id);
+    if (isCiphertextFail) {
+      const participant = m.key?.participant || m.participant || '';
+      const senderPnRaw = m.key?.senderPn || m.senderPn || '';
+      logger.warn(
+        {
+          phone, jid, msgId: m.key?.id, stub,
+          participant: participant || null,
+          senderPn: senderPnRaw || null,
+          addressingMode: m.key?.addressingMode || null,
+        },
+        'group_feed_decryption_failed'
+      );
+      const targets = new Set();
+      if (participant) targets.add(participant);
+      if (typeof senderPnRaw === 'string' && senderPnRaw.includes('@')) {
+        const pnDigits = senderPnRaw.split('@')[0].split(':')[0].replace(/\D/g, '');
+        if (pnDigits.length >= 9) targets.add(`${pnDigits}@s.whatsapp.net`);
+      }
+      const now = Date.now();
+      if (targets.size) {
+        try {
+          await sock.assertSessions(Array.from(targets), true);
+          logger.warn({ phone, jid, targets: Array.from(targets) }, 'group_feed_assertSessions_forced');
+        } catch (err) {
+          logger.error({ phone, jid, err: err?.message }, 'group_feed_assertSessions_failed');
+        }
+      }
+      try {
+        if (typeof sock.uploadPreKeys === 'function' && (now - s.lastPreKeyUploadAt) > 5 * 60_000) {
+          await sock.uploadPreKeys(30);
+          s.lastPreKeyUploadAt = now;
+          logger.warn({ phone, batch: 30 }, 'group_feed_uploadPreKeys_done');
+        }
+      } catch (err) {
+        logger.error({ phone, err: err?.message }, 'group_feed_uploadPreKeys_failed');
+      }
+      try {
+        if (typeof sock.sendRetryRequest === 'function') {
+          const node = {
+            tag: 'message',
+            attrs: {
+              from: jid,
+              id: m.key?.id || '',
+              ...(participant ? { participant } : {}),
+            },
+          };
+          await sock.sendRetryRequest(node, true);
+          logger.warn({ phone, jid, msgId: m.key?.id }, 'group_feed_retry_request_sent');
+        }
+      } catch (err) {
+        logger.error({ phone, jid, err: err?.message }, 'group_feed_retry_request_failed');
+      }
+      return;
+    }
+
+    if (!m.message) return;
+
+    // Extract plain text (conversation / extendedText / image caption).
+    const text =
+      m.message?.conversation ||
+      m.message?.extendedTextMessage?.text ||
+      m.message?.imageMessage?.caption ||
+      m.message?.videoMessage?.caption ||
+      '';
+    if (!text || typeof text !== 'string' || !text.trim()) return;
+
+    // Group subject (cached briefly to avoid spamming groupMetadata).
+    let groupName = null;
+    try {
+      const meta = await getCachedGroupMetadata(sock, jid);
+      groupName = meta?.subject || null;
+    } catch (_) { /* non-fatal */ }
+
+    const participant = m.key?.participant || m.participant || '';
+    const senderPhone = extractRealPhoneDigits(phone, m) ||
+      (participant.split('@')[0] || '').replace(/\D/g, '') || null;
+
+    const payload = {
+      station_phone: phone, // session phone = end-user's phone
+      wa_group_jid: jid,
+      group_name: groupName,
+      sender_jid: participant || null,
+      sender_name: m.pushName || null,
+      sender_phone: senderPhone,
+      wa_message_id: m.key?.id || null,
+      text,
+      timestamp: typeof m.messageTimestamp === 'number'
+        ? m.messageTimestamp
+        : Number(m.messageTimestamp || 0) || undefined,
+    };
+
+    try {
+      const resp = await fetch(GROUP_FEED_WEBHOOK_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(GROUP_FEED_WEBHOOK_SECRET ? { 'X-Webhook-Secret': GROUP_FEED_WEBHOOK_SECRET } : {}),
+        },
+        body: JSON.stringify(payload),
+      });
+      const respText = await resp.text().catch(() => '');
+      logger.info(
+        { phone, jid, msgId: m.key?.id, status: resp.status, body: respText.slice(0, 200) },
+        'group_feed_forward_result',
+      );
+    } catch (err) {
+      logger.error({ phone, jid, err: err?.message }, 'group_feed forward failed');
+    }
+  }
 
   sock.ev.on('connection.update', async (u) => {
     const { connection, lastDisconnect, isNewLogin, qr } = u;
@@ -844,14 +1015,21 @@ async function createSocket(phone, { forceReset } = {}) {
         // retry/assertSessions, the update carries a decrypted `message`.
         // Forward it to the webhook just like a fresh upsert.
         if (!u?.key?.fromMe && u?.update?.message) {
+          const rebuilt = {
+            key: u.key,
+            message: u.update.message,
+            messageTimestamp: u.update.messageTimestamp,
+            pushName: u.update.pushName,
+          };
           try {
-            await forwardInbound({
-              key: u.key,
-              message: u.update.message,
-              messageTimestamp: u.update.messageTimestamp,
-            });
+            await forwardInbound(rebuilt);
           } catch (err) {
             logger.error({ phone, err: err?.message }, 'inbound_update_forward failed');
+          }
+          try {
+            await forwardGroupInbound(rebuilt);
+          } catch (err) {
+            logger.error({ phone, err: err?.message }, 'group_feed_update_forward failed');
           }
         }
 
@@ -1014,6 +1192,8 @@ app.get('/diag', (_req, res) => {
     baileys_pkg_version: BAILEYS_PKG_VERSION,
     webhook_url_configured: !!WEBHOOK_URL,
     webhook_secret_configured: !!WEBHOOK_SECRET,
+    group_feed_webhook_url_configured: !!GROUP_FEED_WEBHOOK_URL,
+    group_feed_webhook_secret_configured: !!GROUP_FEED_WEBHOOK_SECRET,
     api_key_configured: !!API_KEY,
     auth_root: AUTH_ROOT,
     sessions: sessionsInfo,
@@ -1219,7 +1399,16 @@ app.post('/debug-forward-inbound', async (req, res) => {
 app.listen(PORT, () => {
   // (debug endpoint registered above)
   logger.info(
-    { port: PORT, authRoot: AUTH_ROOT, baileys_pkg_version: BAILEYS_PKG_VERSION, bridge_build: BRIDGE_BUILD },
+    {
+      port: PORT,
+      authRoot: AUTH_ROOT,
+      baileys_pkg_version: BAILEYS_PKG_VERSION,
+      bridge_build: BRIDGE_BUILD,
+      webhook_url_configured: !!WEBHOOK_URL,
+      webhook_secret_configured: !!WEBHOOK_SECRET,
+      group_feed_webhook_url_configured: !!GROUP_FEED_WEBHOOK_URL,
+      group_feed_webhook_secret_configured: !!GROUP_FEED_WEBHOOK_SECRET,
+    },
     'whatsapp bridge listening'
   );
   restoreSessionsOnBoot().catch((err) =>
