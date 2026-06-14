@@ -924,6 +924,24 @@ async function createSocket(phone, { forceReset } = {}) {
     const senderPhone = extractRealPhoneDigits(phone, m) ||
       (participant.split('@')[0] || '').replace(/\D/g, '') || null;
 
+    // Quoted message (driver tags a ride post in the group with "ת"/"ת5"/etc.).
+    // The Lovable edge function uses these fields to link the reply to a ride
+    // and open a private DM with the driver — same flow as a wa.me click.
+    const ctx =
+      m.message?.extendedTextMessage?.contextInfo ||
+      m.message?.imageMessage?.contextInfo ||
+      m.message?.videoMessage?.contextInfo ||
+      null;
+    const quotedMsg = ctx?.quotedMessage || null;
+    const quoted_text = quotedMsg
+      ? (quotedMsg.conversation ||
+         quotedMsg.extendedTextMessage?.text ||
+         quotedMsg.imageMessage?.caption ||
+         quotedMsg.videoMessage?.caption ||
+         null)
+      : null;
+    const quoted_wa_message_id = ctx?.stanzaId || null;
+
     const payload = {
       station_phone: phone, // session phone = end-user's phone
       wa_group_jid: jid,
@@ -933,6 +951,8 @@ async function createSocket(phone, { forceReset } = {}) {
       sender_phone: senderPhone,
       wa_message_id: m.key?.id || null,
       text,
+      quoted_text,
+      quoted_wa_message_id,
       timestamp: typeof m.messageTimestamp === 'number'
         ? m.messageTimestamp
         : Number(m.messageTimestamp || 0) || undefined,
@@ -971,6 +991,8 @@ async function createSocket(phone, { forceReset } = {}) {
 
     if (connection === 'open' || isNewLogin) {
       setStatus(s, 'connected', { lastError: null, pairingCode: null });
+      // Reset reconnect attempt counter on every successful open.
+      s.reconnectAttempts = 0;
     }
 
     if (connection === 'close') {
@@ -981,10 +1003,36 @@ async function createSocket(phone, { forceReset } = {}) {
         // WA refused the device. Wipe auth so the next /pair starts clean.
         await wipeAuth(phone);
         setStatus(s, 'logged_out', { lastError: `${code}: ${msg}` });
-      } else if (s.status === 'connected') {
-        // Lost an established session — try to reconnect quietly.
-        setStatus(s, 'connecting', { lastError: msg });
-        setTimeout(() => createSocket(phone).catch(() => {}), 2000);
+      } else if (
+        s.status === 'connected' ||
+        s.status === 'connecting' ||
+        // Auto-restored creds — keep retrying instead of bailing to "failed".
+        sock.authState?.creds?.registered
+      ) {
+        // Lost an (already-paired) session — reconnect with bounded backoff
+        // instead of a single setTimeout shot. Without this, one transient
+        // network blip leaves the session stuck on `connecting` forever and
+        // every /send returns 409 session_missing.
+        const attempts = (s.reconnectAttempts || 0) + 1;
+        s.reconnectAttempts = attempts;
+        setStatus(s, 'connecting', { lastError: `${code ?? '?'}: ${msg}` });
+        await destroySocket(s);
+        if (attempts > 20) {
+          // Give up after ~10 minutes of failed retries — surface clearly.
+          setStatus(s, 'failed', {
+            lastError: `reconnect gave up after ${attempts} attempts: ${msg}`,
+          });
+          s.reconnectAttempts = 0;
+          return;
+        }
+        // Exponential-ish backoff: 2s, 4s, 8s, 16s, 30s cap.
+        const delay = Math.min(30_000, 2_000 * Math.pow(2, Math.min(attempts - 1, 4)));
+        logger.warn({ phone, attempts, delayMs: delay, code, msg }, 'reconnect_scheduled');
+        setTimeout(() => {
+          createSocket(phone).catch((err) => {
+            logger.error({ phone, err: err?.message }, 'reconnect_createSocket_failed');
+          });
+        }, delay);
       } else {
         // Half-pair drop (typical 428 Connection Terminated). Surface the
         // exact code/message so the client can show a useful explanation
@@ -1256,6 +1304,50 @@ app.post('/send', async (req, res) => {
     const out = await sendAndCache(phone, String(jid), { text: String(text) });
     res.json({ ok: true, id: out.id, jid: out.jid });
   } catch (e) {
+    res.status(500).json({ ok: false, error: e?.message || String(e) });
+  }
+});
+
+// Send a text message that QUOTES (tags) an existing message — used for
+// replying inside a group to a specific feed post.
+//
+// Body: { session, jid, text, quoted: { id, participant, text } | null }
+// When `quoted` is null the call degrades to a plain send.
+app.post('/send-reply', async (req, res) => {
+  const { jid, text, session, quoted } = req.body || {};
+  const phone = String(session || '').replace(/\D/g, '');
+  if (!phone || !jid || !text) return res.status(400).json({ error: 'jid, text, session required' });
+  const s = sessions.get(phone);
+  if (!s || s.status !== 'connected' || !s.sock) {
+    return res.status(409).json({ error: 'session_missing', status: s?.status ?? 'not_started' });
+  }
+  const targetJid = String(jid);
+  try {
+    if (quoted && quoted.id) {
+      const quotedMsg = {
+        key: {
+          id: String(quoted.id),
+          fromMe: false,
+          remoteJid: targetJid,
+          ...(quoted.participant ? { participant: String(quoted.participant) } : {}),
+        },
+        message: { conversation: String(quoted.text || '') },
+      };
+      const sent = await s.sock.sendMessage(
+        targetJid,
+        { text: String(text) },
+        { quoted: quotedMsg },
+      );
+      const finalId = sent?.key?.id || null;
+      if (finalId && sent?.message) rememberOutgoing(phone, finalId, sent.message);
+      logger.info({ phone, jid: targetJid, msgId: finalId, quotedId: quoted.id }, 'send_reply_ok');
+      return res.json({ ok: true, id: finalId, jid: targetJid });
+    }
+    // No quote — plain send via cache path.
+    const out = await sendAndCache(phone, targetJid, { text: String(text) });
+    res.json({ ok: true, id: out.id, jid: out.jid });
+  } catch (e) {
+    logger.error({ phone, jid: targetJid, err: e?.message }, 'send_reply_failed');
     res.status(500).json({ ok: false, error: e?.message || String(e) });
   }
 });
