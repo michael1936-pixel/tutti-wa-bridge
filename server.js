@@ -64,6 +64,14 @@ const API_KEY = process.env.API_KEY || '';
 const AUTH_ROOT = process.env.AUTH_DIR || '/data';
 const WEBHOOK_URL = process.env.WEBHOOK_URL || '';
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || '';
+// The app shows a driver's WhatsApp chat ("מי ביקש" → "צ'אט וואטסאפ") and
+// is kept in step through this endpoint: every message of a private chat,
+// in both directions, and the state of sent messages. By default it sits
+// next to the private-reply webhook and takes the same secret.
+const CHAT_SYNC_URL = process.env.CHAT_SYNC_WEBHOOK_URL
+  || (WEBHOOK_URL.includes('whatsapp-private-reply-webhook')
+    ? WEBHOOK_URL.replace('whatsapp-private-reply-webhook', 'whatsapp-chat-sync')
+    : '');
 // Separate webhook for incoming GROUP messages (user WhatsApp feed).
 // When set, every text message received in a @g.us chat is forwarded so
 // Lovable Cloud can parse it and surface rides in OpenRides.
@@ -90,7 +98,7 @@ async function getCachedGroupMetadata(sock, jid) {
 // Surfaced via /diag and printed once on startup. Bump this string when you
 // redeploy a behavioral change so you can read the version straight from
 // Railway logs.
-const BRIDGE_BUILD = 'quoted-reply-2026-10-04';
+const BRIDGE_BUILD = 'chat-sync-2026-10-05';
 // By default we never send to @lid — it's a known cause of "Waiting for this
 // message" on Baileys 6.x. Set WA_ALLOW_LID_SEND=true to opt back in for
 // experiments.
@@ -514,6 +522,100 @@ async function createSocket(phone, { forceReset } = {}) {
   // so we don't spam them on every retry.
   if (!s.notifiedDecryptFail) s.notifiedDecryptFail = new Map();
 
+  // -------------------------------------------------------------------------
+  // Chat sync — reports every message of a PRIVATE chat (what the driver
+  // wrote, what this bridge sent, what was typed on the phone itself) and
+  // the state of sent messages to the app. It only reports: nothing here
+  // answers anybody, and a failure never touches the forwarding below.
+  // -------------------------------------------------------------------------
+  let chatSyncLastErrorAt = 0;
+  async function postChatSync(body) {
+    if (!CHAT_SYNC_URL) return;
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 8000);
+    try {
+      const resp = await fetch(CHAT_SYNC_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(WEBHOOK_SECRET ? { 'x-bridge-secret': WEBHOOK_SECRET } : {}),
+        },
+        body: JSON.stringify(body),
+        signal: ctrl.signal,
+      });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    } catch (err) {
+      // One line a minute at most — the endpoint may not be deployed yet.
+      if (Date.now() - chatSyncLastErrorAt > 60_000) {
+        chatSyncLastErrorAt = Date.now();
+        logger.warn({ phone, err: err?.message }, 'chat_sync_failed');
+      }
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  // What a message says, the way a chat list would show it.
+  function chatSyncText(message) {
+    const msg = message?.ephemeralMessage?.message
+      || message?.viewOnceMessage?.message
+      || message?.viewOnceMessageV2?.message
+      || message?.documentWithCaptionMessage?.message
+      || message;
+    if (!msg) return '';
+    const text = msg.conversation
+      || msg.extendedTextMessage?.text
+      || msg.imageMessage?.caption
+      || msg.videoMessage?.caption
+      || msg.documentMessage?.caption
+      || '';
+    if (text && String(text).trim()) return String(text);
+    if (msg.audioMessage) return '🎤 הודעה קולית';
+    if (msg.imageMessage) return '📷 תמונה';
+    if (msg.videoMessage) return '🎥 סרטון';
+    if (msg.documentMessage) return '📄 מסמך';
+    if (msg.stickerMessage) return 'סטיקר';
+    if (msg.locationMessage || msg.liveLocationMessage) return '📍 מיקום';
+    if (msg.contactMessage || msg.contactsArrayMessage) return '👤 איש קשר';
+    return '';
+  }
+
+  function syncChatMessage(m) {
+    if (!CHAT_SYNC_URL || !m?.key?.id || !m.message) return;
+    const jid = m.key.remoteJid || '';
+    if (!jid || jid.endsWith('@g.us') || jid.endsWith('@broadcast') || jid.endsWith('@newsletter') || jid.startsWith('status@')) return;
+    const text = chatSyncText(m.message);
+    if (!text) return;
+    const peer = extractRealPhoneDigits(phone, m);
+    // No real number behind a LID, or a note to oneself: nothing to report.
+    if (!peer || peer === String(phone)) return;
+    const fromMe = !!m.key.fromMe;
+    void postChatSync({
+      kind: 'message',
+      station_phone: phone,
+      peer_phone: peer,
+      from_me: fromMe,
+      text: text.slice(0, 4000),
+      wa_message_id: m.key.id,
+      // Sent through this bridge's API (the system), or typed on the phone.
+      via_api: fromMe && !!outgoingCache.get(phone)?.has(m.key.id),
+    });
+  }
+
+  // Delivered / read, for a message of ours in a private chat. Reported a
+  // moment later, so the message itself is saved in the app by then.
+  function syncChatStatus(u) {
+    if (!CHAT_SYNC_URL || !u?.key?.fromMe || !u.key.id) return;
+    const jid = u.key.remoteJid || '';
+    if (!jid || jid.endsWith('@g.us') || jid.endsWith('@broadcast')) return;
+    const ack = u.update?.status;
+    const status = ack === 3 ? 'delivered' : (ack === 4 || ack === 5) ? 'read' : null;
+    if (!status) return;
+    setTimeout(() => {
+      void postChatSync({ kind: 'status', station_phone: phone, wa_message_id: u.key.id, status });
+    }, 1500);
+  }
+
   // Shared forwarder used by both messages.upsert and messages.update
   // (because retried/re-delivered messages arrive on `update`).
   async function forwardInbound(m) {
@@ -824,6 +926,16 @@ async function createSocket(phone, { forceReset } = {}) {
   }
 
   sock.ev.on('messages.upsert', async (ev) => {
+    // The chat sync also sees 'append': what this bridge itself sent.
+    if (ev.type === 'notify' || ev.type === 'append') {
+      for (const m of ev.messages || []) {
+        try {
+          syncChatMessage(m);
+        } catch (err) {
+          logger.error({ phone, err: err?.message }, 'chat_sync handler error');
+        }
+      }
+    }
     if (ev.type !== 'notify') return;
     for (const m of ev.messages || []) {
       try {
@@ -1099,6 +1211,7 @@ async function createSocket(phone, { forceReset } = {}) {
   sock.ev.on('messages.update', async (updates) => {
     for (const u of updates || []) {
       try {
+        syncChatStatus(u);
         // If WA re-delivered a previously failed inbound message after our
         // retry/assertSessions, the update carries a decrypted `message`.
         // Forward it to the webhook just like a fresh upsert.
