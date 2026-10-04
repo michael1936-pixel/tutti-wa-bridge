@@ -90,7 +90,7 @@ async function getCachedGroupMetadata(sock, jid) {
 // Surfaced via /diag and printed once on startup. Bump this string when you
 // redeploy a behavioral change so you can read the version straight from
 // Railway logs.
-const BRIDGE_BUILD = 'group-feed-diag-v3-2026-05-17';
+const BRIDGE_BUILD = 'quoted-reply-2026-10-04';
 // By default we never send to @lid — it's a known cause of "Waiting for this
 // message" on Baileys 6.x. Set WA_ALLOW_LID_SEND=true to opt back in for
 // experiments.
@@ -196,10 +196,14 @@ function extractRealPhoneDigits(stationPhone, m) {
     if (head.length >= 9 && head.length <= 13) return head;
   }
   // Try cached LID -> phone mapping learned from prior senderPn events.
-  const jid = m?.key?.remoteJid || '';
-  if (jid.endsWith('@lid')) {
-    const cached = lookupLidPhone(stationPhone, jid);
-    if (cached) return cached;
+  // A direct chat keys on remoteJid; a GROUP message keys on the participant
+  // jid (remoteJid there is the @g.us), which used to be skipped entirely —
+  // so a driver replying "ת" from a LID-addressed group never resolved.
+  for (const cand of [m?.key?.remoteJid, m?.key?.participant, m?.participant]) {
+    if (typeof cand === 'string' && cand.endsWith('@lid')) {
+      const cached = lookupLidPhone(stationPhone, cand);
+      if (cached) return cached;
+    }
   }
   return '';
 }
@@ -712,6 +716,26 @@ async function createSocket(phone, { forceReset } = {}) {
     // Successful decrypt — clear failure counter for this peer.
     s.inboundDecryptFails.delete(jid);
 
+    // The message the driver quoted, if any. A private "ת" on a swipe-reply
+    // of the ride's post names the ride without a code — the webhook reads
+    // quoted_text to find it.
+    const quotedCtx =
+      msg.extendedTextMessage?.contextInfo ||
+      msg.imageMessage?.contextInfo ||
+      msg.videoMessage?.contextInfo ||
+      null;
+    const quotedMsg = quotedCtx?.quotedMessage || null;
+    const quotedText = quotedMsg
+      ? (quotedMsg.conversation ||
+         quotedMsg.extendedTextMessage?.text ||
+         quotedMsg.imageMessage?.caption ||
+         quotedMsg.videoMessage?.caption ||
+         null)
+      : null;
+    const quoted = quotedText
+      ? { quoted_text: String(quotedText).slice(0, 4000), quoted_wa_message_id: quotedCtx?.stanzaId || null }
+      : {};
+
         // WhatsApp often returns @lid (linked-id) instead of @s.whatsapp.net.
         // Try EVERY known Baileys field for the real phone (PN).
         const digits = extractRealPhoneDigits(phone, m);
@@ -751,6 +775,7 @@ async function createSocket(phone, { forceReset } = {}) {
                   text: String(text),
                   wa_message_id: m.key?.id || null,
                   direction: 'incoming',
+                  ...quoted,
                 }),
               });
               const respText = await resp.text().catch(() => '');
@@ -776,6 +801,7 @@ async function createSocket(phone, { forceReset } = {}) {
           text: String(text),
           wa_message_id: m.key?.id || null,
           direction: 'incoming',
+          ...quoted,
         };
         try {
           logger.info({ phone, jid, driver_phone: digits, msgId: m.key?.id }, 'webhook_forward_attempt');
@@ -921,7 +947,21 @@ async function createSocket(phone, { forceReset } = {}) {
     } catch (_) { /* non-fatal */ }
 
     const participant = m.key?.participant || m.participant || '';
-    const senderPhone = extractRealPhoneDigits(phone, m) ||
+    const realPhone = extractRealPhoneDigits(phone, m);
+    // Learn the LID↔PN mapping whenever WhatsApp handed us both, so the next
+    // message from the same participant that arrives LID-only still resolves
+    // to a real number (group take replies depend on it).
+    if (realPhone && participant.endsWith('@lid')) {
+      rememberLidPhone(phone, participant, realPhone);
+    }
+    // Unchanged on purpose: sender_phone is the ride FEED's identity for this
+    // poster, not just the take-reply's. Nulling it for @lid participants (an
+    // @lid's digits really are an internal id, not a number) would disable the
+    // feed's per-sender dedupe in whatsapp-group-feed-inbound and permanently
+    // grey out "בקש בפרטי" in OpenRides — and it is not needed: the edge
+    // function's take path already recognises LID digits and routes them down
+    // the driver_lid path instead of treating them as a phone.
+    const senderPhone = realPhone ||
       (participant.split('@')[0] || '').replace(/\D/g, '') || null;
 
     // Quoted message (driver tags a ride post in the group with "ת"/"ת5"/etc.).
@@ -1398,6 +1438,8 @@ app.get('/groups', async (req, res) => {
     const includeParticipants = String(req.query.include || '').includes('participants');
     let totalWithParticipants = 0;
     let sampleParticipantId = null;
+    // Digits-only form of the session phone for admin matching below.
+    const ownDigits = String(phone).replace(/\D/g, '');
     const groups = Object.values(all || {}).map((g) => {
       const out = {
         jid: g.id,
@@ -1407,7 +1449,20 @@ app.get('/groups', async (req, res) => {
           ? g.size
           : Array.isArray(g.participants) ? g.participants.length : null,
         announce: !!g.announce,
+        isSessionAdmin: false,
       };
+      if (Array.isArray(g.participants)) {
+        for (const p of g.participants) {
+          if (!p || !p.admin) continue; // 'admin' | 'superadmin'
+          const raw = [p.id, p.jid, p.phoneNumber, p.phone_number, p.pn, p.lid]
+            .filter((x) => typeof x === 'string' && x.length > 0);
+          for (const v of raw) {
+            const head = v.split('@')[0].split(':')[0].replace(/\D/g, '');
+            if (head && head === ownDigits) { out.isSessionAdmin = true; break; }
+          }
+          if (out.isSessionAdmin) break;
+        }
+      }
       if (includeParticipants && Array.isArray(g.participants)) {
         // Extract every plausible identifier per participant. Different
         // Baileys versions / LID rollouts populate different fields:
@@ -1541,4 +1596,4 @@ async function restoreSessionsOnBoot() {
       logger.error({ phone, err: err?.message }, 'auto-restore failed');
     }
   }
-}
+} 
