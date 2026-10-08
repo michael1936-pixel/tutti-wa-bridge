@@ -44,6 +44,7 @@ import makeWASocket, {
   DisconnectReason,
   makeCacheableSignalKeyStore,
   generateMessageIDV2,
+  downloadMediaMessage,
 } from 'baileys';
 
 const require = createRequire(import.meta.url);
@@ -98,7 +99,7 @@ async function getCachedGroupMetadata(sock, jid) {
 // Surfaced via /diag and printed once on startup. Bump this string when you
 // redeploy a behavioral change so you can read the version straight from
 // Railway logs.
-const BRIDGE_BUILD = 'chat-sync-2026-10-05';
+const BRIDGE_BUILD = 'chat-voice-2026-10-08';
 // By default we never send to @lid — it's a known cause of "Waiting for this
 // message" on Baileys 6.x. Set WA_ALLOW_LID_SEND=true to opt back in for
 // experiments.
@@ -529,10 +530,10 @@ async function createSocket(phone, { forceReset } = {}) {
   // answers anybody, and a failure never touches the forwarding below.
   // -------------------------------------------------------------------------
   let chatSyncLastErrorAt = 0;
-  async function postChatSync(body) {
+  async function postChatSync(body, timeoutMs = 8000) {
     if (!CHAT_SYNC_URL) return;
     const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 8000);
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
     try {
       const resp = await fetch(CHAT_SYNC_URL, {
         method: 'POST',
@@ -555,13 +556,18 @@ async function createSocket(phone, { forceReset } = {}) {
     }
   }
 
-  // What a message says, the way a chat list would show it.
-  function chatSyncText(message) {
-    const msg = message?.ephemeralMessage?.message
+  // The message inside its wrappers (disappearing, view-once, captioned document).
+  function chatSyncInner(message) {
+    return message?.ephemeralMessage?.message
       || message?.viewOnceMessage?.message
       || message?.viewOnceMessageV2?.message
       || message?.documentWithCaptionMessage?.message
       || message;
+  }
+
+  // What a message says, the way a chat list would show it.
+  function chatSyncText(message) {
+    const msg = chatSyncInner(message);
     if (!msg) return '';
     const text = msg.conversation
       || msg.extendedTextMessage?.text
@@ -590,7 +596,7 @@ async function createSocket(phone, { forceReset } = {}) {
     // No real number behind a LID, or a note to oneself: nothing to report.
     if (!peer || peer === String(phone)) return;
     const fromMe = !!m.key.fromMe;
-    void postChatSync({
+    const body = {
       kind: 'message',
       station_phone: phone,
       peer_phone: peer,
@@ -599,7 +605,39 @@ async function createSocket(phone, { forceReset } = {}) {
       wa_message_id: m.key.id,
       // Sent through this bridge's API (the system), or typed on the phone.
       via_api: fromMe && !!outgoingCache.get(phone)?.has(m.key.id),
-    });
+    };
+    const audio = chatSyncInner(m.message)?.audioMessage;
+    if (!audio) { void postChatSync(body); return; }
+    // A voice note goes with its recording, so the app can play it
+    // (Michael, 2026-10-08). Without it the words alone still go.
+    void (async () => {
+      const media = await chatSyncVoice(m, audio);
+      await postChatSync(media ? { ...body, media } : body, media ? 30_000 : 8000);
+    })();
+  }
+
+  // The recording of a voice note, as base64 — null when it cannot be had.
+  const VOICE_MAX_BYTES = 8 * 1024 * 1024;
+  async function chatSyncVoice(m, audio) {
+    const declared = Number(audio?.fileLength || 0);
+    if (declared > VOICE_MAX_BYTES) return null;
+    try {
+      const download = downloadMediaMessage(m, 'buffer', {}, { logger: baileysLogger, reuploadRequest: sock.updateMediaMessage });
+      const buffer = await Promise.race([
+        download,
+        new Promise((_, reject) => setTimeout(() => reject(new Error('voice_download_timeout')), 20_000)),
+      ]);
+      if (!buffer || !buffer.length || buffer.length > VOICE_MAX_BYTES) return null;
+      return {
+        kind: 'audio',
+        mime: String(audio.mimetype || 'audio/ogg; codecs=opus').slice(0, 100),
+        ...(Number.isFinite(Number(audio.seconds)) ? { seconds: Number(audio.seconds) } : {}),
+        data_base64: Buffer.from(buffer).toString('base64'),
+      };
+    } catch (err) {
+      logger.warn({ phone, msgId: m?.key?.id, err: err?.message }, 'chat_sync_voice_failed');
+      return null;
+    }
   }
 
   // Delivered / read, for a message of ours in a private chat. Reported a
