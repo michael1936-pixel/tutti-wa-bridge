@@ -73,6 +73,15 @@ const CHAT_SYNC_URL = process.env.CHAT_SYNC_WEBHOOK_URL
   || (WEBHOOK_URL.includes('whatsapp-private-reply-webhook')
     ? WEBHOOK_URL.replace('whatsapp-private-reply-webhook', 'whatsapp-chat-sync')
     : '');
+// The payments number (Michael, 2026-10-11): the system's own number that
+// drivers send payment screenshots to. A number paired with purpose
+// 'payments' is not a station's: every private message to it — an image with
+// its file — goes here, and nowhere else. By default it sits next to the
+// private-reply webhook and takes the same secret.
+const PAYMENT_PROOF_URL = process.env.PAYMENT_PROOF_WEBHOOK_URL
+  || (WEBHOOK_URL.includes('whatsapp-private-reply-webhook')
+    ? WEBHOOK_URL.replace('whatsapp-private-reply-webhook', 'whatsapp-payment-proof-inbound')
+    : '');
 // Separate webhook for incoming GROUP messages (user WhatsApp feed).
 // When set, every text message received in a @g.us chat is forwarded so
 // Lovable Cloud can parse it and surface rides in OpenRides.
@@ -99,7 +108,7 @@ async function getCachedGroupMetadata(sock, jid) {
 // Surfaced via /diag and printed once on startup. Bump this string when you
 // redeploy a behavioral change so you can read the version straight from
 // Railway logs.
-const BRIDGE_BUILD = 'chat-voice-2026-10-08';
+const BRIDGE_BUILD = 'payments-number-2026-10-11';
 // By default we never send to @lid — it's a known cause of "Waiting for this
 // message" on Baileys 6.x. Set WA_ALLOW_LID_SEND=true to opt back in for
 // experiments.
@@ -129,6 +138,37 @@ const sessions = new Map();
 
 function authDirFor(phone) {
   return path.join(AUTH_ROOT, 'auth', phone);
+}
+
+// What a number is for, when it is not a station's: 'payments' (see
+// PAYMENT_PROOF_URL). Told by the app at /pair; forgotten at logout.
+const PURPOSES = new Set(['payments']);
+const purposes = new Map(); // phone -> purpose
+const purposeFile = (phone) => path.join(AUTH_ROOT, 'purpose', `${phone}.txt`);
+const purposeOf = (phone) => purposes.get(String(phone)) || null;
+
+async function setPurpose(phone, purpose) {
+  const key = String(phone);
+  if (purpose && PURPOSES.has(purpose)) {
+    purposes.set(key, purpose);
+    await fs.promises.mkdir(path.dirname(purposeFile(key)), { recursive: true });
+    await fs.promises.writeFile(purposeFile(key), purpose, 'utf8');
+  } else {
+    purposes.delete(key);
+    await fs.promises.rm(purposeFile(key), { force: true }).catch(() => {});
+  }
+}
+
+async function loadPurposes() {
+  const dir = path.join(AUTH_ROOT, 'purpose');
+  const files = await fs.promises.readdir(dir).catch(() => []);
+  for (const f of files) {
+    const m = /^(\d{6,})\.txt$/.exec(f);
+    if (!m) continue;
+    const purpose = (await fs.promises.readFile(path.join(dir, f), 'utf8').catch(() => '')).trim();
+    if (PURPOSES.has(purpose)) purposes.set(m[1], purpose);
+  }
+  if (purposes.size) logger.info({ purposes: Object.fromEntries(purposes) }, 'number purposes loaded');
 }
 
 // ---------------------------------------------------------------------------
@@ -588,6 +628,7 @@ async function createSocket(phone, { forceReset } = {}) {
 
   function syncChatMessage(m) {
     if (!CHAT_SYNC_URL || !m?.key?.id || !m.message) return;
+    if (purposeOf(phone)) return;
     const jid = m.key.remoteJid || '';
     if (!jid || jid.endsWith('@g.us') || jid.endsWith('@broadcast') || jid.endsWith('@newsletter') || jid.startsWith('status@')) return;
     const text = chatSyncText(m.message);
@@ -644,6 +685,7 @@ async function createSocket(phone, { forceReset } = {}) {
   // moment later, so the message itself is saved in the app by then.
   function syncChatStatus(u) {
     if (!CHAT_SYNC_URL || !u?.key?.fromMe || !u.key.id) return;
+    if (purposeOf(phone)) return;
     const jid = u.key.remoteJid || '';
     if (!jid || jid.endsWith('@g.us') || jid.endsWith('@broadcast')) return;
     const ack = u.update?.status;
@@ -658,6 +700,7 @@ async function createSocket(phone, { forceReset } = {}) {
   // (because retried/re-delivered messages arrive on `update`).
   async function forwardInbound(m) {
     if (!WEBHOOK_URL) return;
+    if (purposeOf(phone)) return;
     if (!m || m.key?.fromMe) return;
     const jid = m.key?.remoteJid || '';
     if (!jid || jid.endsWith('@g.us') || jid.endsWith('@broadcast')) return;
@@ -963,7 +1006,75 @@ async function createSocket(phone, { forceReset } = {}) {
         }
   }
 
+  // A private message to the payments number: its words, and an image with
+  // its file (a payment screenshot), to PAYMENT_PROOF_URL.
+  const PROOF_IMAGE_MAX_BYTES = 8 * 1024 * 1024;
+  async function forwardPaymentInbound(m) {
+    if (!PAYMENT_PROOF_URL || !m?.key?.id || !m.message || m.key.fromMe) return;
+    const jid = m.key.remoteJid || '';
+    if (!jid || jid.endsWith('@g.us') || jid.endsWith('@broadcast') || jid.endsWith('@newsletter') || jid.startsWith('status@')) return;
+    const inner = chatSyncInner(m.message);
+    const doc = inner?.documentMessage;
+    const image = inner?.imageMessage || (doc && /^image\//.test(String(doc.mimetype || '')) ? doc : null);
+    const text = inner?.conversation || inner?.extendedTextMessage?.text || image?.caption || '';
+    if (!image && !String(text).trim()) return;
+    const peer = extractRealPhoneDigits(phone, m);
+    const body = {
+      session_phone: phone,
+      ...(peer ? { sender_phone: peer } : { sender_lid: jid }),
+      wa_message_id: m.key.id,
+      text: String(text || '').slice(0, 4000),
+    };
+    let media = null;
+    if (image && !(Number(image.fileLength || 0) > PROOF_IMAGE_MAX_BYTES)) {
+      try {
+        const buffer = await Promise.race([
+          downloadMediaMessage(m, 'buffer', {}, { logger: baileysLogger, reuploadRequest: sock.updateMediaMessage }),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('image_download_timeout')), 20_000)),
+        ]);
+        if (buffer && buffer.length && buffer.length <= PROOF_IMAGE_MAX_BYTES) {
+          media = {
+            kind: 'image',
+            mime: String(image.mimetype || 'image/jpeg').slice(0, 100),
+            data_base64: Buffer.from(buffer).toString('base64'),
+          };
+        }
+      } catch (err) {
+        logger.warn({ phone, msgId: m.key.id, err: err?.message }, 'payment_image_download_failed');
+      }
+    }
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), media ? 60_000 : 15_000);
+    try {
+      const resp = await fetch(PAYMENT_PROOF_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(WEBHOOK_SECRET ? { 'x-bridge-secret': WEBHOOK_SECRET } : {}),
+        },
+        body: JSON.stringify(media ? { ...body, media } : body),
+        signal: ctrl.signal,
+      });
+      logger.info({ phone, msgId: m.key.id, status: resp.status, image: !!media }, 'payment_inbound_forwarded');
+    } catch (err) {
+      logger.error({ phone, msgId: m.key.id, err: err?.message }, 'payment_inbound_forward_failed');
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   sock.ev.on('messages.upsert', async (ev) => {
+    if (purposeOf(phone) === 'payments') {
+      if (ev.type !== 'notify') return;
+      for (const m of ev.messages || []) {
+        try {
+          await forwardPaymentInbound(m);
+        } catch (err) {
+          logger.error({ phone, err: err?.message }, 'payment_inbound handler error');
+        }
+      }
+      return;
+    }
     // The chat sync also sees 'append': what this bridge itself sent.
     if (ev.type === 'notify' || ev.type === 'append') {
       for (const m of ev.messages || []) {
@@ -997,6 +1108,7 @@ async function createSocket(phone, { forceReset } = {}) {
   // -------------------------------------------------------------------------
   async function forwardGroupInbound(m) {
     if (!m || m.key?.fromMe) return;
+    if (purposeOf(phone)) return;
     const jid = m.key?.remoteJid || '';
     if (!jid || !jid.endsWith('@g.us')) return;
 
@@ -1456,7 +1568,10 @@ app.post('/pair', async (req, res) => {
   const phone = String(req.body?.phone || req.body?.session || req.body?.phoneNumber || '').replace(/\D/g, '');
   const forceReset = !!req.body?.forceReset;
   if (!phone) return res.status(400).json({ error: 'phone required' });
+  // A station's pairing names no purpose — and clears one left from before.
+  const purpose = PURPOSES.has(String(req.body?.purpose || '')) ? String(req.body.purpose) : null;
   try {
+    await setPurpose(phone, purpose);
     const result = await pair(phone, { forceReset });
     res.json({ ok: true, phone, ...result });
   } catch (e) {
@@ -1474,6 +1589,7 @@ async function logoutHandler(req, res) {
     await destroySocket(s);
   }
   await wipeAuth(phone);
+  await setPurpose(phone, null);
   sessions.delete(phone);
   res.json({ ok: true, phone });
 }
@@ -1706,12 +1822,14 @@ app.listen(PORT, () => {
       webhook_secret_configured: !!WEBHOOK_SECRET,
       group_feed_webhook_url_configured: !!GROUP_FEED_WEBHOOK_URL,
       group_feed_webhook_secret_configured: !!GROUP_FEED_WEBHOOK_SECRET,
+      payment_proof_url_configured: !!PAYMENT_PROOF_URL,
     },
     'whatsapp bridge listening'
   );
-  restoreSessionsOnBoot().catch((err) =>
-    logger.error({ err: err?.message }, 'restore on boot crashed')
-  );
+  loadPurposes()
+    .catch((err) => logger.error({ err: err?.message }, 'purposes load failed'))
+    .then(() => restoreSessionsOnBoot())
+    .catch((err) => logger.error({ err: err?.message }, 'restore on boot crashed'));
 });
 
 // ---------------------------------------------------------------------------
