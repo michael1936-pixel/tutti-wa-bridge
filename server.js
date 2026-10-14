@@ -108,7 +108,7 @@ async function getCachedGroupMetadata(sock, jid) {
 // Surfaced via /diag and printed once on startup. Bump this string when you
 // redeploy a behavioral change so you can read the version straight from
 // Railway logs.
-const BRIDGE_BUILD = 'payments-number-2026-10-11';
+const BRIDGE_BUILD = 'stable-keys-2026-10-15';
 // By default we never send to @lid — it's a known cause of "Waiting for this
 // message" on Baileys 6.x. Set WA_ALLOW_LID_SEND=true to opt back in for
 // experiments.
@@ -447,13 +447,119 @@ async function wipeAuth(phone) {
 }
 
 async function destroySocket(s) {
-  if (s.sock) {
-    try { s.sock.end(undefined); } catch (_) { /* ignore */ }
-    try { s.sock.ws?.close?.(); } catch (_) { /* ignore */ }
-  }
+  // Forget it FIRST: end() fires its own 'close' — that event must find the
+  // socket already stale (ignored), not schedule a second reconnect.
+  const old = s.sock;
   s.sock = null;
+  s.liveToken = null;
   s.pairingReady = false;
+  if (old) {
+    try { old.end(undefined); } catch (_) { /* ignore */ }
+    try { old.ws?.close?.(); } catch (_) { /* ignore */ }
+  }
 }
+
+/**
+ * The key store of one socket, closed to it once it is no longer the
+ * number's socket. Two sockets of one number on the same files (a reconnect
+ * while the old one still worked through its queue; a /pair during a
+ * reconnect) wrote over each other's Signal keys — WhatsApp then logged the
+ * number out ("conflict", 053-3753887 on 2026-10-14) or it stopped reading
+ * anything. Reads go through; writes of a stale socket are dropped.
+ */
+function keysOf(keys, isLive, phone) {
+  let dropped = 0;
+  return {
+    get: (type, ids) => keys.get(type, ids),
+    set: async (data) => {
+      if (!isLive()) {
+        dropped += 1;
+        if (dropped === 1 || dropped % 50 === 0) logger.warn({ phone, dropped }, 'stale_socket_key_write_dropped');
+        return;
+      }
+      return keys.set(data);
+    },
+    ...(typeof keys.clear === 'function' ? { clear: () => (isLive() ? keys.clear() : undefined) } : {}),
+  };
+}
+
+// ---- Session health (2026-10-15) --------------------------------------------
+// A number can stay "connected" and hear nothing: every message fails inside
+// Baileys ("transaction failed", "Key used already or never filled", "No
+// session found"). Counted here from Baileys' own log lines; a decrypted
+// message marks the number alive. /status and /health say 'deaf' when a
+// connected number had many failures and no message for 10 minutes.
+const SESSION_HEALTH = {
+  windowMs: 10 * 60_000,
+  deafFailures: 30,
+  trouble: /transaction failed|failed to decrypt|Key used already|No session found|timed out waiting for message/,
+};
+
+function newHealth() {
+  return { since: Date.now(), failures: [], lastInboundAt: 0, lastPrivateInboundAt: 0, deafLoggedAt: 0 };
+}
+
+function noteTrouble(s) {
+  const h = s.health;
+  if (!h) return;
+  const now = Date.now();
+  h.failures.push(now);
+  while (h.failures.length && now - h.failures[0] > SESSION_HEALTH.windowMs) h.failures.shift();
+  if (h.failures.length > 1000) h.failures.splice(0, h.failures.length - 1000);
+}
+
+function markInbound(s, isPrivate) {
+  if (!s.health) return;
+  s.health.lastInboundAt = Date.now();
+  if (isPrivate) s.health.lastPrivateInboundAt = s.health.lastInboundAt;
+}
+
+function healthOf(s) {
+  const h = s.health;
+  if (!h) return null;
+  const now = Date.now();
+  const failures10m = h.failures.filter((t) => now - t <= SESSION_HEALTH.windowMs).length;
+  const quietMs = now - Math.max(h.lastInboundAt, h.since);
+  const deaf = s.status === 'connected' && failures10m >= SESSION_HEALTH.deafFailures && quietMs > SESSION_HEALTH.windowMs;
+  return {
+    state: deaf ? 'deaf' : 'ok',
+    failures10m,
+    lastInboundAt: h.lastInboundAt || null,
+    lastPrivateInboundAt: h.lastPrivateInboundAt || null,
+  };
+}
+
+/** Baileys' logger for one number, counting the lines that mean trouble. */
+function healthLogger(base, s) {
+  const wrap = (l) => new Proxy(l, {
+    get(target, prop) {
+      if (prop === 'child') return (...a) => wrap(target.child(...a));
+      if (prop === 'info' || prop === 'warn' || prop === 'error' || prop === 'debug' || prop === 'trace') {
+        return (...a) => {
+          try {
+            const msg = a.find((x) => typeof x === 'string') || '';
+            if (SESSION_HEALTH.trouble.test(msg)) noteTrouble(s);
+          } catch (_) { /* never let counting break logging */ }
+          return target[prop](...a);
+        };
+      }
+      const v = target[prop];
+      return typeof v === 'function' ? v.bind(target) : v;
+    },
+  });
+  return wrap(base);
+}
+
+// Once a minute: a deaf number is said loudly in the log (once per 30 minutes).
+setInterval(() => {
+  for (const s of sessions.values()) {
+    const h = healthOf(s);
+    if (h?.state !== 'deaf' || !s.health) continue;
+    if (Date.now() - s.health.deafLoggedAt < 30 * 60_000) continue;
+    s.health.deafLoggedAt = Date.now();
+    logger.error({ phone: s.phone, ...h }, 'session_deaf');
+  }
+}, 60_000).unref?.();
 
 /**
  * Build a fresh Baileys socket for the phone. Does NOT request the pairing
@@ -461,9 +567,23 @@ async function destroySocket(s) {
  */
 async function createSocket(phone, { forceReset } = {}) {
   const s = ensureSession(phone);
+  // One build at a time per number: a /pair and a reconnect that meet share it.
+  if (s.creating && !forceReset) return s.creating;
+  const build = buildSocket(s, phone, { forceReset });
+  s.creating = build;
+  try {
+    return await build;
+  } finally {
+    if (s.creating === build) s.creating = null;
+  }
+}
 
+async function buildSocket(s, phone, { forceReset } = {}) {
+  // A reconnect waiting on its timer is this build now.
+  if (s.reconnectTimer) { clearTimeout(s.reconnectTimer); s.reconnectTimer = null; }
+  // Never two sockets on one number's keys.
+  await destroySocket(s);
   if (forceReset) {
-    await destroySocket(s);
     await wipeAuth(phone);
     outgoingCache.delete(phone);
   }
@@ -507,15 +627,21 @@ async function createSocket(phone, { forceReset } = {}) {
     'wa_version_selected'
   );
 
+  // Is this still the number's socket? Everything this socket does after it
+  // was replaced is ignored (keysOf, the event handlers below). The token is
+  // set before the socket is built, so its first writes count as live.
+  const token = {};
+  s.liveToken = token;
+  const isLive = () => s.liveToken === token;
   const sock = makeWASocket({
     version,
-    logger: baileysLogger.child({ scope: 'baileys', phone }),
+    logger: healthLogger(baileysLogger.child({ scope: 'baileys', phone }), s),
     printQRInTerminal: false,
     // Stock browser fingerprint — custom names get rejected by WA.
     browser: Browsers.macOS('Chrome'),
     auth: {
       creds: state.creds,
-      keys: makeCacheableSignalKeyStore(state.keys, baileysLogger),
+      keys: makeCacheableSignalKeyStore(keysOf(state.keys, isLive, phone), baileysLogger),
     },
     connectTimeoutMs: 60_000,
     defaultQueryTimeoutMs: 60_000,
@@ -548,7 +674,20 @@ async function createSocket(phone, { forceReset } = {}) {
 
   s.sock = sock;
   s.pairingReady = false;
+  s.health = newHealth();
   setStatus(s, 'connecting', { lastError: null });
+
+  // Events of a replaced socket are not this number's any more. off() finds
+  // the wrapped listener, so Baileys' own waits still unregister.
+  const evOn = sock.ev.on.bind(sock.ev);
+  const evOff = sock.ev.off.bind(sock.ev);
+  const wrappedOf = new WeakMap();
+  sock.ev.on = (event, handler) => {
+    const wrapped = (...args) => (isLive() ? handler(...args) : undefined);
+    wrappedOf.set(handler, wrapped);
+    return evOn(event, wrapped);
+  };
+  sock.ev.off = (event, handler) => evOff(event, wrappedOf.get(handler) || handler);
 
   sock.ev.on('creds.update', saveCreds);
 
@@ -765,48 +904,13 @@ async function createSocket(phone, { forceReset } = {}) {
             if (jid.endsWith('@lid')) rememberLidPhone(phone, jid, pnDigits);
           }
         }
-        try {
-          await sock.assertSessions(Array.from(targets), true);
-          logger.warn({ phone, jid, targets: Array.from(targets), count: cur.count }, 'inbound_assertSessions_forced');
-        } catch (err) {
-          logger.error({ phone, jid, err: err?.message }, 'inbound_assertSessions failed');
-        }
-        // Try to upload a LARGE batch of fresh prekeys so a follow-up retry
-        // from WA can build a new session (PreKeyError "Invalid PreKey ID"
-        // recovery). Debounced to once per 5 min per session — calling this
-        // on every failed message floods WhatsApp and triggers rate limits.
-        try {
-          if (typeof sock.uploadPreKeys === 'function' && (now - s.lastPreKeyUploadAt) > 5 * 60_000) {
-            await sock.uploadPreKeys(30);
-            s.lastPreKeyUploadAt = now;
-            logger.warn({ phone, batch: 30 }, 'inbound_uploadPreKeys_done');
-          }
-        } catch (err) {
-          logger.error({ phone, err: err?.message }, 'inbound_uploadPreKeys failed');
-        }
-        // After 2+ failures from same peer in the window: try to wipe the
-        // poisoned Signal session entirely so the next inbound forces a
-        // brand-new handshake (this is the only thing that fixes
-        // "Invalid PreKey ID" when WA keeps re-using the same dead prekey).
-        if (cur.count >= 2) {
-          try {
-            const wipeKeys = {};
-            for (const t of targets) {
-              const tDigits = String(t.split('@')[0] || '').replace(/\D/g, '');
-              if (!tDigits) continue;
-              // Wipe primary device session + a few common device ids.
-              wipeKeys[`${tDigits}.0`] = null;
-              wipeKeys[`${tDigits}.1`] = null;
-              wipeKeys[`${tDigits}.2`] = null;
-            }
-            if (Object.keys(wipeKeys).length && sock.authState?.keys?.set) {
-              await sock.authState.keys.set({ session: wipeKeys });
-              logger.warn({ phone, jid, wiped: Object.keys(wipeKeys) }, 'signal_session_wiped');
-            }
-          } catch (err) {
-            logger.error({ phone, jid, err: err?.message }, 'signal_session_wipe_failed');
-          }
-        }
+        // No "repairs" of our own here (2026-10-15). Forcing new sessions,
+        // uploading prekeys every few minutes and wiping sessions fought
+        // Baileys' own recovery (it already sends the retry receipt with
+        // fresh keys, counted per message): the prekeys WhatsApp handed out
+        // drifted away from the ones kept on disk, and from then on every new
+        // sender failed with "Key used already or never filled" — the
+        // number stayed "connected" and heard nothing. See SESSION_HEALTH.
         // After N failures: send the driver a courtesy message so they know
         // to resend AND so our outbound encrypt resets the ratchet on their
         // side. Throttled to once per hour per peer.
@@ -861,26 +965,8 @@ async function createSocket(phone, { forceReset } = {}) {
             }
           }
         }
-        // Ask WhatsApp to retransmit this exact message. Without this we
-        // depend on the driver to manually resend, which never happens —
-        // they assume the message was delivered. Bounded to 1 attempt per
-        // message id; sendRetryRequest only exists on Baileys 6.7+/7.x.
-        try {
-          if (typeof sock.sendRetryRequest === 'function') {
-            const node = {
-              tag: 'message',
-              attrs: {
-                from: jid,
-                id: m.key?.id || '',
-                ...(m.key?.participant ? { participant: m.key.participant } : {}),
-              },
-            };
-            await sock.sendRetryRequest(node, true);
-            logger.warn({ phone, jid, msgId: m.key?.id }, 'retry_request_sent');
-          }
-        } catch (err) {
-          logger.error({ phone, jid, err: err?.message }, 'retry_request_failed');
-        }
+        // The retry request is Baileys' own (one per message, counted) — a
+        // second one from here, with keys forced in, spent prekeys twice.
         if (cur.count >= 3) s.inboundDecryptFails.delete(jid);
       }
       return;
@@ -898,6 +984,7 @@ async function createSocket(phone, { forceReset } = {}) {
 
     // Successful decrypt — clear failure counter for this peer.
     s.inboundDecryptFails.delete(jid);
+    markInbound(s, true);
 
     // The message the driver quoted, if any. A private "ת" on a swipe-reply
     // of the ride's post names the ride without a code — the webhook reads
@@ -1147,50 +1234,16 @@ async function createSocket(phone, { forceReset } = {}) {
         },
         'group_feed_decryption_failed'
       );
-      const targets = new Set();
-      if (participant) targets.add(participant);
-      if (typeof senderPnRaw === 'string' && senderPnRaw.includes('@')) {
-        const pnDigits = senderPnRaw.split('@')[0].split(':')[0].replace(/\D/g, '');
-        if (pnDigits.length >= 9) targets.add(`${pnDigits}@s.whatsapp.net`);
-      }
-      const now = Date.now();
-      if (targets.size) {
-        try {
-          await sock.assertSessions(Array.from(targets), true);
-          logger.warn({ phone, jid, targets: Array.from(targets) }, 'group_feed_assertSessions_forced');
-        } catch (err) {
-          logger.error({ phone, jid, err: err?.message }, 'group_feed_assertSessions_failed');
-        }
-      }
-      try {
-        if (typeof sock.uploadPreKeys === 'function' && (now - s.lastPreKeyUploadAt) > 5 * 60_000) {
-          await sock.uploadPreKeys(30);
-          s.lastPreKeyUploadAt = now;
-          logger.warn({ phone, batch: 30 }, 'group_feed_uploadPreKeys_done');
-        }
-      } catch (err) {
-        logger.error({ phone, err: err?.message }, 'group_feed_uploadPreKeys_failed');
-      }
-      try {
-        if (typeof sock.sendRetryRequest === 'function') {
-          const node = {
-            tag: 'message',
-            attrs: {
-              from: jid,
-              id: m.key?.id || '',
-              ...(participant ? { participant } : {}),
-            },
-          };
-          await sock.sendRetryRequest(node, true);
-          logger.warn({ phone, jid, msgId: m.key?.id }, 'group_feed_retry_request_sent');
-        }
-      } catch (err) {
-        logger.error({ phone, jid, err: err?.message }, 'group_feed_retry_request_failed');
-      }
+      // A group message we could not read is normal in busy groups (a
+      // sender key not received yet). Baileys asks the sender again by
+      // itself. Forcing sessions with the sender and uploading 30 prekeys
+      // every 5 minutes on these (as until 2026-10-15) is what broke the
+      // number's keys — see the private path above.
       return;
     }
 
     if (!m.message) return;
+    markInbound(s, false);
 
     // Extract plain text (conversation / extendedText / image caption).
     const text =
@@ -1330,7 +1383,9 @@ async function createSocket(phone, { forceReset } = {}) {
         // Exponential-ish backoff: 2s, 4s, 8s, 16s, 30s cap.
         const delay = Math.min(30_000, 2_000 * Math.pow(2, Math.min(attempts - 1, 4)));
         logger.warn({ phone, attempts, delayMs: delay, code, msg }, 'reconnect_scheduled');
-        setTimeout(() => {
+        s.reconnectTimer = setTimeout(() => {
+          s.reconnectTimer = null;
+          if (s.sock) return; // a /pair built it meanwhile
           createSocket(phone).catch((err) => {
             logger.error({ phone, err: err?.message }, 'reconnect_createSocket_failed');
           });
@@ -1460,10 +1515,10 @@ async function pair(phone, { forceReset } = {}) {
       await createSocket(phone, { forceReset });
     }
 
-    // Already authenticated — short-circuit.
+    // Already authenticated — short-circuit. The status is the socket's own
+    // ('connected' only once WhatsApp opened it).
     if (s.sock?.authState?.creds?.registered) {
-      setStatus(s, 'connected');
-      return { alreadyConnected: true, status: 'connected' };
+      return { alreadyConnected: true, status: s.status === 'connected' ? 'connected' : 'connecting' };
     }
 
     // Wait up to 15s for the socket to become pairing-ready.
@@ -1523,6 +1578,8 @@ app.get('/health', (_req, res) => {
   res.json({
     ok: true,
     sessions: Array.from(sessions.keys()),
+    // Numbers connected but hearing nothing (SESSION_HEALTH) — digits only.
+    deaf: Array.from(sessions.values()).filter((s) => healthOf(s)?.state === 'deaf').map((s) => s.phone),
     uptimeSec: Math.round(process.uptime()),
   });
 });
@@ -1561,6 +1618,7 @@ app.get('/status/:phone', (req, res) => {
     lastError: s.lastError,
     codeExpiresAt: s.codeExpiresAt,
     lastUpdate: s.lastUpdate,
+    health: healthOf(s),
   });
 });
 
