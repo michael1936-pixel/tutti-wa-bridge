@@ -108,7 +108,7 @@ async function getCachedGroupMetadata(sock, jid) {
 // Surfaced via /diag and printed once on startup. Bump this string when you
 // redeploy a behavioral change so you can read the version straight from
 // Railway logs.
-const BRIDGE_BUILD = 'stable-keys-2026-10-15';
+const BRIDGE_BUILD = 'peer-not-self-2026-10-18';
 // By default we never send to @lid — it's a known cause of "Waiting for this
 // message" on Baileys 6.x. Set WA_ALLOW_LID_SEND=true to opt back in for
 // experiments.
@@ -210,6 +210,10 @@ const LID_TO_PHONE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7d
 function rememberLidPhone(stationPhone, lidJid, phoneDigits) {
   if (!stationPhone || !lidJid || !phoneDigits) return;
   if (!lidJid.endsWith('@lid')) return;
+  // Another person's LID is never the station's own number (2026-10-15: a
+  // driver's "ת #37Y8" reached the app as sent by the station itself, and the
+  // answer went to the station's own chat).
+  if (String(phoneDigits).replace(/\D/g, '') === String(stationPhone).replace(/\D/g, '')) return;
   lidToPhone.set(`${stationPhone}:${lidJid}`, { phone: phoneDigits, ts: Date.now() });
 }
 
@@ -227,6 +231,9 @@ function lookupLidPhone(stationPhone, lidJid) {
 // carry the peer's real phone number (PN). Returns digits only, or '' if none.
 // Critical for LID-only chats where m.key.senderPn is missing.
 function extractRealPhoneDigits(stationPhone, m) {
+  // The peer of a message we RECEIVED is never this number itself; a field
+  // that carries our own number (seen 2026-10-15) is skipped, and logged.
+  const self = String(stationPhone || '').replace(/\D/g, '');
   const candidates = [
     m?.key?.senderPn,
     m?.senderPn,
@@ -242,6 +249,10 @@ function extractRealPhoneDigits(stationPhone, m) {
     if (!c || typeof c !== 'string') continue;
     if (c.endsWith('@lid') || c.endsWith('@g.us') || c.endsWith('@broadcast')) continue;
     const head = c.split('@')[0].split(':')[0].replace(/\D/g, '');
+    if (self && head === self) {
+      logger.warn({ phone: self, field: c, key: m?.key ? Object.keys(m.key) : null, msgId: m?.key?.id }, 'peer_resolved_to_self_skipped');
+      continue;
+    }
     if (head.length >= 9 && head.length <= 13) return head;
   }
   // Try cached LID -> phone mapping learned from prior senderPn events.
@@ -251,7 +262,7 @@ function extractRealPhoneDigits(stationPhone, m) {
   for (const cand of [m?.key?.remoteJid, m?.key?.participant, m?.participant]) {
     if (typeof cand === 'string' && cand.endsWith('@lid')) {
       const cached = lookupLidPhone(stationPhone, cand);
-      if (cached) return cached;
+      if (cached && cached !== self) return cached;
     }
   }
   return '';
@@ -1008,7 +1019,21 @@ async function buildSocket(s, phone, { forceReset } = {}) {
 
         // WhatsApp often returns @lid (linked-id) instead of @s.whatsapp.net.
         // Try EVERY known Baileys field for the real phone (PN).
-        const digits = extractRealPhoneDigits(phone, m);
+        let digits = extractRealPhoneDigits(phone, m);
+        // Nothing on the message itself: WhatsApp's own map of LIDs to
+        // numbers (Baileys 7 LIDMappingStore) — never our own number.
+        if (!digits && jid.endsWith('@lid')) {
+          try {
+            const pn = await sock.signalRepository?.lidMapping?.getPNForLID?.(jid);
+            const pnDigits = String(pn || '').split('@')[0].split(':')[0].replace(/\D/g, '');
+            if (pnDigits && pnDigits !== phone) {
+              digits = pnDigits;
+              logger.info({ phone, jid, driver_phone: digits }, 'lid_resolved_by_mapping');
+            }
+          } catch (err) {
+            logger.warn({ phone, jid, err: err?.message }, 'lid_mapping_lookup_failed');
+          }
+        }
         const looksLikePhone =
           digits.length >= 9 && digits.length <= 13 &&
           (digits.startsWith('972') || digits.startsWith('0') || digits.length <= 11);
