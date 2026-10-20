@@ -108,7 +108,7 @@ async function getCachedGroupMetadata(sock, jid) {
 // Surfaced via /diag and printed once on startup. Bump this string when you
 // redeploy a behavioral change so you can read the version straight from
 // Railway logs.
-const BRIDGE_BUILD = 'peer-not-self-2026-10-18';
+const BRIDGE_BUILD = 'delete-message-2026-10-20';
 // By default we never send to @lid — it's a known cause of "Waiting for this
 // message" on Baileys 6.x. Set WA_ALLOW_LID_SEND=true to opt back in for
 // experiments.
@@ -1694,6 +1694,31 @@ app.post('/send', async (req, res) => {
     const out = await sendAndCache(phone, String(jid), { text: String(text) });
     res.json({ ok: true, id: out.id, jid: out.jid });
   } catch (e) {
+    res.status(500).json({ ok: false, error: e?.message || String(e) });
+  }
+});
+
+// Delete, for everyone, a message this number sent (Michael, 2026-10-20: a ride passed
+// on after "מעביר" goes back to the driver who answered late — the details sent to the
+// next driver are deleted when he has not answered yet; the app's
+// supabase/functions/_shared/lateReclaim.ts).
+//
+// Body: { session, jid, id }
+app.post('/delete', async (req, res) => {
+  const { jid, id, session } = req.body || {};
+  const phone = String(session || '').replace(/\D/g, '');
+  if (!phone || !jid || !id) return res.status(400).json({ error: 'jid, id, session required' });
+  const s = sessions.get(phone);
+  if (!s || s.status !== 'connected' || !s.sock) {
+    return res.status(409).json({ error: 'session_missing', status: s?.status ?? 'not_started' });
+  }
+  const targetJid = String(jid);
+  try {
+    await s.sock.sendMessage(targetJid, { delete: { remoteJid: targetJid, fromMe: true, id: String(id) } });
+    logger.info({ phone, jid: targetJid, msgId: String(id) }, 'delete_ok');
+    res.json({ ok: true });
+  } catch (e) {
+    logger.error({ phone, jid: targetJid, err: e?.message }, 'delete_failed');
     res.status(500).json({ ok: false, error: e?.message || String(e) });
   }
 });
