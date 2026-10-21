@@ -108,7 +108,26 @@ async function getCachedGroupMetadata(sock, jid) {
 // Surfaced via /diag and printed once on startup. Bump this string when you
 // redeploy a behavioral change so you can read the version straight from
 // Railway logs.
-const BRIDGE_BUILD = 'delete-message-2026-10-20';
+const BRIDGE_BUILD = 'offline-private-2026-10-22';
+
+/** How old a held private message may be and still be passed on. */
+const OFFLINE_PRIVATE_MAX_AGE_MS = 30 * 60_000;
+
+/** A message's own time, in ms (Baileys gives a number or a protobuf Long). */
+function messageTimeMs(m) {
+  const t = m?.messageTimestamp;
+  const sec = t && typeof t === 'object' && typeof t.toNumber === 'function' ? t.toNumber() : Number(t || 0);
+  return Number.isFinite(sec) && sec > 0 ? sec * 1000 : 0;
+}
+
+/** A driver's private message that WhatsApp held and delivered late — recent enough to answer. */
+function recentOfflinePrivate(m, now = Date.now()) {
+  if (!m || m.key?.fromMe) return false;
+  const jid = m.key?.remoteJid || '';
+  if (!jid || jid.endsWith('@g.us') || jid.endsWith('@broadcast') || jid.endsWith('@newsletter') || jid.startsWith('status@')) return false;
+  const at = messageTimeMs(m);
+  return at > 0 && now - at <= OFFLINE_PRIVATE_MAX_AGE_MS;
+}
 // By default we never send to @lid — it's a known cause of "Waiting for this
 // message" on Baileys 6.x. Set WA_ALLOW_LID_SEND=true to opt back in for
 // experiments.
@@ -1202,6 +1221,23 @@ async function buildSocket(s, phone, { forceReset } = {}) {
           logger.error({ phone, err: err?.message }, 'chat_sync handler error');
         }
       }
+    }
+    // What WhatsApp held while this number was not hearing comes as 'append'
+    // (Baileys: node.attrs.offline). A private message of the last 30 minutes
+    // is passed on like a live one: "ת #4SAZ" sent at 01:52 reached the number
+    // at 02:08 and the bot never answered it (Michael, 2026-10-22). Older
+    // ones, and the number's own messages, are not.
+    if (ev.type === 'append') {
+      for (const m of ev.messages || []) {
+        if (!recentOfflinePrivate(m)) continue;
+        logger.info({ phone, msgId: m.key?.id, ageSec: Math.round((Date.now() - messageTimeMs(m)) / 1000) }, 'offline_private_forwarded');
+        try {
+          await forwardInbound(m);
+        } catch (err) {
+          logger.error({ phone, err: err?.message }, 'offline private forward error');
+        }
+      }
+      return;
     }
     if (ev.type !== 'notify') return;
     for (const m of ev.messages || []) {
