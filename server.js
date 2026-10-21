@@ -108,7 +108,7 @@ async function getCachedGroupMetadata(sock, jid) {
 // Surfaced via /diag and printed once on startup. Bump this string when you
 // redeploy a behavioral change so you can read the version straight from
 // Railway logs.
-const BRIDGE_BUILD = 'offline-private-2026-10-22';
+const BRIDGE_BUILD = 'stuck-socket-restart-2026-10-22';
 
 /** How old a held private message may be and still be passed on. */
 const OFFLINE_PRIVATE_MAX_AGE_MS = 30 * 60_000;
@@ -526,7 +526,24 @@ const SESSION_HEALTH = {
 };
 
 function newHealth() {
-  return { since: Date.now(), failures: [], lastInboundAt: 0, lastPrivateInboundAt: 0, deafLoggedAt: 0 };
+  return { since: Date.now(), failures: [], timeouts: [], lastInboundAt: 0, lastPrivateInboundAt: 0, deafLoggedAt: 0, stuckRestartAt: 0 };
+}
+
+// ---- A stuck socket (2026-10-22) ---------------------------------------------
+// 058-711-5623, 01:16–02:07 IL: every query to WhatsApp timed out, once a
+// minute ("timed out waiting for message"), while group posts still came in.
+// WhatsApp held every private message until it ended the stream by itself
+// ("Stream Errored (ack)") 50 minutes later; then they arrived all at once.
+// A healthy number has about 3 such timeouts an HOUR. Three in five minutes:
+// the socket is ended and the usual reconnect builds a new one (same keys,
+// no pairing) — what WhatsApp did at 02:07, only 45 minutes sooner.
+const STUCK_SOCKET = { windowMs: 5 * 60_000, timeouts: 3, minGapMs: 10 * 60_000 };
+const QUERY_TIMEOUT = /timed out waiting for message/;
+
+function stuckOf(h, status, now = Date.now()) {
+  if (!h || status !== 'connected') return false;
+  const recent = (h.timeouts || []).filter((t) => now - t <= STUCK_SOCKET.windowMs).length;
+  return recent >= STUCK_SOCKET.timeouts && now - (h.stuckRestartAt || 0) > STUCK_SOCKET.minGapMs;
 }
 
 function noteTrouble(s) {
@@ -569,6 +586,11 @@ function healthLogger(base, s) {
           try {
             const msg = a.find((x) => typeof x === 'string') || '';
             if (SESSION_HEALTH.trouble.test(msg)) noteTrouble(s);
+            if (QUERY_TIMEOUT.test(msg) && s.health) {
+              const now = Date.now();
+              s.health.timeouts = (s.health.timeouts || []).filter((t) => now - t <= STUCK_SOCKET.windowMs);
+              s.health.timeouts.push(now);
+            }
           } catch (_) { /* never let counting break logging */ }
           return target[prop](...a);
         };
@@ -580,8 +602,19 @@ function healthLogger(base, s) {
   return wrap(base);
 }
 
-// Once a minute: a deaf number is said loudly in the log (once per 30 minutes).
+// Once a minute: a stuck socket is ended (the reconnect builds a new one), and
+// a deaf number is said loudly in the log (once per 30 minutes).
 setInterval(() => {
+  for (const s of sessions.values()) {
+    if (s.sock && stuckOf(s.health, s.status)) {
+      s.health.stuckRestartAt = Date.now();
+      logger.warn({ phone: s.phone, timeouts5m: s.health.timeouts.length }, 'session_stuck_restart');
+      s.health.timeouts = [];
+      try { s.sock.end(new Error('stuck: WhatsApp queries time out')); } catch (err) {
+        logger.error({ phone: s.phone, err: err?.message }, 'session_stuck_restart_failed');
+      }
+    }
+  }
   for (const s of sessions.values()) {
     const h = healthOf(s);
     if (h?.state !== 'deaf' || !s.health) continue;
@@ -704,7 +737,9 @@ async function buildSocket(s, phone, { forceReset } = {}) {
 
   s.sock = sock;
   s.pairingReady = false;
-  s.health = newHealth();
+  // A new socket starts its health anew — but remembers when a stuck one was
+  // last ended, so a stuck number is restarted at most once in 10 minutes.
+  s.health = { ...newHealth(), stuckRestartAt: s.health?.stuckRestartAt || 0 };
   setStatus(s, 'connecting', { lastError: null });
 
   // Events of a replaced socket are not this number's any more. off() finds
