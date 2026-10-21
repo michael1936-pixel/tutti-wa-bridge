@@ -1190,6 +1190,12 @@ async function buildSocket(s, phone, { forceReset } = {}) {
     // The chat sync also sees 'append': what this bridge itself sent.
     if (ev.type === 'notify' || ev.type === 'append') {
       for (const m of ev.messages || []) {
+        // A group post this number sent — from this bridge or from another
+        // device or system linked to the same WhatsApp — logged, nothing else,
+        // so a publishing pace can be measured (Michael, 2026-10-21).
+        try {
+          logOwnGroupPost(m, ev.type);
+        } catch { /* a log line only */ }
         try {
           syncChatMessage(m);
         } catch (err) {
@@ -1218,6 +1224,26 @@ async function buildSocket(s, phone, { forceReset } = {}) {
   // text with Hebrew ride heuristics and inserts matches into
   // user_whatsapp_feed_posts (shown in OpenRides).
   // -------------------------------------------------------------------------
+  function logOwnGroupPost(m, kind) {
+    if (!m?.key?.fromMe) return;
+    const jid = m.key.remoteJid || '';
+    if (!jid.endsWith('@g.us')) return;
+    const msg = m.message || {};
+    const text = msg.conversation || msg.extendedTextMessage?.text || msg.imageMessage?.caption || msg.videoMessage?.caption || '';
+    logger.info(
+      {
+        phone,
+        jid,
+        msgId: m.key.id || null,
+        sentAt: Number(m.messageTimestamp) || null,
+        kind,
+        viaThisBridge: !!(m.key.id && outgoingCache.get(phone)?.has(m.key.id)),
+        text: String(text).replace(/\s+/g, ' ').slice(0, 60),
+      },
+      'group_own_sent',
+    );
+  }
+
   async function forwardGroupInbound(m) {
     if (!m || m.key?.fromMe) return;
     if (purposeOf(phone)) return;
