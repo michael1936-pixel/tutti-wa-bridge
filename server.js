@@ -108,7 +108,7 @@ async function getCachedGroupMetadata(sock, jid) {
 // Surfaced via /diag and printed once on startup. Bump this string when you
 // redeploy a behavioral change so you can read the version straight from
 // Railway logs.
-const BRIDGE_BUILD = 'cached-group-members-2026-10-22';
+const BRIDGE_BUILD = 'one-failure-per-message-2026-10-22';
 
 /** How old a held private message may be and still be passed on. */
 const OFFLINE_PRIVATE_MAX_AGE_MS = 30 * 60_000;
@@ -598,7 +598,14 @@ function noteTrouble(s, id = null) {
   if (!h) return;
   const now = Date.now();
   const last = h.failures[h.failures.length - 1];
+  // Baileys logs "failed to decrypt message" (with the id) and then "transaction
+  // failed" (without) for the same message, in either order: the one without an
+  // id takes the other's (2026-10-22, 19:14: 355 of these for FIVE messages
+  // WhatsApp kept re-delivering, 494 "failures" — "deaf" again and again).
   if (id && last && !last.id && now - last.t < 2000) last.id = id;
+  if (!id && last && last.id && now - last.t < 2000) id = last.id;
+  // One message counts once, however many times it is tried again.
+  if (id && h.failures.some((f) => f.id === id)) return;
   h.failures.push({ t: now, id });
   while (h.failures.length && now - h.failures[0].t > SESSION_HEALTH.windowMs) h.failures.shift();
   if (h.failures.length > 1000) h.failures.splice(0, h.failures.length - 1000);
