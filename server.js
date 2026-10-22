@@ -108,7 +108,7 @@ async function getCachedGroupMetadata(sock, jid) {
 // Surfaced via /diag and printed once on startup. Bump this string when you
 // redeploy a behavioral change so you can read the version straight from
 // Railway logs.
-const BRIDGE_BUILD = 'stuck-socket-restart-2026-10-22';
+const BRIDGE_BUILD = 'stuck-socket-30s-2026-10-22';
 
 /** How old a held private message may be and still be passed on. */
 const OFFLINE_PRIVATE_MAX_AGE_MS = 30 * 60_000;
@@ -530,14 +530,20 @@ function newHealth() {
 }
 
 // ---- A stuck socket (2026-10-22) ---------------------------------------------
-// 058-711-5623, 01:16–02:07 IL: every query to WhatsApp timed out, once a
-// minute ("timed out waiting for message"), while group posts still came in.
-// WhatsApp held every private message until it ended the stream by itself
-// ("Stream Errored (ack)") 50 minutes later; then they arrived all at once.
-// A healthy number has about 3 such timeouts an HOUR. Three in five minutes:
-// the socket is ended and the usual reconnect builds a new one (same keys,
-// no pairing) — what WhatsApp did at 02:07, only 45 minutes sooner.
-const STUCK_SOCKET = { windowMs: 5 * 60_000, timeouts: 3, minGapMs: 10 * 60_000 };
+// 058-711-5623, 01:16–02:07 IL: a private message waited on a number lookup
+// (USync) that WhatsApp never answered — "timed out waiting for message" +
+// "USync fetch yielded no results for pending PNs", tried again every minute
+// (the query timeout) — and was never acknowledged; WhatsApp held every
+// private message behind it, while group posts and keep-alive pings still
+// went through, until it ended the stream itself ("Stream Errored (ack)") 50
+// minutes later. Then they arrived all at once, as offline ('append').
+// Queries now time out after 15 s (was 60 s), and two timeouts within a
+// minute end the socket; the usual reconnect builds a new one (same keys, no
+// pairing) — about 30 seconds after the number got stuck (Michael: «אחרי 30
+// שניות זה אמור לקרות … 30 שניות זה גם הרבה מאוד»). A healthy number has about
+// 3 timeouts an hour, never two in a minute.
+const QUERY_TIMEOUT_MS = 15_000;
+const STUCK_SOCKET = { windowMs: 60_000, timeouts: 2, minGapMs: 60_000 };
 const QUERY_TIMEOUT = /timed out waiting for message/;
 
 function stuckOf(h, status, now = Date.now()) {
@@ -590,6 +596,8 @@ function healthLogger(base, s) {
               const now = Date.now();
               s.health.timeouts = (s.health.timeouts || []).filter((t) => now - t <= STUCK_SOCKET.windowMs);
               s.health.timeouts.push(now);
+              // Out of the logging call — Baileys is still in the middle of its own work.
+              setTimeout(() => restartIfStuck(s), 0);
             }
           } catch (_) { /* never let counting break logging */ }
           return target[prop](...a);
@@ -602,19 +610,19 @@ function healthLogger(base, s) {
   return wrap(base);
 }
 
-// Once a minute: a stuck socket is ended (the reconnect builds a new one), and
-// a deaf number is said loudly in the log (once per 30 minutes).
-setInterval(() => {
-  for (const s of sessions.values()) {
-    if (s.sock && stuckOf(s.health, s.status)) {
-      s.health.stuckRestartAt = Date.now();
-      logger.warn({ phone: s.phone, timeouts5m: s.health.timeouts.length }, 'session_stuck_restart');
-      s.health.timeouts = [];
-      try { s.sock.end(new Error('stuck: WhatsApp queries time out')); } catch (err) {
-        logger.error({ phone: s.phone, err: err?.message }, 'session_stuck_restart_failed');
-      }
-    }
+/** A stuck socket is ended at once — the usual reconnect builds a new one. */
+function restartIfStuck(s) {
+  if (!s?.sock || !stuckOf(s.health, s.status)) return;
+  s.health.stuckRestartAt = Date.now();
+  logger.warn({ phone: s.phone, timeouts: s.health.timeouts.length }, 'session_stuck_restart');
+  s.health.timeouts = [];
+  try { s.sock.end(new Error('stuck: WhatsApp queries time out')); } catch (err) {
+    logger.error({ phone: s.phone, err: err?.message }, 'session_stuck_restart_failed');
   }
+}
+
+// Once a minute: a deaf number is said loudly in the log (once per 30 minutes).
+setInterval(() => {
   for (const s of sessions.values()) {
     const h = healthOf(s);
     if (h?.state !== 'deaf' || !s.health) continue;
@@ -707,7 +715,7 @@ async function buildSocket(s, phone, { forceReset } = {}) {
       keys: makeCacheableSignalKeyStore(keysOf(state.keys, isLive, phone), baileysLogger),
     },
     connectTimeoutMs: 60_000,
-    defaultQueryTimeoutMs: 60_000,
+    defaultQueryTimeoutMs: QUERY_TIMEOUT_MS,
     keepAliveIntervalMs: 10_000,
     markOnlineOnConnect: false,
     syncFullHistory: false,
@@ -738,7 +746,7 @@ async function buildSocket(s, phone, { forceReset } = {}) {
   s.sock = sock;
   s.pairingReady = false;
   // A new socket starts its health anew — but remembers when a stuck one was
-  // last ended, so a stuck number is restarted at most once in 10 minutes.
+  // last ended, so a stuck number is restarted at most once a minute.
   s.health = { ...newHealth(), stuckRestartAt: s.health?.stuckRestartAt || 0 };
   setStatus(s, 'connecting', { lastError: null });
 
