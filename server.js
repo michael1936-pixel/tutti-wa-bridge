@@ -108,7 +108,7 @@ async function getCachedGroupMetadata(sock, jid) {
 // Surfaced via /diag and printed once on startup. Bump this string when you
 // redeploy a behavioral change so you can read the version straight from
 // Railway logs.
-const BRIDGE_BUILD = 'stuck-socket-30s-2026-10-22';
+const BRIDGE_BUILD = 'recovered-not-failures-2026-10-22';
 
 /** How old a held private message may be and still be passed on. */
 const OFFLINE_PRIVATE_MAX_AGE_MS = 30 * 60_000;
@@ -552,26 +552,47 @@ function stuckOf(h, status, now = Date.now()) {
   return recent >= STUCK_SOCKET.timeouts && now - (h.stuckRestartAt || 0) > STUCK_SOCKET.minGapMs;
 }
 
-function noteTrouble(s) {
+// A failure is kept with its message id (2026-10-22, 058-711-5623 after a new
+// pairing: ~300 "failures" in 10 minutes, so it was called deaf — yet every
+// one was a group message whose sender key had not come yet, and 188 of 195
+// arrived a few seconds later on Baileys' own retry). A message that arrives
+// in the end was no failure: markInbound takes its failures back. Baileys
+// logs "transaction failed" and then "failed to decrypt message" for the same
+// message — the first has no id, so it takes the id of the second.
+function noteTrouble(s, id = null) {
   const h = s.health;
   if (!h) return;
   const now = Date.now();
-  h.failures.push(now);
-  while (h.failures.length && now - h.failures[0] > SESSION_HEALTH.windowMs) h.failures.shift();
+  const last = h.failures[h.failures.length - 1];
+  if (id && last && !last.id && now - last.t < 2000) last.id = id;
+  h.failures.push({ t: now, id });
+  while (h.failures.length && now - h.failures[0].t > SESSION_HEALTH.windowMs) h.failures.shift();
   if (h.failures.length > 1000) h.failures.splice(0, h.failures.length - 1000);
 }
 
-function markInbound(s, isPrivate) {
+function markInbound(s, isPrivate, id = null) {
   if (!s.health) return;
   s.health.lastInboundAt = Date.now();
   if (isPrivate) s.health.lastPrivateInboundAt = s.health.lastInboundAt;
+  if (id && s.health.failures.some((f) => f.id === id)) {
+    s.health.failures = s.health.failures.filter((f) => f.id !== id);
+    s.health.recovered = (s.health.recovered || 0) + 1;
+  }
+}
+
+/** The message id in a Baileys log call, if it names one. */
+function troubleIdOf(args) {
+  for (const x of args) {
+    if (x && typeof x === 'object' && x.key && typeof x.key.id === 'string') return x.key.id;
+  }
+  return null;
 }
 
 function healthOf(s) {
   const h = s.health;
   if (!h) return null;
   const now = Date.now();
-  const failures10m = h.failures.filter((t) => now - t <= SESSION_HEALTH.windowMs).length;
+  const failures10m = h.failures.filter((f) => now - f.t <= SESSION_HEALTH.windowMs).length;
   const quietMs = now - Math.max(h.lastInboundAt, h.since);
   const deaf = s.status === 'connected' && failures10m >= SESSION_HEALTH.deafFailures && quietMs > SESSION_HEALTH.windowMs;
   return {
@@ -579,6 +600,7 @@ function healthOf(s) {
     failures10m,
     lastInboundAt: h.lastInboundAt || null,
     lastPrivateInboundAt: h.lastPrivateInboundAt || null,
+    recovered: h.recovered || 0,
   };
 }
 
@@ -591,7 +613,7 @@ function healthLogger(base, s) {
         return (...a) => {
           try {
             const msg = a.find((x) => typeof x === 'string') || '';
-            if (SESSION_HEALTH.trouble.test(msg)) noteTrouble(s);
+            if (SESSION_HEALTH.trouble.test(msg)) noteTrouble(s, troubleIdOf(a));
             if (QUERY_TIMEOUT.test(msg) && s.health) {
               const now = Date.now();
               s.health.timeouts = (s.health.timeouts || []).filter((t) => now - t <= STUCK_SOCKET.windowMs);
@@ -1057,7 +1079,7 @@ async function buildSocket(s, phone, { forceReset } = {}) {
 
     // Successful decrypt — clear failure counter for this peer.
     s.inboundDecryptFails.delete(jid);
-    markInbound(s, true);
+    markInbound(s, true, m.key?.id);
 
     // The message the driver quoted, if any. A private "ת" on a swipe-reply
     // of the ride's post names the ride without a code — the webhook reads
@@ -1373,7 +1395,7 @@ async function buildSocket(s, phone, { forceReset } = {}) {
     }
 
     if (!m.message) return;
-    markInbound(s, false);
+    markInbound(s, false, m.key?.id);
 
     // Extract plain text (conversation / extendedText / image caption).
     const text =
