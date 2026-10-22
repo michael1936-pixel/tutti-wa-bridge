@@ -108,7 +108,7 @@ async function getCachedGroupMetadata(sock, jid) {
 // Surfaced via /diag and printed once on startup. Bump this string when you
 // redeploy a behavioral change so you can read the version straight from
 // Railway logs.
-const BRIDGE_BUILD = 'recovered-not-failures-2026-10-22';
+const BRIDGE_BUILD = 'cached-group-members-2026-10-22';
 
 /** How old a held private message may be and still be passed on. */
 const OFFLINE_PRIVATE_MAX_AGE_MS = 30 * 60_000;
@@ -513,6 +513,40 @@ function keysOf(keys, isLive, phone) {
   };
 }
 
+// ---- The groups' members, for sending (2026-10-22) --------------------------
+// Before a group message Baileys needs the group's members. Without
+// `cachedGroupMetadata` it asks WhatsApp before EVERY message — a ride to 90
+// groups was 180 requests, and WhatsApp answered "rate-overlimit" (62 times in
+// a week; Baileys' own FAQ names this). Now one request reads all the
+// number's groups (groupFetchAllParticipating), kept 10 minutes; a group whose
+// members or settings change is dropped at once, so Baileys asks for it alone.
+const SEND_GROUPS = { ttlMs: 10 * 60_000, fetchTimeoutMs: 15_000 };
+
+function keepSendGroups(s, all) {
+  s.sendGroups = { at: Date.now(), map: new Map(Object.entries(all || {})) };
+}
+
+async function sendGroupMeta(s, jid) {
+  const c = s.sendGroups;
+  if (c && Date.now() - c.at < SEND_GROUPS.ttlMs) return c.map.get(jid);
+  if (!s.sendGroupsLoading && s.sock) {
+    s.sendGroupsLoading = Promise.race([
+      s.sock.groupFetchAllParticipating(),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), SEND_GROUPS.fetchTimeoutMs)),
+    ]).then((all) => keepSendGroups(s, all))
+      .catch((err) => logger.warn({ phone: s.phone, err: err?.message }, 'send_groups_fetch_failed'))
+      .finally(() => { s.sendGroupsLoading = null; });
+  }
+  if (s.sendGroupsLoading) await s.sendGroupsLoading;
+  // Not there, or the read failed and the list is old: Baileys asks for this group itself, as before.
+  const k = s.sendGroups;
+  return k && Date.now() - k.at < SEND_GROUPS.ttlMs ? k.map.get(jid) : undefined;
+}
+
+function dropSendGroup(s, jid) {
+  if (jid) s.sendGroups?.map.delete(jid);
+}
+
 // ---- Session health (2026-10-15) --------------------------------------------
 // A number can stay "connected" and hear nothing: every message fails inside
 // Baileys ("transaction failed", "Key used already or never filled", "No
@@ -739,6 +773,8 @@ async function buildSocket(s, phone, { forceReset } = {}) {
     connectTimeoutMs: 60_000,
     defaultQueryTimeoutMs: QUERY_TIMEOUT_MS,
     keepAliveIntervalMs: 10_000,
+    // The groups' members from one read, not one request per message (sendGroupMeta).
+    cachedGroupMetadata: (jid) => sendGroupMeta(s, jid),
     markOnlineOnConnect: false,
     syncFullHistory: false,
     // Allow history sync so that signal sessions/prekeys arrive promptly after
@@ -1258,6 +1294,11 @@ async function buildSocket(s, phone, { forceReset } = {}) {
       clearTimeout(timer);
     }
   }
+
+  // A group that changed is read again on its next message (sendGroupMeta).
+  sock.ev.on('group-participants.update', (u) => dropSendGroup(s, u?.id));
+  sock.ev.on('groups.update', (list) => { for (const g of list || []) dropSendGroup(s, g?.id); });
+  sock.ev.on('groups.upsert', (list) => { for (const g of list || []) dropSendGroup(s, g?.id); });
 
   sock.ev.on('messages.upsert', async (ev) => {
     if (purposeOf(phone) === 'payments') {
@@ -1937,6 +1978,7 @@ app.get('/groups', async (req, res) => {
   }
   try {
     const all = await s.sock.groupFetchAllParticipating();
+    keepSendGroups(s, all);
     const includeParticipants = String(req.query.include || '').includes('participants');
     let totalWithParticipants = 0;
     let sampleParticipantId = null;
