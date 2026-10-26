@@ -47,6 +47,25 @@ import makeWASocket, {
   downloadMediaMessage,
 } from 'baileys';
 
+// The station's number must never show "מחובר/ת" to the drivers: the bridge is
+// a companion device, not a person at the phone (Michael, 2026-10-26: «כל מי
+// שהגשר שלו מחובר רואים מחובר/ת — אצל המתחרה זה לא קיים»). markOnlineOnConnect
+// is false, but Baileys drops the "unavailable" presence node when
+// creds.me.name is empty — a number paired by code has no name — with only a
+// log line ("no name present, ignoring presence update request"). So the name
+// is set when missing, and "unavailable" is sent on every open and after every
+// message we send (a send may mark the companion available on WhatsApp's side).
+async function markOffline(sock, phone) {
+  try {
+    const me = sock?.authState?.creds?.me;
+    if (!me) return;
+    if (!me.name) me.name = 'תחנה';
+    await sock.sendPresenceUpdate('unavailable');
+  } catch (e) {
+    logger.warn({ phone, err: e instanceof Error ? e.message : String(e) }, 'presence_unavailable_failed');
+  }
+}
+
 const require = createRequire(import.meta.url);
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -409,6 +428,7 @@ async function sendAndCache(phone, jid, content) {
     );
     const finalId = sent?.key?.id || id || null;
     if (finalId && sent?.message) rememberOutgoing(phone, finalId, sent.message);
+    void markOffline(sock, phone);
     return { sent, finalId };
   };
 
@@ -1548,6 +1568,8 @@ async function buildSocket(s, phone, { forceReset } = {}) {
       setStatus(s, 'connected', { lastError: null, pairingCode: null });
       // Reset reconnect attempt counter on every successful open.
       s.reconnectAttempts = 0;
+      // Not "מחובר/ת" to the drivers (markOffline).
+      void markOffline(sock, phone);
     }
 
     if (connection === 'close') {
@@ -1930,6 +1952,7 @@ app.post('/send-reply', async (req, res) => {
       );
       const finalId = sent?.key?.id || null;
       if (finalId && sent?.message) rememberOutgoing(phone, finalId, sent.message);
+      void markOffline(s.sock, phone);
       logger.info({ phone, jid: targetJid, msgId: finalId, quotedId: quoted.id }, 'send_reply_ok');
       return res.json({ ok: true, id: finalId, jid: targetJid });
     }
