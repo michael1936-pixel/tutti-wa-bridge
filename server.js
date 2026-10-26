@@ -88,8 +88,11 @@ const isPrivateJid = (jid) => String(jid || '').endsWith('@s.whatsapp.net');
  * send with afterwards (the session's current one — it may have reconnected
  * during the pause), or null when the session is no longer connected.
  */
-async function typingBefore(sock, phone, targetJid, text) {
-  if (!isPrivateJid(targetJid)) return sock;
+async function typingBefore(sock, phone, targetJid, text, personal = false) {
+  // A private chat, or a personal reply inside a group (a quoted answer to
+  // the one who asked — Michael, 2026-10-26: «תגובות אישיות שיהיה מקליד»);
+  // never a ride post to the groups.
+  if (!isPrivateJid(targetJid) && !personal) return sock;
   try {
     await sock.presenceSubscribe?.(targetJid);
     await sock.sendPresenceUpdate?.('composing', targetJid);
@@ -1992,8 +1995,8 @@ app.post('/send-reply', async (req, res) => {
         },
         message: { conversation: String(quoted.text || '') },
       };
-      // A private chat sees "מקליד/ה…" first (typingBefore); a group gets none.
-      const typed = await typingBefore(s.sock, phone, targetJid, String(text));
+      // A quoted answer is personal — "מקליד/ה…" first, in a group too (typingBefore).
+      const typed = await typingBefore(s.sock, phone, targetJid, String(text), true);
       if (!typed) return res.status(409).json({ error: 'session_missing', status: 'reconnecting' });
       const sent = await typed.sendMessage(
         targetJid,
