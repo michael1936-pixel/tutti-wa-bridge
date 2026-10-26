@@ -66,6 +66,47 @@ async function markOffline(sock, phone) {
   }
 }
 
+// "מקליד/ה…" before a private reply, the way a person at the phone types
+// (Michael, 2026-10-26 — as the Tiktak bridge does it, comfort-den-builder/
+// wa-bridge/lib.js presenceDelayMs). Per chat only ("composing"/"paused" to
+// the target), never a global "available"; the delay grows with the text so
+// it reads as real typing; a presence failure never fails the send. Group
+// posts (ride publishing) get none of it — only a person's private chat.
+const PRESENCE_MIN_MS = 1_500;
+const PRESENCE_MAX_MS = 4_000;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+function presenceDelayMs(text = '', rand = Math.random) {
+  const len = Math.min(String(text ?? '').length, 300);
+  const base = PRESENCE_MIN_MS + len * 7;
+  const jitter = (Number(rand()) - 0.5) * 1_000;
+  const ms = Math.round(base + (Number.isFinite(jitter) ? jitter : 0));
+  return Math.min(PRESENCE_MAX_MS, Math.max(PRESENCE_MIN_MS, ms));
+}
+const isPrivateJid = (jid) => String(jid || '').endsWith('@s.whatsapp.net');
+/**
+ * Types to a private chat for a moment, then pauses. Returns the socket to
+ * send with afterwards (the session's current one — it may have reconnected
+ * during the pause), or null when the session is no longer connected.
+ */
+async function typingBefore(sock, phone, targetJid, text) {
+  if (!isPrivateJid(targetJid)) return sock;
+  try {
+    await sock.presenceSubscribe?.(targetJid);
+    await sock.sendPresenceUpdate?.('composing', targetJid);
+  } catch (e) {
+    logger.warn({ phone, jid: targetJid, err: e instanceof Error ? e.message : String(e) }, 'presence_failed');
+  }
+  await sleep(presenceDelayMs(text, Math.random));
+  const now = sessions.get(phone);
+  if (!now?.sock || now.status !== 'connected') return null;
+  try {
+    await now.sock.sendPresenceUpdate?.('paused', targetJid);
+  } catch (e) {
+    logger.warn({ phone, jid: targetJid, err: e instanceof Error ? e.message : String(e) }, 'presence_failed');
+  }
+  return now.sock;
+}
+
 const require = createRequire(import.meta.url);
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -420,19 +461,25 @@ async function sendAndCache(phone, jid, content) {
     rememberOutgoing(phone, messageId, protoContent);
   }
 
+  // The socket to send with — the session's current one after the typing pause.
+  let sendSock = sock;
   const trySend = async (id) => {
-    const sent = await sock.sendMessage(
+    const sent = await sendSock.sendMessage(
       targetJid,
       content,
       id ? { messageId: id } : undefined
     );
     const finalId = sent?.key?.id || id || null;
     if (finalId && sent?.message) rememberOutgoing(phone, finalId, sent.message);
-    void markOffline(sock, phone);
+    void markOffline(sendSock, phone);
     return { sent, finalId };
   };
 
   try {
+    // A private chat sees "מקליד/ה…" first (typingBefore); a group gets none.
+    const typed = await typingBefore(sock, phone, targetJid, content?.text);
+    if (!typed) throw new Error('socket not ready');
+    sendSock = typed;
     const { finalId } = await trySend(messageId);
     logger.info({ phone, jid: targetJid, msgId: finalId }, 'send_cached');
     return { ok: true, id: finalId, jid: targetJid };
@@ -1945,14 +1992,17 @@ app.post('/send-reply', async (req, res) => {
         },
         message: { conversation: String(quoted.text || '') },
       };
-      const sent = await s.sock.sendMessage(
+      // A private chat sees "מקליד/ה…" first (typingBefore); a group gets none.
+      const typed = await typingBefore(s.sock, phone, targetJid, String(text));
+      if (!typed) return res.status(409).json({ error: 'session_missing', status: 'reconnecting' });
+      const sent = await typed.sendMessage(
         targetJid,
         { text: String(text) },
         { quoted: quotedMsg },
       );
       const finalId = sent?.key?.id || null;
       if (finalId && sent?.message) rememberOutgoing(phone, finalId, sent.message);
-      void markOffline(s.sock, phone);
+      void markOffline(typed, phone);
       logger.info({ phone, jid: targetJid, msgId: finalId, quotedId: quoted.id }, 'send_reply_ok');
       return res.json({ ok: true, id: finalId, jid: targetJid });
     }
