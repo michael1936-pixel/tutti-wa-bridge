@@ -1976,9 +1976,11 @@ app.post('/delete', async (req, res) => {
 // Body: { session, jid, text, quoted: { id, participant, text } | null }
 // When `quoted` is null the call degrades to a plain send.
 app.post('/send-reply', async (req, res) => {
-  const { jid, text, session, quoted } = req.body || {};
+  const { jid, text, session, quoted, mentions } = req.body || {};
   const phone = String(session || '').replace(/\D/g, '');
   if (!phone || !jid || !text) return res.status(400).json({ error: 'jid, text, session required' });
+  // A tag in the text ("@972… שלח בפרטי!"): WhatsApp renders it only with the jids named here.
+  const mentioned = Array.isArray(mentions) ? mentions.map((m) => String(m)).filter(Boolean) : [];
   const s = sessions.get(phone);
   if (!s || s.status !== 'connected' || !s.sock) {
     return res.status(409).json({ error: 'session_missing', status: s?.status ?? 'not_started' });
@@ -2000,7 +2002,7 @@ app.post('/send-reply', async (req, res) => {
       if (!typed) return res.status(409).json({ error: 'session_missing', status: 'reconnecting' });
       const sent = await typed.sendMessage(
         targetJid,
-        { text: String(text) },
+        { text: String(text), ...(mentioned.length ? { mentions: mentioned } : {}) },
         { quoted: quotedMsg },
       );
       const finalId = sent?.key?.id || null;
