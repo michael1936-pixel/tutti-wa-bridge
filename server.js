@@ -172,7 +172,7 @@ async function getCachedGroupMetadata(sock, jid) {
 // Surfaced via /diag and printed once on startup. Bump this string when you
 // redeploy a behavioral change so you can read the version straight from
 // Railway logs.
-const BRIDGE_BUILD = 'retry-guard-2026-10-28';
+const BRIDGE_BUILD = 'edit-message-2026-10-28';
 
 /** How old a held private message may be and still be passed on. */
 const OFFLINE_PRIVATE_MAX_AGE_MS = 30 * 60_000;
@@ -1999,6 +1999,35 @@ app.post('/delete', async (req, res) => {
     res.json({ ok: true });
   } catch (e) {
     logger.error({ phone, jid: targetJid, err: e?.message }, 'delete_failed');
+    res.status(500).json({ ok: false, error: e?.message || String(e) });
+  }
+});
+
+// Edit, for everyone, a text message this number sent — WhatsApp allows it for 15
+// minutes (Michael, 2026-10-28: a ride's driver replaced after "ס" — «במקרה של עריכה
+// בהחלפת נהג תערוך את המי קיבל»; the app's supabase/functions/who-got-report).
+//
+// Body: { session, jid, id, text }
+app.post('/edit', async (req, res) => {
+  const { jid, id, text, session } = req.body || {};
+  const phone = String(session || '').replace(/\D/g, '');
+  if (!phone || !jid || !id || !text) return res.status(400).json({ error: 'jid, id, text, session required' });
+  const s = sessions.get(phone);
+  if (!s || s.status !== 'connected' || !s.sock) {
+    return res.status(409).json({ error: 'session_missing', status: s?.status ?? 'not_started' });
+  }
+  const targetJid = String(jid);
+  try {
+    const sent = await s.sock.sendMessage(targetJid, {
+      text: String(text),
+      edit: { remoteJid: targetJid, fromMe: true, id: String(id) },
+    });
+    if (sent?.key?.id && sent?.message) rememberOutgoing(phone, sent.key.id, sent.message, targetJid);
+    void markOffline(s.sock, phone);
+    logger.info({ phone, jid: targetJid, msgId: String(id) }, 'edit_ok');
+    res.json({ ok: true });
+  } catch (e) {
+    logger.error({ phone, jid: targetJid, err: e?.message }, 'edit_failed');
     res.status(500).json({ ok: false, error: e?.message || String(e) });
   }
 });
