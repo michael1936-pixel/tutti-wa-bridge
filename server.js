@@ -46,6 +46,7 @@ import makeWASocket, {
   generateMessageIDV2,
   downloadMediaMessage,
 } from 'baileys';
+import { makeRetryCounter } from './retryGuard.js';
 
 // The station's number must never show "מחובר/ת" to the drivers: the bridge is
 // a companion device, not a person at the phone (Michael, 2026-10-26: «כל מי
@@ -171,7 +172,7 @@ async function getCachedGroupMetadata(sock, jid) {
 // Surfaced via /diag and printed once on startup. Bump this string when you
 // redeploy a behavioral change so you can read the version straight from
 // Railway logs.
-const BRIDGE_BUILD = 'one-failure-per-message-2026-10-22';
+const BRIDGE_BUILD = 'retry-guard-2026-10-28';
 
 /** How old a held private message may be and still be passed on. */
 const OFFLINE_PRIVATE_MAX_AGE_MS = 30 * 60_000;
@@ -266,7 +267,7 @@ async function loadPurposes() {
 // ---------------------------------------------------------------------------
 const OUTGOING_CACHE_LIMIT = 5000;
 const OUTGOING_CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24h
-const outgoingCache = new Map(); // phone -> Map<msgId, { content, ts }>
+const outgoingCache = new Map(); // phone -> Map<msgId, { content, ts, group }>
 const outgoingDirty = new Set(); // phones with unsaved cache changes
 
 // Last-known JID per (phone, peer-phone). When a peer sends us a message via
@@ -415,10 +416,11 @@ async function saveOutgoingCache(phone) {
   }
 }
 
-function rememberOutgoing(phone, id, content) {
+function rememberOutgoing(phone, id, content, jid) {
   if (!id || !content) return;
   const m = getOutgoingMap(phone);
-  m.set(id, { content, ts: Date.now() });
+  // group: whether a resend of it is held to the group's limit (retryGuard.js).
+  m.set(id, { content, ts: Date.now(), group: String(jid || '').endsWith('@g.us') });
   // Evict oldest entries past the limit (Map preserves insertion order).
   while (m.size > OUTGOING_CACHE_LIMIT) {
     const oldestKey = m.keys().next().value;
@@ -427,6 +429,32 @@ function rememberOutgoing(phone, id, content) {
   outgoingDirty.add(phone);
   // Debounced persist — fire-and-forget.
   setTimeout(() => { saveOutgoingCache(phone).catch(() => {}); }, 1000);
+}
+
+/**
+ * The retry counter Baileys asks before it resends one of our messages
+ * (retryGuard.js) — one per number, kept across its sockets. Resends not made
+ * are counted on the session (/diag) and logged at most once a minute.
+ */
+function retryCounterFor(s, phone) {
+  if (s.retryCounter) return s.retryCounter;
+  s.retrySkipped = {};
+  let pending = {};
+  let loggedAt = 0;
+  s.retryCounter = makeRetryCounter({
+    ourMessage: (id) => outgoingCache.get(phone)?.get(id),
+    onSkip: (why, kind) => {
+      const k = `${kind}_${why}`;
+      s.retrySkipped[k] = (s.retrySkipped[k] || 0) + 1;
+      pending[k] = (pending[k] || 0) + 1;
+      const t = Date.now();
+      if (t - loggedAt < 60_000) return;
+      logger.warn({ phone, skipped: pending, total: s.retrySkipped }, 'retry_resend_skipped');
+      pending = {};
+      loggedAt = t;
+    },
+  });
+  return s.retryCounter;
 }
 
 /**
@@ -461,7 +489,7 @@ async function sendAndCache(phone, jid, content) {
   // Pre-cache so getMessage can find it even if WhatsApp issues a retry
   // before sendMessage resolves.
   if (messageId && protoContent) {
-    rememberOutgoing(phone, messageId, protoContent);
+    rememberOutgoing(phone, messageId, protoContent, targetJid);
   }
 
   // The socket to send with — the session's current one after the typing pause.
@@ -473,7 +501,7 @@ async function sendAndCache(phone, jid, content) {
       id ? { messageId: id } : undefined
     );
     const finalId = sent?.key?.id || id || null;
-    if (finalId && sent?.message) rememberOutgoing(phone, finalId, sent.message);
+    if (finalId && sent?.message) rememberOutgoing(phone, finalId, sent.message, targetJid);
     void markOffline(sendSock, phone);
     return { sent, finalId };
   };
@@ -502,7 +530,7 @@ async function sendAndCache(phone, jid, content) {
     }
     let retryId;
     try { retryId = generateMessageIDV2 ? generateMessageIDV2(sock.user?.id) : undefined; } catch (_) { retryId = undefined; }
-    if (retryId && protoContent) rememberOutgoing(phone, retryId, protoContent);
+    if (retryId && protoContent) rememberOutgoing(phone, retryId, protoContent, targetJid);
     try {
       logger.warn({ phone, jid: targetJid, msgId: retryId }, 'send_retry_attempt');
       const { finalId } = await trySend(retryId);
@@ -859,6 +887,10 @@ async function buildSocket(s, phone, { forceReset } = {}) {
     // can't be decrypted and we never see the driver's ride code.
     shouldSyncHistoryMessage: () => true,
     generateHighQualityLinkPreview: false,
+    // Members' phones asking again and again for an old group post choked the
+    // number (2026-10-28) — a resend of ours that is old, or one too many in a
+    // minute, is answered "sent too many times" (retryGuard.js).
+    msgRetryCounterCache: retryCounterFor(s, phone),
     // Critical: when WA asks us to resend (retry receipt), supply the
     // original message content. Without this the recipient sees
     // "Waiting for this message. This may take a while."
@@ -1865,6 +1897,7 @@ app.get('/diag', (_req, res) => {
     lastError: s.lastError,
     lastUpdate: s.lastUpdate,
     lidMappingCount: Array.from(lidToPhone.keys()).filter((k) => k.startsWith(`${phone}:`)).length,
+    retrySkipped: s.retrySkipped || {},
   }));
   res.json({
     ok: true,
@@ -2006,7 +2039,7 @@ app.post('/send-reply', async (req, res) => {
         { quoted: quotedMsg },
       );
       const finalId = sent?.key?.id || null;
-      if (finalId && sent?.message) rememberOutgoing(phone, finalId, sent.message);
+      if (finalId && sent?.message) rememberOutgoing(phone, finalId, sent.message, targetJid);
       void markOffline(typed, phone);
       logger.info({ phone, jid: targetJid, msgId: finalId, quotedId: quoted.id }, 'send_reply_ok');
       return res.json({ ok: true, id: finalId, jid: targetJid });
