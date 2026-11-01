@@ -172,7 +172,7 @@ async function getCachedGroupMetadata(sock, jid) {
 // Surfaced via /diag and printed once on startup. Bump this string when you
 // redeploy a behavioral change so you can read the version straight from
 // Railway logs.
-const BRIDGE_BUILD = 'edit-message-2026-10-28';
+const BRIDGE_BUILD = 'fast-feed-request-2026-11-01';
 
 /** How old a held private message may be and still be passed on. */
 const OFFLINE_PRIVATE_MAX_AGE_MS = 30 * 60_000;
@@ -465,7 +465,7 @@ function retryCounterFor(s, phone) {
  * Generates the message id ourselves with generateMessageIDV2 so we can
  * pre-cache the content and pass the same id to Baileys.
  */
-async function sendAndCache(phone, jid, content) {
+async function sendAndCache(phone, jid, content, opts = {}) {
   const session = sessions.get(phone);
   if (!session?.sock) throw new Error('socket not ready');
   const sock = session.sock;
@@ -508,7 +508,9 @@ async function sendAndCache(phone, jid, content) {
 
   try {
     // A private chat sees "מקליד/ה…" first (typingBefore); a group gets none.
-    const typed = await typingBefore(sock, phone, targetJid, content?.text);
+    // A driver's ride request (noTyping) goes out at once — the first to ask
+    // wins the ride (Michael, 2026-11-01: זה נשלח ממש לאט).
+    const typed = opts.noTyping === true ? sock : await typingBefore(sock, phone, targetJid, content?.text);
     if (!typed) throw new Error('socket not ready');
     sendSock = typed;
     const { finalId } = await trySend(messageId);
@@ -1963,7 +1965,7 @@ app.delete('/session/:phone', logoutHandler);
 app.post('/reset', logoutHandler);
 
 app.post('/send', async (req, res) => {
-  const { jid, text, session } = req.body || {};
+  const { jid, text, session, noTyping } = req.body || {};
   const phone = String(session || '').replace(/\D/g, '');
   if (!phone || !jid || !text) return res.status(400).json({ error: 'jid, text, session required' });
   const s = sessions.get(phone);
@@ -1971,7 +1973,7 @@ app.post('/send', async (req, res) => {
     return res.status(409).json({ error: 'session_missing', status: s?.status ?? 'not_started' });
   }
   try {
-    const out = await sendAndCache(phone, String(jid), { text: String(text) });
+    const out = await sendAndCache(phone, String(jid), { text: String(text) }, { noTyping: noTyping === true });
     res.json({ ok: true, id: out.id, jid: out.jid });
   } catch (e) {
     res.status(500).json({ ok: false, error: e?.message || String(e) });
@@ -2038,7 +2040,7 @@ app.post('/edit', async (req, res) => {
 // Body: { session, jid, text, quoted: { id, participant, text } | null }
 // When `quoted` is null the call degrades to a plain send.
 app.post('/send-reply', async (req, res) => {
-  const { jid, text, session, quoted, mentions } = req.body || {};
+  const { jid, text, session, quoted, mentions, noTyping } = req.body || {};
   const phone = String(session || '').replace(/\D/g, '');
   if (!phone || !jid || !text) return res.status(400).json({ error: 'jid, text, session required' });
   // A tag in the text ("@972… שלח בפרטי!"): WhatsApp renders it only with the jids named here.
@@ -2059,8 +2061,9 @@ app.post('/send-reply', async (req, res) => {
         },
         message: { conversation: String(quoted.text || '') },
       };
-      // A quoted answer is personal — "מקליד/ה…" first, in a group too (typingBefore).
-      const typed = await typingBefore(s.sock, phone, targetJid, String(text), true);
+      // A quoted answer is personal — "מקליד/ה…" first, in a group too (typingBefore)
+      // — except a driver's ride request (noTyping), which goes out at once.
+      const typed = noTyping === true ? s.sock : await typingBefore(s.sock, phone, targetJid, String(text), true);
       if (!typed) return res.status(409).json({ error: 'session_missing', status: 'reconnecting' });
       const sent = await typed.sendMessage(
         targetJid,
@@ -2074,7 +2077,7 @@ app.post('/send-reply', async (req, res) => {
       return res.json({ ok: true, id: finalId, jid: targetJid });
     }
     // No quote — plain send via cache path.
-    const out = await sendAndCache(phone, targetJid, { text: String(text) });
+    const out = await sendAndCache(phone, targetJid, { text: String(text) }, { noTyping: noTyping === true });
     res.json({ ok: true, id: out.id, jid: out.jid });
   } catch (e) {
     logger.error({ phone, jid: targetJid, err: e?.message }, 'send_reply_failed');
