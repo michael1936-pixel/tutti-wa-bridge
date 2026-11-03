@@ -172,7 +172,7 @@ async function getCachedGroupMetadata(sock, jid) {
 // Surfaced via /diag and printed once on startup. Bump this string when you
 // redeploy a behavioral change so you can read the version straight from
 // Railway logs.
-const BRIDGE_BUILD = 'heartbeat-on-suspicion-2026-11-03';
+const BRIDGE_BUILD = 'self-heartbeat-2026-11-03';
 
 /** How old a held private message may be and still be passed on. */
 const OFFLINE_PRIVATE_MAX_AGE_MS = 30 * 60_000;
@@ -880,21 +880,20 @@ setInterval(() => {
   }
 }, 60_000).unref?.();
 
-// ---- Inter-arm heartbeat (Michael, 2026-11-03, stage ב of the plan) ----------
+// ---- Self heartbeat (Michael, 2026-11-03, stage ב of the plan) ---------------
 // Waiting for 30 decryption failures finds a deaf number only once drivers
 // already lost messages. A number UNDER SUSPICION — a few failures lately and
-// no private message read since — is sent a short line from ANOTHER connected
-// number of the system; a line that does not decrypt within 45 seconds counts
-// as a miss, and two misses in a row restart the socket (the heal ladder's
-// step 1). The line is swallowed on arrival (forwardInbound).
-// Suspicion only (Michael, 2026-11-03 13:06, six lines in the payments chat:
-// «מה זה כל הבדיקות שהוא שולח???»): a healthy-but-quiet number is NEVER
-// pinged — on a normal day no one sees this line at all.
+// no private message read since — sends a short line TO ITSELF (WhatsApp's
+// self chat, «הודעות לעצמי» — nobody else ever sees it; Michael, 13:06, six
+// lines in the payments chat: «מה זה כל הבדיקות שהוא שולח??? שזה ישלח לעצמי»).
+// A send that hangs or fails is a miss; two misses in a row restart the
+// socket (the heal ladder's step 1). A healthy-but-quiet number is NEVER
+// pinged — on a normal day the line is not sent at all.
 const HEARTBEAT = {
   everyMs: 10 * 60_000,
   quietMs: 8 * 60_000,
   suspectFailures: 5,
-  waitMs: 45_000,
+  waitMs: 20_000,
   missesForRestart: 2,
   text: '🔄 בדיקת קו אוטומטית של המערכת',
 };
@@ -921,9 +920,7 @@ setInterval(() => { void backupCreds(); }, 24 * 60 * 60_000).unref?.();
 setTimeout(() => { void backupCreds(); }, 60_000).unref?.();
 
 setInterval(() => {
-  const live = [...sessions.values()].filter((x) => x.status === 'connected' && x.health);
-  if (live.length < 2) return;
-  for (const target of live) {
+  for (const target of [...sessions.values()].filter((x) => x.status === 'connected' && x.health)) {
     const h = target.health;
     const now = Date.now();
     // Heard a private recently, mid-check, or mid-heal (its own ladder runs): skip.
@@ -932,29 +929,27 @@ setInterval(() => {
     // Under suspicion only: decryption failures piling up with nothing read.
     const failures10m = h.failures.filter((f) => now - f.t <= SESSION_HEALTH.windowMs).length;
     if (failures10m < HEARTBEAT.suspectFailures && !rawDeafOf(target, now)) { h.pingMisses = 0; continue; }
-    const prober = live.find((x) => x.phone !== target.phone);
-    if (!prober) continue;
     h.pingAt = now;
-    const before = h.lastPrivateInboundAt || 0;
     void (async () => {
+      // To itself: the number's own self chat. A healthy socket sends and is
+      // acknowledged in a moment; a stuck one hangs past the timeout.
+      const selfJid = `${String(target.phone).replace(/\D/g, '')}@s.whatsapp.net`;
       try {
-        await sendAndCache(prober.phone, `${String(target.phone).replace(/\D/g, '')}@s.whatsapp.net`, { text: HEARTBEAT.text }, { noTyping: true });
+        await Promise.race([
+          sendAndCache(target.phone, selfJid, { text: HEARTBEAT.text }, { noTyping: true }),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('heartbeat timeout')), HEARTBEAT.waitMs)),
+        ]);
+        h.pingMisses = 0;
+        logger.info({ phone: target.phone }, 'heartbeat_ok');
       } catch (err) {
-        logger.warn({ from: prober.phone, to: target.phone, err: err?.message }, 'heartbeat_send_failed');
-        return;
-      }
-      setTimeout(() => {
-        const th = target.health;
-        if (!th) return;
-        if ((th.lastPrivateInboundAt || 0) > before) { th.pingMisses = 0; return; }
-        th.pingMisses = (th.pingMisses || 0) + 1;
-        logger.warn({ phone: target.phone, misses: th.pingMisses }, 'heartbeat_missed');
-        if (th.pingMisses >= HEARTBEAT.missesForRestart) {
-          th.pingMisses = 0;
+        h.pingMisses = (h.pingMisses || 0) + 1;
+        logger.warn({ phone: target.phone, misses: h.pingMisses, err: err?.message }, 'heartbeat_missed');
+        if (h.pingMisses >= HEARTBEAT.missesForRestart) {
+          h.pingMisses = 0;
           logger.warn({ phone: target.phone }, 'deaf_heal_restart');
           try { target.sock?.end(new Error('deaf: heartbeat missed twice')); } catch (_) { /* reconnect handles it */ }
         }
-      }, HEARTBEAT.waitMs).unref?.();
+      }
     })();
   }
 }, 60_000).unref?.();
