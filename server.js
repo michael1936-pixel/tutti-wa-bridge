@@ -172,7 +172,7 @@ async function getCachedGroupMetadata(sock, jid) {
 // Surfaced via /diag and printed once on startup. Bump this string when you
 // redeploy a behavioral change so you can read the version straight from
 // Railway logs.
-const BRIDGE_BUILD = 'fast-feed-request-2026-11-01';
+const BRIDGE_BUILD = 'deaf-auto-heal-2026-11-03';
 
 /** How old a held private message may be and still be passed on. */
 const OFFLINE_PRIVATE_MAX_AGE_MS = 30 * 60_000;
@@ -660,7 +660,12 @@ const SESSION_HEALTH = {
 };
 
 function newHealth() {
-  return { since: Date.now(), failures: [], timeouts: [], lastInboundAt: 0, lastPrivateInboundAt: 0, deafLoggedAt: 0, stuckRestartAt: 0 };
+  return {
+    since: Date.now(), failures: [], timeouts: [], lastInboundAt: 0, lastPrivateInboundAt: 0,
+    deafLoggedAt: 0, stuckRestartAt: 0,
+    // The deaf auto-heal ladder (healDeafTick) and the inter-arm heartbeat.
+    healStep: 0, healAt: 0, healFailed: false, deafSince: 0, pingMisses: 0, pingAt: 0,
+  };
 }
 
 // ---- A stuck socket (2026-10-22) ---------------------------------------------
@@ -729,19 +734,33 @@ function troubleIdOf(args) {
   return null;
 }
 
+/** Deaf by the raw numbers alone — what the auto-heal acts on. */
+function rawDeafOf(s, now = Date.now()) {
+  const h = s.health;
+  if (!h || s.status !== 'connected') return false;
+  const failures10m = h.failures.filter((f) => now - f.t <= SESSION_HEALTH.windowMs).length;
+  const quietMs = now - Math.max(h.lastInboundAt, h.since);
+  return failures10m >= SESSION_HEALTH.deafFailures && quietMs > SESSION_HEALTH.windowMs;
+}
+
 function healthOf(s) {
   const h = s.health;
   if (!h) return null;
   const now = Date.now();
   const failures10m = h.failures.filter((f) => now - f.t <= SESSION_HEALTH.windowMs).length;
-  const quietMs = now - Math.max(h.lastInboundAt, h.since);
-  const deaf = s.status === 'connected' && failures10m >= SESSION_HEALTH.deafFailures && quietMs > SESSION_HEALTH.windowMs;
+  // Said 'deaf' outwards (the app, the alert) only once the auto-heal below
+  // gave up (Michael, 2026-11-03: «איך פותרים את זה אחת ולתמיד» — first the
+  // bridge heals itself; only a number it could not heal is told).
+  const deaf = rawDeafOf(s, now) && !!h.healFailed;
   return {
     state: deaf ? 'deaf' : 'ok',
     failures10m,
     lastInboundAt: h.lastInboundAt || null,
     lastPrivateInboundAt: h.lastPrivateInboundAt || null,
     recovered: h.recovered || 0,
+    /** false while the bridge still heals; the server's alert waits for true. */
+    healFailed: !!h.healFailed,
+    healStep: h.healStep || 0,
   };
 }
 
@@ -784,14 +803,153 @@ function restartIfStuck(s) {
   }
 }
 
-// Once a minute: a deaf number is said loudly in the log (once per 30 minutes).
+// ---- Deaf auto-heal (Michael, 2026-11-03: «למה זה כל הזמן קורה? ואיך פותרים
+// את זה אחת ולתמיד») -----------------------------------------------------------
+// Once a minute every session is checked; a number that went deaf heals itself
+// in steps, and only one the steps did not help is reported (healthOf above):
+//   1. end the socket — the usual reconnect builds a fresh one (prekeys are
+//      uploaded again, the app state re-syncs); the same safe move as the
+//      stuck-socket restart.
+//   2. still deaf on re-detection — write a short line to the private peers
+//      whose messages failed lately: OUR outbound encrypt hands each of them a
+//      fresh session, and their next message decrypts (the mechanism behind
+//      the courtesy message in forwardInbound). NEVER wiping sessions
+//      ourselves — that fought Baileys' own recovery and left numbers deaf
+//      for good (2026-10-15).
+//   3. still deaf — healFailed, and the server's health cron tells Michael.
+// A private message that decrypts after a heal step logs 'deaf_healed' and
+// starts the ladder over.
+const DEAF_HEAL = { stepGapMs: 5 * 60_000, maxPeers: 5, peerWindowMs: 30 * 60_000 };
+const HEAL_PEER_TEXT = '📵 לא הצלחנו לקרוא את ההודעה האחרונה שלך עקב תקלת הצפנה זמנית. אנא שלח שוב. תודה!';
+
+async function healDeafTick(s) {
+  const h = s.health;
+  const now = Date.now();
+  if (!h.deafSince) h.deafSince = now;
+  if (now - (h.healAt || 0) < DEAF_HEAL.stepGapMs) return;
+  h.healAt = now;
+  h.healStep = (h.healStep || 0) + 1;
+  if (h.healStep === 1) {
+    logger.warn({ phone: s.phone, step: 1 }, 'deaf_heal_restart');
+    try { s.sock?.end(new Error('deaf: restarting socket')); } catch (err) {
+      logger.error({ phone: s.phone, err: err?.message }, 'deaf_heal_restart_failed');
+    }
+    return;
+  }
+  if (h.healStep === 2) {
+    // The failing private peers, newest first — a fresh session to each.
+    const peers = [...(s.inboundDecryptFails?.entries() || [])]
+      .filter(([, v]) => now - v.ts < DEAF_HEAL.peerWindowMs)
+      .sort((a, b) => b[1].ts - a[1].ts)
+      .map(([jid]) => jid)
+      .slice(0, DEAF_HEAL.maxPeers);
+    logger.warn({ phone: s.phone, step: 2, peers: peers.length }, 'deaf_heal_peer_ping');
+    for (const jid of peers) {
+      try { await sendAndCache(s.phone, jid, { text: HEAL_PEER_TEXT }, { noTyping: true }); } catch (_) { /* the next peer still gets his */ }
+    }
+    return;
+  }
+  if (!h.healFailed) {
+    h.healFailed = true;
+    logger.error({ phone: s.phone, deafForMin: Math.round((now - h.deafSince) / 60_000) }, 'deaf_heal_failed');
+  }
+}
+
+// Once a minute: heal what is deaf, log what healed, and say a reported-deaf
+// number loudly (once per 30 minutes).
 setInterval(() => {
   for (const s of sessions.values()) {
-    const h = healthOf(s);
-    if (h?.state !== 'deaf' || !s.health) continue;
-    if (Date.now() - s.health.deafLoggedAt < 30 * 60_000) continue;
-    s.health.deafLoggedAt = Date.now();
-    logger.error({ phone: s.phone, ...h }, 'session_deaf');
+    const h = s.health;
+    if (!h) continue;
+    const now = Date.now();
+    if (rawDeafOf(s, now)) {
+      void healDeafTick(s);
+    } else if (h.healStep && h.lastPrivateInboundAt > (h.deafSince || 0)) {
+      // A private message decrypted again: the heal worked (or the number came back).
+      logger.warn({ phone: s.phone, step: h.healStep, healFailed: !!h.healFailed }, 'deaf_healed');
+      h.healStep = 0;
+      h.healAt = 0;
+      h.healFailed = false;
+      h.deafSince = 0;
+    }
+    const rep = healthOf(s);
+    if (rep?.state !== 'deaf') continue;
+    if (now - h.deafLoggedAt < 30 * 60_000) continue;
+    h.deafLoggedAt = now;
+    logger.error({ phone: s.phone, ...rep }, 'session_deaf');
+  }
+}, 60_000).unref?.();
+
+// ---- Inter-arm heartbeat (Michael, 2026-11-03, stage ב of the plan) ----------
+// Waiting for 30 decryption failures finds a deaf number only once drivers
+// already lost messages. Instead, a connected number that heard no private
+// message for a while is sent a short line from ANOTHER connected number of
+// the system; a line that does not decrypt within 45 seconds counts as a miss,
+// and two misses in a row restart the socket (the heal ladder's step 1). The
+// line itself is swallowed on arrival (forwardInbound) — it proves the ear
+// works and never reaches the webhook or the app.
+const HEARTBEAT = {
+  everyMs: 5 * 60_000,
+  quietMs: 8 * 60_000,
+  waitMs: 45_000,
+  missesForRestart: 2,
+  text: '🔄 בדיקת קו אוטומטית של המערכת',
+};
+
+// ---- creds backup (stage ג): a copy of each number's creds.json, once a day,
+// taken only when the live file parses — a Railway restart mid-write can
+// otherwise leave a broken creds.json and force a new pairing. Sessions are
+// NOT backed up: restoring stale signal sessions is what makes numbers deaf.
+async function backupCreds() {
+  const root = path.join(AUTH_ROOT, 'auth');
+  let dirs = [];
+  try { dirs = await fs.promises.readdir(root); } catch (_) { return; }
+  for (const d of dirs) {
+    const live = path.join(root, d, 'creds.json');
+    try {
+      const raw = await fs.promises.readFile(live, 'utf8');
+      JSON.parse(raw);
+      await fs.promises.writeFile(path.join(root, d, 'creds.backup.json'), raw, 'utf8');
+    } catch (_) { /* no creds here, or it is broken — never overwrite the backup with it */ }
+  }
+  logger.info({ numbers: dirs.length }, 'creds_backup_done');
+}
+setInterval(() => { void backupCreds(); }, 24 * 60 * 60_000).unref?.();
+setTimeout(() => { void backupCreds(); }, 60_000).unref?.();
+
+setInterval(() => {
+  const live = [...sessions.values()].filter((x) => x.status === 'connected' && x.health);
+  if (live.length < 2) return;
+  for (const target of live) {
+    const h = target.health;
+    const now = Date.now();
+    // Heard a private recently, mid-check, or mid-heal (its own ladder runs): skip.
+    if (now - Math.max(h.lastPrivateInboundAt || 0, h.since) < HEARTBEAT.quietMs) { h.pingMisses = 0; continue; }
+    if (now - (h.pingAt || 0) < HEARTBEAT.everyMs || h.healStep) continue;
+    const prober = live.find((x) => x.phone !== target.phone);
+    if (!prober) continue;
+    h.pingAt = now;
+    const before = h.lastPrivateInboundAt || 0;
+    void (async () => {
+      try {
+        await sendAndCache(prober.phone, `${String(target.phone).replace(/\D/g, '')}@s.whatsapp.net`, { text: HEARTBEAT.text }, { noTyping: true });
+      } catch (err) {
+        logger.warn({ from: prober.phone, to: target.phone, err: err?.message }, 'heartbeat_send_failed');
+        return;
+      }
+      setTimeout(() => {
+        const th = target.health;
+        if (!th) return;
+        if ((th.lastPrivateInboundAt || 0) > before) { th.pingMisses = 0; return; }
+        th.pingMisses = (th.pingMisses || 0) + 1;
+        logger.warn({ phone: target.phone, misses: th.pingMisses }, 'heartbeat_missed');
+        if (th.pingMisses >= HEARTBEAT.missesForRestart) {
+          th.pingMisses = 0;
+          logger.warn({ phone: target.phone }, 'deaf_heal_restart');
+          try { target.sock?.end(new Error('deaf: heartbeat missed twice')); } catch (_) { /* reconnect handles it */ }
+        }
+      }, HEARTBEAT.waitMs).unref?.();
+    })();
   }
 }, 60_000).unref?.();
 
@@ -916,7 +1074,16 @@ async function buildSocket(s, phone, { forceReset } = {}) {
   s.pairingReady = false;
   // A new socket starts its health anew — but remembers when a stuck one was
   // last ended, so a stuck number is restarted at most once a minute.
-  s.health = { ...newHealth(), stuckRestartAt: s.health?.stuckRestartAt || 0 };
+  s.health = {
+    ...newHealth(),
+    stuckRestartAt: s.health?.stuckRestartAt || 0,
+    // The heal ladder survives the socket it restarted (deaf auto-heal):
+    // otherwise step 1 would start over after every reconnect, forever.
+    healStep: s.health?.healStep || 0,
+    healAt: s.health?.healAt || 0,
+    healFailed: s.health?.healFailed || false,
+    deafSince: s.health?.deafSince || 0,
+  };
   setStatus(s, 'connecting', { lastError: null });
 
   // Events of a replaced socket are not this number's any more. off() finds
@@ -1227,6 +1394,14 @@ async function buildSocket(s, phone, { forceReset } = {}) {
     // Successful decrypt — clear failure counter for this peer.
     s.inboundDecryptFails.delete(jid);
     markInbound(s, true, m.key?.id);
+
+    // The inter-arm heartbeat proved the ear works — that was its whole job;
+    // the webhook and the app never see it (HEARTBEAT, 2026-11-03). By the
+    // words alone: the sender may arrive under its @lid, not its number.
+    if (String(text).trim() === HEARTBEAT.text) {
+      logger.info({ phone, from: jid }, 'heartbeat_received');
+      return;
+    }
 
     // The message the driver quoted, if any. A private "ת" on a swipe-reply
     // of the ride's post names the ride without a code — the webhook reads
