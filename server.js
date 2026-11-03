@@ -172,7 +172,7 @@ async function getCachedGroupMetadata(sock, jid) {
 // Surfaced via /diag and printed once on startup. Bump this string when you
 // redeploy a behavioral change so you can read the version straight from
 // Railway logs.
-const BRIDGE_BUILD = 'deaf-auto-heal-2026-11-03';
+const BRIDGE_BUILD = 'heartbeat-on-suspicion-2026-11-03';
 
 /** How old a held private message may be and still be passed on. */
 const OFFLINE_PRIVATE_MAX_AGE_MS = 30 * 60_000;
@@ -882,15 +882,18 @@ setInterval(() => {
 
 // ---- Inter-arm heartbeat (Michael, 2026-11-03, stage ב of the plan) ----------
 // Waiting for 30 decryption failures finds a deaf number only once drivers
-// already lost messages. Instead, a connected number that heard no private
-// message for a while is sent a short line from ANOTHER connected number of
-// the system; a line that does not decrypt within 45 seconds counts as a miss,
-// and two misses in a row restart the socket (the heal ladder's step 1). The
-// line itself is swallowed on arrival (forwardInbound) — it proves the ear
-// works and never reaches the webhook or the app.
+// already lost messages. A number UNDER SUSPICION — a few failures lately and
+// no private message read since — is sent a short line from ANOTHER connected
+// number of the system; a line that does not decrypt within 45 seconds counts
+// as a miss, and two misses in a row restart the socket (the heal ladder's
+// step 1). The line is swallowed on arrival (forwardInbound).
+// Suspicion only (Michael, 2026-11-03 13:06, six lines in the payments chat:
+// «מה זה כל הבדיקות שהוא שולח???»): a healthy-but-quiet number is NEVER
+// pinged — on a normal day no one sees this line at all.
 const HEARTBEAT = {
-  everyMs: 5 * 60_000,
+  everyMs: 10 * 60_000,
   quietMs: 8 * 60_000,
+  suspectFailures: 5,
   waitMs: 45_000,
   missesForRestart: 2,
   text: '🔄 בדיקת קו אוטומטית של המערכת',
@@ -926,6 +929,9 @@ setInterval(() => {
     // Heard a private recently, mid-check, or mid-heal (its own ladder runs): skip.
     if (now - Math.max(h.lastPrivateInboundAt || 0, h.since) < HEARTBEAT.quietMs) { h.pingMisses = 0; continue; }
     if (now - (h.pingAt || 0) < HEARTBEAT.everyMs || h.healStep) continue;
+    // Under suspicion only: decryption failures piling up with nothing read.
+    const failures10m = h.failures.filter((f) => now - f.t <= SESSION_HEALTH.windowMs).length;
+    if (failures10m < HEARTBEAT.suspectFailures && !rawDeafOf(target, now)) { h.pingMisses = 0; continue; }
     const prober = live.find((x) => x.phone !== target.phone);
     if (!prober) continue;
     h.pingAt = now;
