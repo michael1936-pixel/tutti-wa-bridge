@@ -172,7 +172,7 @@ async function getCachedGroupMetadata(sock, jid) {
 // Surfaced via /diag and printed once on startup. Bump this string when you
 // redeploy a behavioral change so you can read the version straight from
 // Railway logs.
-const BRIDGE_BUILD = 'self-heartbeat-2026-11-03';
+const BRIDGE_BUILD = 'silent-heartbeat-2026-11-03';
 
 /** How old a held private message may be and still be passed on. */
 const OFFLINE_PRIVATE_MAX_AGE_MS = 30 * 60_000;
@@ -889,6 +889,11 @@ setInterval(() => {
 // A send that hangs or fails is a miss; two misses in a row restart the
 // socket (the heal ladder's step 1). A healthy-but-quiet number is NEVER
 // pinged — on a normal day the line is not sent at all.
+// The probe is INVISIBLE (Michael, 2026-11-03, «תבטל בבקשה את ההודעות בדיקה…
+// זה ממש מציק»): an empty reaction aimed at a message id that never existed.
+// It rides the same encrypt-and-send pipeline and earns the same server ack
+// as a text, but every phone drops a reaction to an unknown message silently,
+// so nothing is ever shown — not even in the self chat.
 const HEARTBEAT = {
   everyMs: 10 * 60_000,
   quietMs: 8 * 60_000,
@@ -932,11 +937,14 @@ setInterval(() => {
     h.pingAt = now;
     void (async () => {
       // To itself: the number's own self chat. A healthy socket sends and is
-      // acknowledged in a moment; a stuck one hangs past the timeout.
+      // acknowledged in a moment; a stuck one hangs past the timeout. An empty
+      // reaction to a made-up id: full pipeline, same ack, nothing on screen.
       const selfJid = `${String(target.phone).replace(/\D/g, '')}@s.whatsapp.net`;
       try {
         await Promise.race([
-          sendAndCache(target.phone, selfJid, { text: HEARTBEAT.text }, { noTyping: true }),
+          target.sock.sendMessage(selfJid, {
+            react: { text: '', key: { remoteJid: selfJid, fromMe: true, id: `HEARTBEAT${now}` } },
+          }),
           new Promise((_, reject) => setTimeout(() => reject(new Error('heartbeat timeout')), HEARTBEAT.waitMs)),
         ]);
         h.pingMisses = 0;
