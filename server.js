@@ -2231,7 +2231,12 @@ app.post('/send-reply', async (req, res) => {
         key: {
           id: String(quoted.id),
           fromMe: false,
-          remoteJid: targetJid,
+          // The chat the quoted message really lives in: a private "ת" quotes
+          // the GROUP's post — named here, the quote is real and a tap jumps
+          // to the group (Michael, 2026-11-03: the system's quote was «חסום
+          // כאילו זה לא תיוג אמיתי»). Without quoted.jid — the chat we send
+          // into, as before.
+          remoteJid: quoted.jid ? String(quoted.jid) : targetJid,
           ...(quoted.participant ? { participant: String(quoted.participant) } : {}),
         },
         message: { conversation: String(quoted.text || '') },
