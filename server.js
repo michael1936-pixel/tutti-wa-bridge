@@ -1641,18 +1641,26 @@ async function buildSocket(s, phone, { forceReset } = {}) {
       return;
     }
     if (ev.type !== 'notify') return;
+    // When WhatsApp hands this batch over (ms): the server measures the way
+    // from the group to the driver's phone with it (2026-11-07, Michael:
+    // «אחרי 3 שניות שראיתי כבר את ההודעה בבוט בטלגרם אז הגיע ההתראה»).
+    const receivedMs = Date.now();
+    // The group posts of a batch go out together: one after the other, a
+    // busy minute queued every post behind the webhook call of the one before.
+    const groupJobs = [];
     for (const m of ev.messages || []) {
+      groupJobs.push(
+        forwardGroupInbound(m, receivedMs).catch((err) => {
+          logger.error({ phone, err: err?.message }, 'group_feed forward handler error');
+        }),
+      );
       try {
         await forwardInbound(m);
       } catch (err) {
         logger.error({ phone, err: err?.message }, 'messages.upsert handler error');
       }
-      try {
-        await forwardGroupInbound(m);
-      } catch (err) {
-        logger.error({ phone, err: err?.message }, 'group_feed forward handler error');
-      }
     }
+    await Promise.all(groupJobs);
   });
 
   // -------------------------------------------------------------------------
@@ -1681,7 +1689,7 @@ async function buildSocket(s, phone, { forceReset } = {}) {
     );
   }
 
-  async function forwardGroupInbound(m) {
+  async function forwardGroupInbound(m, receivedMs = Date.now()) {
     if (!m || m.key?.fromMe) return;
     if (purposeOf(phone)) return;
     const jid = m.key?.remoteJid || '';
@@ -1799,6 +1807,10 @@ async function buildSocket(s, phone, { forceReset } = {}) {
       timestamp: typeof m.messageTimestamp === 'number'
         ? m.messageTimestamp
         : Number(m.messageTimestamp || 0) || undefined,
+      // The bridge's own clock: when WhatsApp handed the message over, and
+      // when it left for the server (the server logs the way, feed_timing).
+      bridge_received_ms: receivedMs,
+      bridge_sent_ms: Date.now(),
     };
 
     try {
