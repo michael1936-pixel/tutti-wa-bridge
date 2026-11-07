@@ -149,6 +149,9 @@ const PAYMENT_PROOF_URL = process.env.PAYMENT_PROOF_WEBHOOK_URL
 // Separate webhook for incoming GROUP messages (user WhatsApp feed).
 // When set, every text message received in a @g.us chat is forwarded so
 // Lovable Cloud can parse it and surface rides in OpenRides.
+// Every call to the server's functions carries x-region eu-central-1: it runs
+// beside the database (Frankfurt). From here the function ran in a far region,
+// and each of its database round trips cost ~200 ms (feed_timing, 2026-11-07).
 const GROUP_FEED_WEBHOOK_URL = process.env.GROUP_FEED_WEBHOOK_URL || '';
 const GROUP_FEED_WEBHOOK_SECRET = process.env.GROUP_FEED_WEBHOOK_SECRET || '';
 
@@ -1136,6 +1139,7 @@ async function buildSocket(s, phone, { forceReset } = {}) {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
+          'x-region': 'eu-central-1',
           ...(WEBHOOK_SECRET ? { 'x-bridge-secret': WEBHOOK_SECRET } : {}),
         },
         body: JSON.stringify(body),
@@ -1366,6 +1370,7 @@ async function buildSocket(s, phone, { forceReset } = {}) {
                 method: 'POST',
                 headers: {
                   'Content-Type': 'application/json',
+                  'x-region': 'eu-central-1',
                   ...(WEBHOOK_SECRET ? { 'x-bridge-secret': WEBHOOK_SECRET } : {}),
                 },
                 body: JSON.stringify({
@@ -1477,6 +1482,7 @@ async function buildSocket(s, phone, { forceReset } = {}) {
                 method: 'POST',
                 headers: {
                   'Content-Type': 'application/json',
+                  'x-region': 'eu-central-1',
                   ...(WEBHOOK_SECRET ? { 'x-bridge-secret': WEBHOOK_SECRET } : {}),
                 },
                 body: JSON.stringify({
@@ -1519,6 +1525,7 @@ async function buildSocket(s, phone, { forceReset } = {}) {
             method: 'POST',
             headers: {
               'Content-Type': 'application/json',
+              'x-region': 'eu-central-1',
               ...(WEBHOOK_SECRET ? { 'x-bridge-secret': WEBHOOK_SECRET } : {}),
             },
             body: JSON.stringify(payload),
@@ -1577,6 +1584,7 @@ async function buildSocket(s, phone, { forceReset } = {}) {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
+          'x-region': 'eu-central-1',
           ...(WEBHOOK_SECRET ? { 'x-bridge-secret': WEBHOOK_SECRET } : {}),
         },
         body: JSON.stringify(media ? { ...body, media } : body),
@@ -1818,6 +1826,7 @@ async function buildSocket(s, phone, { forceReset } = {}) {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
+          'x-region': 'eu-central-1',
           ...(GROUP_FEED_WEBHOOK_SECRET ? { 'X-Webhook-Secret': GROUP_FEED_WEBHOOK_SECRET } : {}),
         },
         body: JSON.stringify(payload),
@@ -2425,6 +2434,7 @@ app.post('/debug-forward-inbound', async (req, res) => {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
+        'x-region': 'eu-central-1',
         ...(WEBHOOK_SECRET ? { 'x-bridge-secret': WEBHOOK_SECRET } : {}),
       },
       body: JSON.stringify(payload),
