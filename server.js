@@ -175,7 +175,7 @@ async function getCachedGroupMetadata(sock, jid) {
 // Surfaced via /diag and printed once on startup. Bump this string when you
 // redeploy a behavioral change so you can read the version straight from
 // Railway logs.
-const BRIDGE_BUILD = 'profile-pics-2026-11-08';
+const BRIDGE_BUILD = 'profile-pics-lid-2026-11-08';
 
 /** How old a held private message may be and still be passed on. */
 const OFFLINE_PRIVATE_MAX_AGE_MS = 30 * 60_000;
@@ -2297,11 +2297,13 @@ app.post('/send-reply', async (req, res) => {
 
 
 // The driver's WhatsApp profile picture, for the requester cards (Michael,
-// 2026-11-08). One lightweight query; a photo his privacy settings hide from
-// us (or a driver with no photo) comes back as url null — never an error.
-// 'preview' (~96px) is plenty for the avatar circles and far lighter than the
-// full image. The caller (supabase wa-profile-pics) caches per phone, so this
-// is called a handful of times a day — never in bursts.
+// 2026-11-08). A photo his privacy settings hide from us (or a driver with no
+// photo) comes back as url null — never an error. A LID-era account may only
+// answer by its @lid face, so the PN query is followed by a LID one (from the
+// learned lidToPhone map, else a live onWhatsApp lookup). The caller
+// (supabase wa-profile-pics) caches per phone, so this is called a handful of
+// times a day — never in bursts. `attempts` says what WhatsApp answered to
+// each try, so a wrong null can be told from a real "no photo".
 //
 // Body: { session, phone }
 app.post('/profile-pic', async (req, res) => {
@@ -2313,11 +2315,40 @@ app.post('/profile-pic', async (req, res) => {
   if (!s || s.status !== 'connected' || !s.sock) {
     return res.status(409).json({ error: 'session_missing', status: s?.status ?? 'not_started' });
   }
+  const attempts = [];
+  const tryJid = async (jid, type) => {
+    try {
+      const url = await s.sock.profilePictureUrl(jid, type);
+      attempts.push({ jid, type, got: url ? 'url' : 'empty' });
+      return url || null;
+    } catch (e) {
+      attempts.push({ jid, type, err: e?.data ?? e?.output?.statusCode ?? e?.message ?? String(e) });
+      return null;
+    }
+  };
   try {
-    const url = await s.sock.profilePictureUrl(`${digits}@s.whatsapp.net`, 'preview').catch(() => null);
-    res.json({ ok: true, url: url || null });
+    let url = await tryJid(`${digits}@s.whatsapp.net`, 'image');
+    if (!url) {
+      // His LID, as this session learned it from his messages.
+      let lid = null;
+      for (const [k, v] of lidToPhone) {
+        if (k.startsWith(`${phone}:`) && String(v?.phone ?? '').replace(/\D/g, '') === digits) { lid = k.slice(phone.length + 1); break; }
+      }
+      if (!lid) {
+        try {
+          const r = await s.sock.onWhatsApp(digits);
+          const hit = Array.isArray(r) ? r[0] : null;
+          lid = (hit && (hit.lid || (String(hit.jid || '').endsWith('@lid') ? hit.jid : null))) || null;
+          if (hit) attempts.push({ onWhatsApp: { exists: hit.exists ?? null, jid: hit.jid ?? null, lid: hit.lid ?? null } });
+        } catch (e) {
+          attempts.push({ onWhatsApp: { err: e?.message || String(e) } });
+        }
+      }
+      if (lid) url = await tryJid(String(lid), 'image');
+    }
+    res.json({ ok: true, url: url || null, attempts });
   } catch (e) {
-    res.status(500).json({ ok: false, error: e?.message || String(e) });
+    res.status(500).json({ ok: false, error: e?.message || String(e), attempts });
   }
 });
 
