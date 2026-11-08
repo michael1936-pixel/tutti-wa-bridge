@@ -175,7 +175,7 @@ async function getCachedGroupMetadata(sock, jid) {
 // Surfaced via /diag and printed once on startup. Bump this string when you
 // redeploy a behavioral change so you can read the version straight from
 // Railway logs.
-const BRIDGE_BUILD = 'silent-heartbeat-2026-11-03';
+const BRIDGE_BUILD = 'profile-pics-2026-11-08';
 
 /** How old a held private message may be and still be passed on. */
 const OFFLINE_PRIVATE_MAX_AGE_MS = 30 * 60_000;
@@ -2295,6 +2295,31 @@ app.post('/send-reply', async (req, res) => {
   }
 });
 
+
+// The driver's WhatsApp profile picture, for the requester cards (Michael,
+// 2026-11-08). One lightweight query; a photo his privacy settings hide from
+// us (or a driver with no photo) comes back as url null — never an error.
+// 'preview' (~96px) is plenty for the avatar circles and far lighter than the
+// full image. The caller (supabase wa-profile-pics) caches per phone, so this
+// is called a handful of times a day — never in bursts.
+//
+// Body: { session, phone }
+app.post('/profile-pic', async (req, res) => {
+  const { session, phone: target } = req.body || {};
+  const phone = String(session || '').replace(/\D/g, '');
+  const digits = String(target || '').replace(/\D/g, '');
+  if (!phone || !digits) return res.status(400).json({ error: 'session and phone required' });
+  const s = sessions.get(phone);
+  if (!s || s.status !== 'connected' || !s.sock) {
+    return res.status(409).json({ error: 'session_missing', status: s?.status ?? 'not_started' });
+  }
+  try {
+    const url = await s.sock.profilePictureUrl(`${digits}@s.whatsapp.net`, 'preview').catch(() => null);
+    res.json({ ok: true, url: url || null });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e?.message || String(e) });
+  }
+});
 
 // Force-rebuild the Signal session for a specific peer JID. Use this when
 // the recipient is stuck on "Waiting for this message" — assertSessions(true)
