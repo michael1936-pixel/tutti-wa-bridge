@@ -175,7 +175,7 @@ async function getCachedGroupMetadata(sock, jid) {
 // Surfaced via /diag and printed once on startup. Bump this string when you
 // redeploy a behavioral change so you can read the version straight from
 // Railway logs.
-const BRIDGE_BUILD = 'profile-pics-lid-2026-11-08';
+const BRIDGE_BUILD = 'pairing-history-2026-11-08';
 
 /** How old a held private message may be and still be passed on. */
 const OFFLINE_PRIVATE_MAX_AGE_MS = 30 * 60_000;
@@ -1257,6 +1257,51 @@ async function buildSocket(s, phone, { forceReset } = {}) {
     }, 1500);
   }
 
+  // ---- the chats WhatsApp hands over on pairing ---------------------------
+  // On a (re)pair WhatsApp sends the number's recent history
+  // (messaging-history.set). Private text messages go to the chat sync with
+  // their own time (historic:true), so «כל ההיסטוריה» in the app also shows
+  // what was written before the system listened (Michael, 2026-11-08). The
+  // server decides what it keeps (requesters, and everything on a number
+  // registered on the account); an old voice note goes as its label only and
+  // is never answered.
+  const HISTORY_MAX_AGE_MS = 60 * 24 * 60 * 60 * 1000;
+  const HISTORY_CAP = 400;
+  function syncHistoryMessages(messages) {
+    if (!CHAT_SYNC_URL || purposeOf(phone)) return;
+    const now = Date.now();
+    const items = [];
+    for (const m of messages || []) {
+      if (!m?.key?.id || !m.message) continue;
+      const jid = m.key.remoteJid || '';
+      if (!jid || jid.endsWith('@g.us') || jid.endsWith('@broadcast') || jid.endsWith('@newsletter') || jid.startsWith('status@')) continue;
+      const text = chatSyncText(m.message);
+      if (!text) continue;
+      const peer = extractRealPhoneDigits(phone, m);
+      if (!peer || peer === String(phone)) continue;
+      const at = Number(String(m.messageTimestamp || 0)) * 1000;
+      if (!at || now - at > HISTORY_MAX_AGE_MS || at > now + 60_000) continue;
+      items.push({
+        kind: 'message', station_phone: phone, peer_phone: peer,
+        from_me: !!m.key.fromMe, text: text.slice(0, 4000),
+        wa_message_id: m.key.id, via_api: false, historic: true, at,
+      });
+    }
+    if (!items.length) return;
+    // Oldest first, newest kept when there are too many; one at a time with a
+    // pause — a pairing must never look like a burst.
+    items.sort((a, b) => a.at - b.at);
+    const batch = items.slice(-HISTORY_CAP);
+    logger.info({ phone, got: items.length, sending: batch.length }, 'history_sync_start');
+    void (async () => {
+      for (const b of batch) {
+        await postChatSync(b);
+        await new Promise((r) => setTimeout(r, 250));
+      }
+      logger.info({ phone, sent: batch.length }, 'history_sync_done');
+    })();
+  }
+
   // Shared forwarder used by both messages.upsert and messages.update
   // (because retried/re-delivered messages arrive on `update`).
   async function forwardInbound(m) {
@@ -1597,6 +1642,15 @@ async function buildSocket(s, phone, { forceReset } = {}) {
       clearTimeout(timer);
     }
   }
+
+  // The history WhatsApp hands over on pairing — recorded, never answered.
+  sock.ev.on('messaging-history.set', (h) => {
+    try {
+      syncHistoryMessages(h?.messages);
+    } catch (err) {
+      logger.warn({ phone, err: err?.message }, 'history_sync_failed');
+    }
+  });
 
   // A group that changed is read again on its next message (sendGroupMeta).
   sock.ev.on('group-participants.update', (u) => dropSendGroup(s, u?.id));
