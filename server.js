@@ -175,7 +175,7 @@ async function getCachedGroupMetadata(sock, jid) {
 // Surfaced via /diag and printed once on startup. Bump this string when you
 // redeploy a behavioral change so you can read the version straight from
 // Railway logs.
-const BRIDGE_BUILD = 'pairing-history-2026-11-08';
+const BRIDGE_BUILD = 'group-members-fill-2026-11-10';
 
 /** How old a held private message may be and still be passed on. */
 const OFFLINE_PRIVATE_MAX_AGE_MS = 30 * 60_000;
@@ -648,6 +648,50 @@ async function sendGroupMeta(s, jid) {
 
 function dropSendGroup(s, jid) {
   if (jid) s.sendGroups?.map.delete(jid);
+}
+
+// ---- Members of groups handed over without them (2026-11-10) -----------------
+// groupFetchAllParticipating hands some groups over with no participants (20 of
+// a station's 193 one night — the number still got their messages). The server
+// keeps only groups with members (wa_group_snapshots), so those groups were
+// shared with nobody: a driver who asked in «מגבים 6 ג' - 2» did not have it
+// among his shared groups (Michael, 2026-11-09). /groups?include=participants
+// now asks for such a group's members alone (groupMetadata), a few per call and
+// slowly — the list is read every 30 minutes — and keeps them for hours, so a
+// big station's missing groups fill within a few calls without a burst.
+const MEMBERS_FILL = { ttlMs: 6 * 60 * 60_000, perCall: 8, gapMs: 400, timeoutMs: 8_000 };
+
+async function fillMissingMembers(s, all) {
+  if (!s.memberCache) s.memberCache = new Map(); // jid -> { participants, at }
+  const now = Date.now();
+  const want = [];
+  let filled = 0;
+  for (const [jid, g] of Object.entries(all || {})) {
+    if (!g || (Array.isArray(g.participants) && g.participants.length > 0)) continue;
+    const kept = s.memberCache.get(jid);
+    if (kept && now - kept.at < MEMBERS_FILL.ttlMs) {
+      all[jid] = { ...g, participants: kept.participants };
+      filled += 1;
+    } else want.push(jid);
+  }
+  for (const jid of want.slice(0, MEMBERS_FILL.perCall)) {
+    try {
+      const meta = await Promise.race([
+        s.sock.groupMetadata(jid),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), MEMBERS_FILL.timeoutMs)),
+      ]);
+      const participants = Array.isArray(meta?.participants) ? meta.participants : [];
+      if (participants.length > 0) {
+        s.memberCache.set(jid, { participants, at: Date.now() });
+        all[jid] = { ...all[jid], participants };
+        filled += 1;
+      }
+    } catch (err) {
+      logger.warn({ phone: s.phone, jid, err: err?.message }, 'group_members_fill_failed');
+    }
+    await new Promise((r) => setTimeout(r, MEMBERS_FILL.gapMs));
+  }
+  return { filled, missing: want.length };
 }
 
 // ---- Session health (2026-10-15) --------------------------------------------
@@ -2450,6 +2494,8 @@ app.get('/groups', async (req, res) => {
     const all = await s.sock.groupFetchAllParticipating();
     keepSendGroups(s, all);
     const includeParticipants = String(req.query.include || '').includes('participants');
+    // Groups handed over without members: asked for alone (fillMissingMembers).
+    const fill = includeParticipants ? await fillMissingMembers(s, all) : { filled: 0, missing: 0 };
     let totalWithParticipants = 0;
     let sampleParticipantId = null;
     // Digits-only form of the session phone for admin matching below.
@@ -2508,6 +2554,8 @@ app.get('/groups', async (req, res) => {
       ok: true,
       build: BRIDGE_BUILD,
       participantsIncluded: includeParticipants,
+      membersFilled: fill.filled,
+      membersStillMissing: Math.max(0, fill.missing - MEMBERS_FILL.perCall),
       totalGroups: groups.length,
       totalWithParticipants,
       sampleParticipantId,
