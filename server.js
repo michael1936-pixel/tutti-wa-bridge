@@ -61,9 +61,13 @@ const PAYMENT_PROOF_URL = process.env.PAYMENT_PROOF_WEBHOOK_URL
     ? WEBHOOK_URL.replace('whatsapp-private-reply-webhook', 'whatsapp-payment-proof-inbound')
     : '');
 const ISOLATED = String(process.env.BRIDGE_ISOLATION || 'on').toLowerCase() !== 'off';
-// Where the watchdog's actions are reported to the app. No such function
-// exists yet: unset (the default), they are logged only.
-const WATCHDOG_WEBHOOK_URL = process.env.WATCHDOG_WEBHOOK_URL || '';
+// Where the watchdog's actions are reported to the app: the whatsapp-bridge-watchdog
+// function (app logs + a push to the admins), found next to the private webhook as the
+// payment-proof one is; WATCHDOG_WEBHOOK_URL overrides.
+const WATCHDOG_WEBHOOK_URL = process.env.WATCHDOG_WEBHOOK_URL
+  || (WEBHOOK_URL.includes('whatsapp-private-reply-webhook')
+    ? WEBHOOK_URL.replace('whatsapp-private-reply-webhook', 'whatsapp-bridge-watchdog')
+    : '');
 
 const numEnv = (name, def) => {
   const v = Number(process.env[name]);
