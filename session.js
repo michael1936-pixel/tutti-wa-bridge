@@ -200,7 +200,7 @@ async function getCachedGroupMetadata(sock, jid) {
 // Surfaced via /diag and printed once on startup. Bump this string when you
 // redeploy a behavioral change so you can read the version straight from
 // Railway logs.
-const BRIDGE_BUILD = 'paced-backlog-2026-11-12';
+const BRIDGE_BUILD = 'fast-send-recover-2026-11-12';
 
 /** How old a held private message may be and still be passed on. */
 const OFFLINE_PRIVATE_MAX_AGE_MS = 30 * 60_000;
@@ -496,6 +496,18 @@ function retryCounterFor(s, phone) {
 async function sendAndCache(phone, jid, content, opts = {}) {
   const session = sessions.get(phone);
   if (!session?.sock) throw new Error('socket not ready');
+  // A send to a number that is not up, or that just showed a stuck sign, is
+  // refused AT ONCE (the server tries again in seconds) and a stuck socket is
+  // renewed now — not after the second timeout, and not after a send that hangs
+  // for minutes (12.11.2026: rides waited 2–3 minutes on 058-711-5623).
+  // Group posts only (the publishing queue tries them again); a private
+  // reply keeps its old way.
+  const toGroup = String(jid || '').endsWith('@g.us');
+  if (toGroup && session.status !== 'connected') throw new Error('session_missing: connecting');
+  if (toGroup && stuckSignOf(session.health)) {
+    renewStuckNow(session, 'send');
+    throw new Error('session_missing: renewing stuck socket');
+  }
   const sock = session.sock;
 
   const targetJid = preferredOutgoingJid(phone, jid);
@@ -866,6 +878,28 @@ function healthLogger(base, s) {
     },
   });
   return wrap(base);
+}
+
+/** One query timeout in the last minute: the number may be stuck. */
+function stuckSignOf(h, now = Date.now()) {
+  return !!h && (h.timeouts || []).some((t) => now - t <= STUCK_SOCKET.windowMs);
+}
+
+/**
+ * A send came to a number with a stuck sign: its socket is renewed at once
+ * (at most once a minute; the watchdog's own restart keeps its 5-minute gap).
+ */
+function renewStuckNow(s, why) {
+  const now = Date.now();
+  if (!s?.sock || now - (s.health?.sendRenewAt || 0) < 60_000) return;
+  s.health.sendRenewAt = now;
+  s.health.stuckRestartAt = now;
+  s.health.timeouts = [];
+  logger.warn({ phone: s.phone, why }, 'session_stuck_renew_on_send');
+  emitEvent('session_stuck_restart', { phone: s.phone, reason: `stuck_on_${why}` });
+  try { s.sock.end(new Error(`stuck: renewed on ${why}`)); } catch (err) {
+    logger.error({ phone: s.phone, err: err?.message }, 'session_stuck_renew_failed');
+  }
 }
 
 /** A stuck socket is ended at once — the usual reconnect builds a new one. */
