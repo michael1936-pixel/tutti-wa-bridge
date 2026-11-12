@@ -176,3 +176,22 @@ test('every route the bridge had is routed', () => {
     'POST /profile-pic', 'POST /reset', 'POST /reset-peer', 'POST /send', 'POST /send-reply', 'POST /session/:phone/logout',
   ].sort());
 });
+
+test('silence: a number that usually hears little is given the time of its own pace', () => {
+  const now = 1_000 * MIN;
+  const busy = num('B', { now, socketSince: now - 300 * MIN, lastAt: now - 1_000, perMin: 40 });
+  // ~3 messages in ten minutes (050-423-3449): ten or fifteen quiet minutes are ordinary for it
+  const slow15 = num('S', { now, socketSince: now - 300 * MIN, lastAt: now - 15 * MIN, perMin: 0.3 });
+  const v = silenceVerdict('S', [slow15, busy], now, SILENCE_DEFAULTS);
+  assert.equal(v.restart, false, JSON.stringify(v));
+  assert.equal(v.reason, 'quiet_for_its_pace');
+  assert.ok(v.needMs > 40 * MIN && v.needMs <= 60 * MIN, `needs ~50 quiet minutes, said ${Math.round(v.needMs / MIN)}`);
+  // …and an hour of nothing is silence for it too
+  const slow65 = num('S', { now, socketSince: now - 300 * MIN, lastAt: now - 65 * MIN, perMin: 0.3 });
+  assert.equal(silenceVerdict('S', [slow65, busy], now, SILENCE_DEFAULTS).restart, true);
+  // a busy number is still caught after the ten minutes
+  const deaf = num('A', { now, socketSince: now - 300 * MIN, lastAt: now - 11 * MIN, perMin: 30 });
+  const d = silenceVerdict('A', [deaf, busy], now, SILENCE_DEFAULTS);
+  assert.equal(d.restart, true, JSON.stringify(d));
+  assert.equal(d.needMs, SILENCE_DEFAULTS.silenceMs);
+});

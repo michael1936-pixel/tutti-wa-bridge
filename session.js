@@ -48,8 +48,13 @@ import makeWASocket, {
   makeCacheableSignalKeyStore,
   generateMessageIDV2,
   downloadMediaMessage,
+  DEFAULT_CONNECTION_CONFIG,
 } from 'baileys';
 import { makeRetryCounter } from './retryGuard.js';
+import { baileysPatched } from './baileysPatch.js';
+import {
+  parseMode, forgetAsker, makeRetryStats, guardLidLookup, makeBreather, breathingRepository, setInSlices, waitUntil,
+} from './retryMode.js';
 
 // The station's number must never show "מחובר/ת" to the drivers: the bridge is
 // a companion device, not a person at the phone (Michael, 2026-10-26: «כל מי
@@ -200,7 +205,7 @@ async function getCachedGroupMetadata(sock, jid) {
 // Surfaced via /diag and printed once on startup. Bump this string when you
 // redeploy a behavioral change so you can read the version straight from
 // Railway logs.
-const BRIDGE_BUILD = 'fast-send-recover-2026-11-12';
+const BRIDGE_BUILD = 'group-retry-root-2026-11-12';
 
 /** How old a held private message may be and still be passed on. */
 const OFFLINE_PRIVATE_MAX_AGE_MS = 30 * 60_000;
@@ -246,6 +251,75 @@ const baileysLogger = pino({ level: process.env.BAILEYS_LOG_LEVEL || 'warn' });
  *   failed             — terminal error before pairing succeeded
  */
 const sessions = new Map();
+
+// ---- The retry patch's switches and hooks (baileysPatch.js, retryMode.js) ------
+// server.js patches Baileys before any number's process loads it; here its
+// switches are set. Not patched (another Baileys version) -> every switch off,
+// Baileys as stock. The mode is read from /data/retry-mode.json (written by
+// POST /retry-mode), else BRIDGE_RETRY_MODE, else the default.
+const RETRY_PATCHED = baileysPatched();
+const RETRY_MODE_FILE = path.join(AUTH_ROOT, 'retry-mode.json');
+const STOCK_MODE = { keepGroupMemory: false, referenceStanza: false, phonesToParticipant: false };
+function storedRetryMode() {
+  try {
+    return parseMode(JSON.parse(fs.readFileSync(RETRY_MODE_FILE, 'utf8')));
+  } catch (_) {
+    return parseMode(process.env.BRIDGE_RETRY_MODE);
+  }
+}
+let retryMode = RETRY_PATCHED ? storedRetryMode() : { ...STOCK_MODE };
+// Members who ask again while nothing of theirs is in a group's memory (forgetAsker).
+const askerRepeats = new Map();
+// How many devices group posts carried the group's key to (measured by the patch).
+const groupKeys = { posts: 0, devices: 0, full: 0, loggedAt: 0 };
+globalThis.__bridgeRetry = {
+  ...retryMode,
+  forgetAsker: (a) => (retryMode.keepGroupMemory ? forgetAsker(a, { repeats: askerRepeats }) : false),
+  onGroupKeys: (jid, sent, devices) => {
+    groupKeys.posts += 1;
+    groupKeys.devices += sent;
+    const full = devices > 20 && sent >= devices * 0.8;
+    if (full) groupKeys.full += 1;
+    // A post that carried the key to a whole big group, said at most every 10 s.
+    if (full && Date.now() - groupKeys.loggedAt > 10_000) {
+      groupKeys.loggedAt = Date.now();
+      logger.info({ jid, sent, devices, total: { posts: groupKeys.posts, full: groupKeys.full } }, 'group_keys_sent_to_all');
+    }
+  },
+};
+
+// Once a minute, when anything was counted: resends by who asked (a phone, a
+// linked device) and how many of them WhatsApp rejected, LID questions spared,
+// group posts that carried the key to a whole group.
+setInterval(() => {
+  for (const s of sessions.values()) {
+    const resends = s.retryStats?.totals();
+    const sig = JSON.stringify([resends, s.lidStat, groupKeys.posts, groupKeys.full]);
+    if (sig === s.retryStatsSig) continue;
+    s.retryStatsSig = sig;
+    logger.info({
+      phone: s.phone, patched: RETRY_PATCHED, mode: retryMode, resends,
+      lid: s.lidStat ? { ...s.lidStat, remembered: s.lidNone?.size || 0 } : null,
+      groupKeys: { posts: groupKeys.posts, devices: groupKeys.devices, full: groupKeys.full },
+      breaths: s.breathe?.pauses?.() || 0,
+    }, 'retry_stats');
+  }
+}, 60_000).unref?.();
+
+/** Switch the patch's mode while running (worker.js <- server.js POST /retry-mode). */
+export function setRetryMode(raw) {
+  if (!RETRY_PATCHED) return { patched: false, mode: { ...STOCK_MODE } };
+  const next = parseMode(raw, retryMode);
+  const was = retryMode;
+  retryMode = next;
+  Object.assign(globalThis.__bridgeRetry, next);
+  // The counts of the mode before are said and started anew: each mode is read by its own numbers.
+  for (const s of sessions.values()) {
+    const counted = s.retryStats?.reset();
+    logger.warn({ phone: s.phone, was, now: next, counted }, 'retry_mode_changed');
+  }
+  return { patched: true, mode: { ...next } };
+}
 
 function authDirFor(phone) {
   return path.join(AUTH_ROOT, 'auth', phone);
@@ -469,8 +543,11 @@ function retryCounterFor(s, phone) {
   s.retrySkipped = {};
   let pending = {};
   let loggedAt = 0;
+  s.retryStats = s.retryStats || makeRetryStats();
   s.retryCounter = makeRetryCounter({
     ourMessage: (id) => outgoingCache.get(phone)?.get(id),
+    // A resend let through, by who asked — a phone or a linked device (retry_stats).
+    onAllow: (key) => { s.retryStats.resend(key); },
     onSkip: (why, kind) => {
       const k = `${kind}_${why}`;
       s.retrySkipped[k] = (s.retrySkipped[k] || 0) + 1;
@@ -496,18 +573,6 @@ function retryCounterFor(s, phone) {
 async function sendAndCache(phone, jid, content, opts = {}) {
   const session = sessions.get(phone);
   if (!session?.sock) throw new Error('socket not ready');
-  // A send to a number that is not up, or that just showed a stuck sign, is
-  // refused AT ONCE (the server tries again in seconds) and a stuck socket is
-  // renewed now — not after the second timeout, and not after a send that hangs
-  // for minutes (12.11.2026: rides waited 2–3 minutes on 058-711-5623).
-  // Group posts only (the publishing queue tries them again); a private
-  // reply keeps its old way.
-  const toGroup = String(jid || '').endsWith('@g.us');
-  if (toGroup && session.status !== 'connected') throw new Error('session_missing: connecting');
-  if (toGroup && stuckSignOf(session.health)) {
-    renewStuckNow(session, 'send');
-    throw new Error('session_missing: renewing stuck socket');
-  }
   const sock = session.sock;
 
   const targetJid = preferredOutgoingJid(phone, jid);
@@ -553,8 +618,11 @@ async function sendAndCache(phone, jid, content, opts = {}) {
     const typed = opts.noTyping === true ? sock : await typingBefore(sock, phone, targetJid, content?.text);
     if (!typed) throw new Error('socket not ready');
     sendSock = typed;
+    const sendStart = Date.now();
     const { finalId } = await trySend(messageId);
-    logger.info({ phone, jid: targetJid, msgId: finalId }, 'send_cached');
+    // How long the send itself took: a group post that carries the group's key
+    // to every device takes seconds; one to a group that holds it, a moment.
+    logger.info({ phone, jid: targetJid, msgId: finalId, ms: Date.now() - sendStart }, 'send_cached');
     return { ok: true, id: finalId, jid: targetJid };
   } catch (err) {
     const msg = String(err?.message || '');
@@ -648,7 +716,9 @@ function keysOf(keys, isLive, phone) {
         if (dropped === 1 || dropped % 50 === 0) logger.warn({ phone, dropped }, 'stale_socket_key_write_dropped');
         return;
       }
-      return keys.set(data);
+      // A big write (a group post that carried the key to a whole group) goes
+      // to the files in slices, so the number's loop breathes (retryMode.js).
+      return setInSlices(keys, data);
     },
     ...(typeof keys.clear === 'function' ? { clear: () => (isLive() ? keys.clear() : undefined) } : {}),
   };
@@ -770,12 +840,20 @@ const QUERY_TIMEOUT_MS = 15_000;
 // minGapMs 5 min (was 1 min, 2026-11-10): one restart re-syncs the number and
 // costs a lot of CPU — a number that stays stuck is restarted again only after
 // 5 minutes; the first restart is still immediate.
-const STUCK_SOCKET = { windowMs: 60_000, timeouts: 2, minGapMs: 5 * 60_000 };
+// quietMs (2026-11-12): two unanswered queries are a stuck socket only when
+// the number ALSO hears nothing. 058-711-5623 was restarted 13–26 times a day
+// for two unanswered LID questions while its groups' messages kept arriving —
+// and one such restart, in a busy hour, cost 20 minutes of feed (16:29).
+// floodTimeouts: that many unanswered queries in a minute are a broken socket
+// even when messages still arrive.
+const STUCK_SOCKET = { windowMs: 60_000, timeouts: 2, minGapMs: 5 * 60_000, quietMs: 45_000, floodTimeouts: 10 };
 const QUERY_TIMEOUT = /timed out waiting for message/;
 
-function stuckOf(h, status, now = Date.now()) {
+function stuckOf(h, status, now = Date.now(), heardAt = 0) {
   if (!h || status !== 'connected') return false;
   const recent = (h.timeouts || []).filter((t) => now - t <= STUCK_SOCKET.windowMs).length;
+  const hears = now - Math.max(heardAt || 0, h.since || 0) < STUCK_SOCKET.quietMs;
+  if (hears && recent < STUCK_SOCKET.floodTimeouts) return false; // it hears: not stuck
   return recent >= STUCK_SOCKET.timeouts && now - (h.stuckRestartAt || 0) > STUCK_SOCKET.minGapMs;
 }
 
@@ -861,8 +939,13 @@ function healthLogger(base, s) {
         return (...a) => {
           try {
             const msg = a.find((x) => typeof x === 'string') || '';
-            if (SESSION_HEALTH.trouble.test(msg)) noteTrouble(s, troubleIdOf(a));
-            if (QUERY_TIMEOUT.test(msg) && s.health) {
+            // WhatsApp rejected a stanza (479): counted to the resend it answers (retry_stats).
+            if (msg.includes('smax-invalid')) s.retryStats?.rejected(a.find((x) => x && typeof x === 'object')?.msgId);
+            // The 15-s timeout of a LID question the guard already gave up on (4 s).
+            const lidOnly = QUERY_TIMEOUT.test(msg) && (s.lidTimeoutsOpen || 0) > 0 && Date.now() - (s.lidTimeoutAt || 0) < 20_000;
+            if (lidOnly) s.lidTimeoutsOpen -= 1;
+            else if (SESSION_HEALTH.trouble.test(msg)) noteTrouble(s, troubleIdOf(a));
+            if (QUERY_TIMEOUT.test(msg) && s.health && !lidOnly) {
               const now = Date.now();
               s.health.timeouts = (s.health.timeouts || []).filter((t) => now - t <= STUCK_SOCKET.windowMs);
               s.health.timeouts.push(now);
@@ -880,31 +963,9 @@ function healthLogger(base, s) {
   return wrap(base);
 }
 
-/** One query timeout in the last minute: the number may be stuck. */
-function stuckSignOf(h, now = Date.now()) {
-  return !!h && (h.timeouts || []).some((t) => now - t <= STUCK_SOCKET.windowMs);
-}
-
-/**
- * A send came to a number with a stuck sign: its socket is renewed at once
- * (at most once a minute; the watchdog's own restart keeps its 5-minute gap).
- */
-function renewStuckNow(s, why) {
-  const now = Date.now();
-  if (!s?.sock || now - (s.health?.sendRenewAt || 0) < 60_000) return;
-  s.health.sendRenewAt = now;
-  s.health.stuckRestartAt = now;
-  s.health.timeouts = [];
-  logger.warn({ phone: s.phone, why }, 'session_stuck_renew_on_send');
-  emitEvent('session_stuck_restart', { phone: s.phone, reason: `stuck_on_${why}` });
-  try { s.sock.end(new Error(`stuck: renewed on ${why}`)); } catch (err) {
-    logger.error({ phone: s.phone, err: err?.message }, 'session_stuck_renew_failed');
-  }
-}
-
 /** A stuck socket is ended at once — the usual reconnect builds a new one. */
 function restartIfStuck(s) {
-  if (!s?.sock || !stuckOf(s.health, s.status)) return;
+  if (!s?.sock || !stuckOf(s.health, s.status, Date.now(), s.lastInboundEventAt)) return;
   s.health.stuckRestartAt = Date.now();
   logger.warn({ phone: s.phone, timeouts: s.health.timeouts.length }, 'session_stuck_restart');
   emitEvent('session_stuck_restart', { phone: s.phone, timeouts: s.health.timeouts.length });
@@ -1164,6 +1225,18 @@ async function buildSocket(s, phone, { forceReset } = {}) {
     keepAliveIntervalMs: 10_000,
     // The groups' members from one read, not one request per message (sendGroupMeta).
     cachedGroupMetadata: (jid) => sendGroupMeta(s, jid),
+    // A LID question WhatsApp did not answer is not asked again per message, and
+    // long runs of encryption let the number's loop breathe (retryMode.js). The
+    // memory and the line are the number's: a reconnect keeps them.
+    makeSignalRepository: (auth, lg, pnToLid) => breathingRepository(
+      DEFAULT_CONNECTION_CONFIG.makeSignalRepository(auth, lg, guardLidLookup(pnToLid, {
+        memory: (s.lidNone = s.lidNone || new Map()),
+        stat: (s.lidStat = s.lidStat || { asked: 0, spared: 0, empty: 0, timedOut: 0, failed: 0 }),
+        // Its own unanswered question is no sign of a stuck socket (healthLogger).
+        onTimeout: () => { s.lidTimeoutsOpen = Math.min(20, (s.lidTimeoutsOpen || 0) + 1); s.lidTimeoutAt = Date.now(); },
+      })),
+      (s.breathe = s.breathe || makeBreather()),
+    ),
     markOnlineOnConnect: false,
     syncFullHistory: false,
     // Allow history sync so that signal sessions/prekeys arrive promptly after
@@ -2082,7 +2155,12 @@ async function buildSocket(s, phone, { forceReset } = {}) {
           return;
         }
         // Exponential-ish backoff: 2s, 4s, 8s, 16s, 30s cap.
-        const delay = Math.min(30_000, 2_000 * Math.pow(2, Math.min(attempts - 1, 4)));
+        // The first try at once (was 2 s) when the socket that closed had been up
+        // for a while: a number that publishes is back in a second or two. A
+        // socket that closed right after it opened, and the tries after the
+        // first, back off as before.
+        const wasStable = Date.now() - (s.health?.since || 0) > 60_000;
+        const delay = attempts === 1 && wasStable ? 300 : Math.min(30_000, 2_000 * Math.pow(2, Math.min(attempts - 1, 4)));
         logger.warn({ phone, attempts, delayMs: delay, code, msg }, 'reconnect_scheduled');
         s.reconnectTimer = setTimeout(() => {
           s.reconnectTimer = null;
@@ -2267,6 +2345,11 @@ async function pair(phone, { forceReset } = {}) {
 // (2026-11-10: one stuck number had frozen every number, all in one process).
 // `app` is a small table, not express: runRoute() calls a handler with the
 // request's body/query/params and returns what it answered.
+/** How long a group post waits for a reconnecting number before it is refused. */
+// Well under the server's own 20-s wait for /send: a send it gave up on is
+// never tried again (it may have gone out), so the wait and the send together
+// must end before that.
+const SEND_READY_WAIT_MS = Number(process.env.SEND_READY_WAIT_MS || 8_000);
 const routeTable = new Map(); // 'POST /send' -> handler
 const app = {
   get: (p, h) => { routeTable.set(`GET ${p}`, h); },
@@ -2313,7 +2396,17 @@ app.post('/send', async (req, res) => {
   const { jid, text, session, noTyping } = req.body || {};
   const phone = String(session || '').replace(/\D/g, '');
   if (!phone || !jid || !text) return res.status(400).json({ error: 'jid, text, session required' });
-  const s = sessions.get(phone);
+  let s = sessions.get(phone);
+  // A group post that meets a reconnecting number waits for it (a reconnect
+  // is a second or two) and goes out the moment the socket is up; refused, it
+  // waited for the server's next try (Michael, 2026-11-12: no 15-second wait).
+  // A number that is logged out or was never started is refused at once, as before.
+  if (s && s.status === 'connecting' && String(jid).endsWith('@g.us')) {
+    const waitStart = Date.now();
+    const up = await waitUntil(() => sessions.get(phone)?.status === 'connected', { waitMs: SEND_READY_WAIT_MS });
+    logger.info({ phone, jid: String(jid), waitedMs: Date.now() - waitStart, up }, 'send_waited_for_socket');
+    s = sessions.get(phone);
+  }
   if (!s || s.status !== 'connected') {
     return res.status(409).json({ error: 'session_missing', status: s?.status ?? 'not_started' });
   }
@@ -2702,6 +2795,16 @@ export function snapshotOf(phone) {
     lastUpdate: s.lastUpdate,
     health: healthOf(s),
     retrySkipped: s.retrySkipped || {},
+    // The retry patch: is Baileys patched, the mode, resends and 479s by who asked,
+    // LID questions spared, group posts that carried the key to a whole group.
+    retry: {
+      patched: RETRY_PATCHED,
+      mode: { ...retryMode },
+      stats: s.retryStats?.totals() || null,
+      lid: s.lidStat ? { ...s.lidStat, remembered: s.lidNone?.size || 0 } : null,
+      groupKeys: { posts: groupKeys.posts, devices: groupKeys.devices, full: groupKeys.full },
+      breaths: s.breathe?.pauses?.() || 0,
+    },
     lidMappingCount,
     purpose: purposeOf(phone),
     inboundEvents: s.inboundEvents || 0,

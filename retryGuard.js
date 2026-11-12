@@ -54,10 +54,11 @@ export function retryKeyId(key) {
 /**
  * Baileys' msgRetryCounterCache for one number. `ourMessage(id)` is the sent
  * message ({ ts, group }) or nothing; `onSkip(why, kind, id)` is told of
- * every resend not made. A number keeps one counter across its sockets, so a
- * restart does not start the storm over.
+ * every resend not made, `onAllow(key, kind)` of every one let through. A
+ * number keeps one counter across its sockets, so a restart does not start
+ * the storm over.
  */
-export function makeRetryCounter({ ourMessage, onSkip, rules = RETRY_RULES, now = Date.now }) {
+export function makeRetryCounter({ ourMessage, onSkip, onAllow, rules = RETRY_RULES, now = Date.now }) {
   const counts = new Map(); // key -> { v, exp }
   const verdicts = new Map(); // key -> { verdict, exp }
   const recent = { group: [], private: [] }; // times of resends let through
@@ -77,8 +78,11 @@ export function makeRetryCounter({ ourMessage, onSkip, rules = RETRY_RULES, now 
     const kind = mine.group === false ? 'private' : 'group';
     recent[kind] = recent[kind].filter((x) => t - x < 60_000);
     const verdict = retryVerdict({ ageMs: t - Number(mine.ts), group: kind === 'group', recentCount: recent[kind].length }, rules);
-    if (verdict === 'ok') recent[kind].push(t);
-    else {
+    if (verdict === 'ok') {
+      recent[kind].push(t);
+      // Told once per resend let through (`key` = `${msgId}:${participant}`).
+      try { onAllow?.(key, kind); } catch (_) { /* a count never stops the answer */ }
+    } else {
       try { onSkip?.(verdict, kind, retryKeyId(key)); } catch (_) { /* a log line never stops the answer */ }
     }
     verdicts.set(key, { verdict, exp: t + VERDICT_MS });

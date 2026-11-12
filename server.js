@@ -46,6 +46,8 @@ import {
   heartbeatStale,
   SILENCE_DEFAULTS,
 } from './watchdog.js';
+import { applyBaileysPatch } from './baileysPatch.js';
+import { parseMode } from './retryMode.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -93,6 +95,17 @@ const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
 // Reporting a watchdog action: a log line always, and the app when configured.
 // ---------------------------------------------------------------------------
 let BRIDGE_BUILD = 'unknown';
+// What applyBaileysPatch said at boot: applied | already | mismatch | version | error.
+let RETRY_PATCH = { state: 'not_run' };
+// The retry patch's mode, kept for the numbers' processes (session.js reads it at start).
+const RETRY_MODE_FILE = path.join(process.env.AUTH_DIR || '/data', 'retry-mode.json');
+function storedRetryMode() {
+  try {
+    return parseMode(JSON.parse(fs.readFileSync(RETRY_MODE_FILE, 'utf8')));
+  } catch (_) {
+    return parseMode(process.env.BRIDGE_RETRY_MODE);
+  }
+}
 let BAILEYS_PKG_VERSION = 'unknown';
 
 async function reportWatchdog(event, fields = {}, level = 'warn') {
@@ -410,6 +423,7 @@ app.get('/diag', (_req, res) => {
       lastUpdate: s.lastUpdate ?? null,
       lidMappingCount: s.lidMappingCount ?? 0,
       retrySkipped: s.retrySkipped || {},
+      retry: s.retry || null,
     };
   });
   const now = Date.now();
@@ -427,6 +441,9 @@ app.get('/diag', (_req, res) => {
     uptimeSec: Math.round(process.uptime()),
     // Since 2026-11-10: a process per number, and the watchdog.
     isolation: ISOLATED ? 'process_per_number' : 'off',
+    // The retry patch (baileysPatch.js): its state at boot and the mode in force.
+    baileys_retry_patch: RETRY_PATCH.state,
+    retry_mode: storedRetryMode(),
     watchdog_webhook_configured: !!WATCHDOG_WEBHOOK_URL,
     event_loop_lag_ms: lastLagMs,
     workers: local ? [] : [...workers.values()].filter((w) => !w.removed).map((w) => ({
@@ -455,6 +472,31 @@ app.get('/status/:phone', (req, res) => {
     lastUpdate: s.lastUpdate,
     health: s.health,
   });
+});
+
+// The retry patch's mode, switched while running — no deploy, no reconnect
+// (retryMode.js). Body: { mode: 'keep,reference' } (exactly these switches on;
+// 'stock' = all off) or { reference: true } (one switch, the rest as they are).
+app.post('/retry-mode', async (req, res) => {
+  try {
+    const body = req.body || {};
+    const mode = typeof body.mode === 'string' ? parseMode(body.mode) : parseMode(body, storedRetryMode());
+    await fs.promises.writeFile(RETRY_MODE_FILE, JSON.stringify(mode), 'utf8');
+    const told = [];
+    if (local) {
+      local.setRetryMode(mode);
+      told.push('local');
+    } else {
+      for (const w of workers.values()) {
+        if (!w.child || w.state !== 'up' || w.removed) continue;
+        try { w.child.send({ t: 'retry_mode', mode }); told.push(w.phone); } catch (_) { /* it reads the file at its next start */ }
+      }
+    }
+    logger.warn({ mode, told }, 'retry_mode_set');
+    res.json({ ok: true, patch: RETRY_PATCH.state, mode, told });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e?.message || String(e) });
+  }
 });
 
 for (const route of ROUTES) {
@@ -671,6 +713,10 @@ async function restoreOnBoot() {
 }
 
 async function main() {
+  // Baileys' answer to a "send again" of a group post is patched before any
+  // number's process (or this one, isolation off) loads it (baileysPatch.js).
+  RETRY_PATCH = applyBaileysPatch(__dirname);
+  logger[RETRY_PATCH.state === 'applied' || RETRY_PATCH.state === 'already' ? 'info' : 'error'](RETRY_PATCH, 'baileys_retry_patch');
   if (!ISOLATED) {
     local = await import('./session.js');
     BRIDGE_BUILD = local.BRIDGE_BUILD;

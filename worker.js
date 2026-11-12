@@ -7,6 +7,7 @@
 // talks to server.js over the IPC channel only:
 //
 //   server → worker  { t: 'rpc', id, key, req }       one HTTP request
+//                    { t: 'retry_mode', mode }         the retry patch's switches
 //                    { t: 'restart_socket', reason }   the watchdog's restart
 //   worker → server  { t: 'ready', pid }               listening for rpc
 //                    { t: 'hb', at, lagMs, snap }      every 5 s (heartbeat)
@@ -23,6 +24,7 @@ import {
   runRoute,
   snapshotOf,
   restartSocket,
+  setRetryMode,
   restoreSession,
   loadPurposes,
   shutdownSessions,
@@ -71,6 +73,12 @@ process.on('message', async (m) => {
       result = { code: 500, body: { ok: false, error: e?.message || String(e) } };
     }
     send({ t: 'rpc_result', id: m.id, code: result.code, body: result.body, snap: snapshotOf(PHONE) });
+    return;
+  }
+  // The retry patch's mode, switched while running (server.js POST /retry-mode).
+  if (m.t === 'retry_mode') {
+    setRetryMode(m.mode);
+    send({ t: 'state', snap: snapshotOf(PHONE) });
     return;
   }
   if (m.t === 'restart_socket') {

@@ -189,6 +189,14 @@ export const SILENCE_DEFAULTS = {
   /** And this number must have heard this many in the hours before (a quiet number is no deaf number). */
   baselineMin: 30,
   baselineMs: 3 * 60 * 60_000,
+  /**
+   * A number is "silent" only after the time in which it usually hears this
+   * many messages (never less than silenceMs, never more than maxSilenceMs).
+   * 050-423-3449 hears 2-4 messages in ten minutes; ten quiet minutes are
+   * ordinary for it, and it was restarted 13-29 times a day (10-12.11.2026).
+   */
+  expectMin: 15,
+  maxSilenceMs: 60 * 60_000,
 };
 
 /**
@@ -196,8 +204,9 @@ export const SILENCE_DEFAULTS = {
  * { phone, snap, series }. Only a station's number (no purpose) that is
  * connected, has had its socket for silenceMs, heard nothing for silenceMs
  * and used to hear (baseline), while another connected station number heard
- * at least othersMin in the same window.
- * Returns { restart: boolean, reason, quietMs, othersHeard }.
+ * at least othersMin in the same window. How long "nothing" must last follows
+ * the number's own pace (expectMin).
+ * Returns { restart: boolean, reason, quietMs, othersHeard, needMs }.
  */
 export function silenceVerdict(phone, nums, now, cfg = SILENCE_DEFAULTS) {
   const me = nums.find((n) => n.phone === phone);
@@ -208,13 +217,19 @@ export function silenceVerdict(phone, nums, now, cfg = SILENCE_DEFAULTS) {
   if (quietMs < cfg.silenceMs) return { restart: false, reason: 'hearing', quietMs };
   const baseline = me.series ? me.series.between(now - cfg.baselineMs, now - cfg.silenceMs) : 0;
   if (baseline < cfg.baselineMin) return { restart: false, reason: 'quiet_number', quietMs, baseline };
+  // Its own pace: the quiet must last as long as it usually takes it to hear expectMin messages.
+  const spanMs = Math.max(60_000, Math.min(cfg.baselineMs, me.series.spanMs(now)) - cfg.silenceMs);
+  const needMs = cfg.expectMin
+    ? Math.min(cfg.maxSilenceMs || Infinity, Math.max(cfg.silenceMs, Math.round((cfg.expectMin * spanMs) / baseline)))
+    : cfg.silenceMs;
+  if (quietMs < needMs) return { restart: false, reason: 'quiet_for_its_pace', quietMs, baseline, needMs };
   let othersHeard = 0;
   for (const n of nums) {
     if (n.phone === phone || !n.snap || n.snap.status !== 'connected' || n.snap.purpose || !n.series) continue;
     othersHeard = Math.max(othersHeard, n.series.between(now - cfg.silenceMs, now));
   }
   if (othersHeard < cfg.othersMin) return { restart: false, reason: 'all_quiet', quietMs, othersHeard };
-  return { restart: true, reason: 'inbound_silence', quietMs, othersHeard, baseline };
+  return { restart: true, reason: 'inbound_silence', quietMs, othersHeard, baseline, needMs };
 }
 
 /** A number's process that has not reported for `timeoutMs` is wedged (its event loop does not run). */
