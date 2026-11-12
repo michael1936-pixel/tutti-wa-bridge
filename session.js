@@ -79,6 +79,28 @@ async function markOffline(sock, phone) {
 const PRESENCE_MIN_MS = 1_500;
 const PRESENCE_MAX_MS = 4_000;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// At most this many group messages on their way to the server at once, per
+// number (each number is its own process). The rest wait in line, in order.
+const GROUP_FORWARD_LIMIT = Number(process.env.GROUP_FORWARD_LIMIT || 8);
+const groupForwardQueue = [];
+let groupForwardBusy = 0;
+function groupForwardSlot(job) {
+  return new Promise((resolve) => {
+    const run = async () => {
+      groupForwardBusy++;
+      try { await job(); } catch { /* logged inside */ }
+      finally {
+        groupForwardBusy--;
+        const next = groupForwardQueue.shift();
+        if (next) next();
+        resolve();
+      }
+    };
+    if (groupForwardBusy < GROUP_FORWARD_LIMIT) run(); else groupForwardQueue.push(run);
+  });
+}
+
 function presenceDelayMs(text = '', rand = Math.random) {
   const len = Math.min(String(text ?? '').length, 300);
   const base = PRESENCE_MIN_MS + len * 7;
@@ -178,7 +200,7 @@ async function getCachedGroupMetadata(sock, jid) {
 // Surfaced via /diag and printed once on startup. Bump this string when you
 // redeploy a behavioral change so you can read the version straight from
 // Railway logs.
-const BRIDGE_BUILD = 'isolation-watchdog-2026-11-10';
+const BRIDGE_BUILD = 'paced-backlog-2026-11-12';
 
 /** How old a held private message may be and still be passed on. */
 const OFFLINE_PRIVATE_MAX_AGE_MS = 30 * 60_000;
@@ -1938,24 +1960,38 @@ async function buildSocket(s, phone, { forceReset } = {}) {
       bridge_sent_ms: Date.now(),
     };
 
-    try {
-      const resp = await fetch(GROUP_FEED_WEBHOOK_URL, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-region': 'eu-central-1',
-          ...(GROUP_FEED_WEBHOOK_SECRET ? { 'X-Webhook-Secret': GROUP_FEED_WEBHOOK_SECRET } : {}),
-        },
-        body: JSON.stringify(payload),
-      });
-      const respText = await resp.text().catch(() => '');
-      logger.info(
-        { phone, jid, msgId: m.key?.id, status: resp.status, body: respText.slice(0, 200) },
-        'group_feed_forward_result',
-      );
-    } catch (err) {
-      logger.error({ phone, jid, err: err?.message }, 'group_feed forward failed');
-    }
+    // A backlog after a reconnect (12.11.2026 16:50: ~3,000 held messages at
+    // once) sent every message to the server at the same moment and choked it
+    // (504 idle timeouts for 8 minutes). Now at most GROUP_FORWARD_LIMIT go at
+    // a time and the rest wait their turn — every message still goes, one call
+    // each; a 5xx or a network error is tried once more after a short pause.
+    await groupForwardSlot(async () => {
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        try {
+          if (attempt > 1) payload.bridge_sent_ms = Date.now();
+          const resp = await fetch(GROUP_FEED_WEBHOOK_URL, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'x-region': 'eu-central-1',
+              ...(GROUP_FEED_WEBHOOK_SECRET ? { 'X-Webhook-Secret': GROUP_FEED_WEBHOOK_SECRET } : {}),
+            },
+            body: JSON.stringify(payload),
+            signal: AbortSignal.timeout(60_000),
+          });
+          const respText = await resp.text().catch(() => '');
+          logger.info(
+            { phone, jid, msgId: m.key?.id, status: resp.status, body: respText.slice(0, 200), attempt, queued: groupForwardQueue.length },
+            'group_feed_forward_result',
+          );
+          if (resp.status < 500 || attempt === 2) return;
+        } catch (err) {
+          logger.error({ phone, jid, err: err?.message, attempt }, 'group_feed forward failed');
+          if (attempt === 2) return;
+        }
+        await new Promise((r) => setTimeout(r, 3_000));
+      }
+    });
   }
 
   sock.ev.on('connection.update', async (u) => {
