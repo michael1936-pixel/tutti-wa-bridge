@@ -87,7 +87,12 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // At most this many group messages on their way to the server at once, per
 // number (each number is its own process). The rest wait in line, in order.
-const GROUP_FORWARD_LIMIT = Number(process.env.GROUP_FORWARD_LIMIT || 8);
+// 8 was too few (13.11.2026, Friday noon): one number hears ~6 group messages a
+// second and a call to the server takes ~1–1.5 s, so the line only grew — posts
+// reached the app up to 35 minutes late. 64 at a time carries ~40 a second;
+// a backlog of thousands after a reconnect still goes in waves, not at once.
+const GROUP_FORWARD_LIMIT = Number(process.env.GROUP_FORWARD_LIMIT || 64);
+let groupForwardWarnAt = 0;
 const groupForwardQueue = [];
 let groupForwardBusy = 0;
 function groupForwardSlot(job) {
@@ -205,7 +210,7 @@ async function getCachedGroupMetadata(sock, jid) {
 // Surfaced via /diag and printed once on startup. Bump this string when you
 // redeploy a behavioral change so you can read the version straight from
 // Railway logs.
-const BRIDGE_BUILD = 'group-retry-root-2026-11-12';
+const BRIDGE_BUILD = 'forward-64-2026-11-14';
 
 /** How old a held private message may be and still be passed on. */
 const OFFLINE_PRIVATE_MAX_AGE_MS = 30 * 60_000;
@@ -2075,7 +2080,14 @@ async function buildSocket(s, phone, { forceReset } = {}) {
     await groupForwardSlot(async () => {
       for (let attempt = 1; attempt <= 2; attempt++) {
         try {
-          if (attempt > 1) payload.bridge_sent_ms = Date.now();
+          // Stamped when it really leaves (after its turn in the line), and the
+          // wait in the line said apart — the server's feed_timing shows both.
+          if (attempt === 1) payload.bridge_queue_ms = Date.now() - payload.bridge_sent_ms;
+          payload.bridge_sent_ms = Date.now();
+          if (groupForwardQueue.length > 200 && Date.now() - groupForwardWarnAt > 30_000) {
+            groupForwardWarnAt = Date.now();
+            logger.warn({ phone, queued: groupForwardQueue.length, busy: groupForwardBusy, limit: GROUP_FORWARD_LIMIT }, 'group_forward_backlog');
+          }
           const resp = await fetch(GROUP_FEED_WEBHOOK_URL, {
             method: 'POST',
             headers: {
