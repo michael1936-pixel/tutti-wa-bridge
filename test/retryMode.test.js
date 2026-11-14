@@ -269,7 +269,8 @@ test('breather: every job runs in the context it was handed over in (Baileys tra
   const second = als.run('B', () => breathe(async () => { seen.push(als.getStore()); await null; seen.push(als.getStore()); }));
   const third = breathe(async () => { seen.push(als.getStore()); });
   const fourth = als.run('A', () => breathe(async () => { seen.push(als.getStore()); }));
-  await new Promise((r) => setTimeout(r, 5));
+  // until the first job holds the lane (5 ms was not always enough on a busy machine)
+  for (let i = 0; i < 200 && !release; i++) await new Promise((r) => setTimeout(r, 5));
   release();
   await Promise.all([first, second, third, fourth]);
   assert.deepEqual(seen, ['A', 'B', 'B', undefined, 'A']);

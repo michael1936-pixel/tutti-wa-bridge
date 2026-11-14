@@ -210,7 +210,7 @@ async function getCachedGroupMetadata(sock, jid) {
 // Surfaced via /diag and printed once on startup. Bump this string when you
 // redeploy a behavioral change so you can read the version straight from
 // Railway logs.
-const BRIDGE_BUILD = 'quick-send-2026-11-14';
+const BRIDGE_BUILD = 'group-invite-2026-11-14';
 
 /** How old a held private message may be and still be passed on. */
 const OFFLINE_PRIVATE_MAX_AGE_MS = 30 * 60_000;
@@ -2614,6 +2614,40 @@ app.post('/profile-pic', async (req, res) => {
     res.json({ ok: true, url: url || null, attempts });
   } catch (e) {
     res.status(500).json({ ok: false, error: e?.message || String(e), attempts });
+  }
+});
+
+// A group's invite link, when this number is one of the group's admins —
+// WhatsApp hands the link to admins only, and it is the one way to open a
+// group from outside the app (the feed's "לקבוצה" button). Michael, 2026-11-14:
+// «לאט לאט שיתחברו עוד ועוד מספרים שהמערכת תאסוף קישורים». The server asks, a
+// few groups an hour for a number; nothing here loops over groups.
+// Not an admin (any more): a plain answer { code: null, reason: 'not_admin' }.
+const GROUP_INVITE_TIMEOUT_MS = 15_000;
+app.post('/group-invite', async (req, res) => {
+  const { session, jid } = req.body || {};
+  const phone = String(session || '').replace(/\D/g, '');
+  const group = String(jid || '');
+  if (!phone || !/^[0-9-]+@g\.us$/.test(group)) return res.status(400).json({ error: 'session and group jid required' });
+  const s = sessions.get(phone);
+  if (!s || s.status !== 'connected' || !s.sock) {
+    return res.status(409).json({ error: 'session_missing', status: s?.status ?? 'not_started' });
+  }
+  try {
+    const code = await Promise.race([
+      s.sock.groupInviteCode(group),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), GROUP_INVITE_TIMEOUT_MS)),
+    ]);
+    const clean = /^[A-Za-z0-9]{10,40}$/.test(String(code || '')) ? String(code) : null;
+    res.json({ ok: true, code: clean, url: clean ? `https://chat.whatsapp.com/${clean}` : null, ...(clean ? {} : { reason: 'no_code' }) });
+  } catch (e) {
+    const status = Number(e?.data ?? e?.output?.statusCode ?? 0);
+    const msg = e?.message || String(e);
+    if (status === 401 || status === 403 || /not-authorized|forbidden/i.test(msg)) {
+      return res.json({ ok: true, code: null, url: null, reason: 'not_admin' });
+    }
+    logger.warn({ phone, jid: group, err: msg, status }, 'group_invite_failed');
+    res.status(msg === 'timeout' ? 504 : 500).json({ ok: false, error: msg });
   }
 });
 

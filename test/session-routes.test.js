@@ -18,6 +18,15 @@ test('routes without a session answer 409 not_started, as before', async () => {
   assert.deepEqual(g, { code: 409, body: { error: 'session_missing', status: 'not_started' } });
 });
 
+test('a group\'s invite link: asked by number and group jid only, and never without a connected number', async () => {
+  const none = await session.runRoute('POST /group-invite', { body: { session: '972500000001' } });
+  assert.deepEqual(none, { code: 400, body: { error: 'session and group jid required' } });
+  const person = await session.runRoute('POST /group-invite', { body: { session: '972500000001', jid: '972500000009@s.whatsapp.net' } });
+  assert.equal(person.code, 400);
+  const off = await session.runRoute('POST /group-invite', { body: { session: '972500000001', jid: '120363000000000001@g.us' } });
+  assert.deepEqual(off, { code: 409, body: { error: 'session_missing', status: 'not_started' } });
+});
+
 test('missing fields answer the same 400', async () => {
   const out = await session.runRoute('POST /edit', { body: { session: '972500000001', jid: 'x' } });
   assert.deepEqual(out, { code: 400, body: { error: 'jid, id, text, session required' } });
