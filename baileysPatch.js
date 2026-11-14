@@ -50,6 +50,7 @@ export const PATCH_MARK = 'bridge-patch:group-retry';
 
 const RECV = 'lib/Socket/messages-recv.js';
 const SEND = 'lib/Socket/messages-send.js';
+const RETRY = 'lib/Utils/message-retry-manager.js';
 
 /** file → edits; `find` must match exactly once. */
 export const EDITS = {
@@ -79,6 +80,11 @@ export const EDITS = {
       ].join('\n'),
     },
     {
+      name: 'phone_request_without_the_second_wait',
+      find: /await delay\(2000\);/g,
+      put: `await delay(globalThis.__bridgeRetry?.placeholderDelayMs ?? 2000); /* ${PATCH_MARK} */`,
+    },
+    {
       name: 'resend_to_all_keeps_device_cache',
       find: /if \(sendToAll\) \{\s*msgRelayOpts\.useUserDevicesCache = false;\s*\}/g,
       put: [
@@ -87,6 +93,19 @@ export const EDITS = {
         '                    msgRelayOpts.useUserDevicesCache = !!(isJidGroup(remoteJid) && globalThis.__bridgeRetry?.keepGroupMemory);',
         '                }',
       ].join('\n'),
+    },
+  ],
+  // A message that does not decrypt is asked again from its sender, and — when
+  // the sender's copy has not come — from the number's own phone, which holds
+  // it readable. Baileys waits 3 s before it turns to the phone and 2 s more
+  // inside the request: 5 s on every message of a sender whose resends never
+  // arrive (14.11.2026: seven senders, bots, ALL of their posts exactly 5 s
+  // late — the "6-second" tail of the feed). Both waits are the bridge's to set.
+  [RETRY]: [
+    {
+      name: 'phone_asked_sooner',
+      find: /schedulePhoneRequest\(messageId, callback, delay = PHONE_REQUEST_DELAY\) \{/g,
+      put: `schedulePhoneRequest(messageId, callback, delay = (globalThis.__bridgeRetry?.phoneDelayMs ?? PHONE_REQUEST_DELAY)) { /* ${PATCH_MARK} */`,
     },
   ],
   [SEND]: [

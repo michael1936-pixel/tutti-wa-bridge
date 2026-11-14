@@ -210,7 +210,7 @@ async function getCachedGroupMetadata(sock, jid) {
 // Surfaced via /diag and printed once on startup. Bump this string when you
 // redeploy a behavioral change so you can read the version straight from
 // Railway logs.
-const BRIDGE_BUILD = 'forward-64-2026-11-14';
+const BRIDGE_BUILD = 'phone-asked-sooner-2026-11-14';
 
 /** How old a held private message may be and still be passed on. */
 const OFFLINE_PRIVATE_MAX_AGE_MS = 30 * 60_000;
@@ -277,8 +277,14 @@ let retryMode = RETRY_PATCHED ? storedRetryMode() : { ...STOCK_MODE };
 const askerRepeats = new Map();
 // How many devices group posts carried the group's key to (measured by the patch).
 const groupKeys = { posts: 0, devices: 0, full: 0, loggedAt: 0 };
+// How soon the number's own phone is asked for a message that did not decrypt
+// (Baileys: 3 s + 2 s; baileysPatch.js). The sender's own resend still comes
+// first when it is quick; a message that arrives twice is kept once by the server.
+const PHONE_DELAY_MS = Number(process.env.PHONE_REQUEST_DELAY_MS || 400);
+const PLACEHOLDER_DELAY_MS = Number(process.env.PLACEHOLDER_DELAY_MS || 100);
 globalThis.__bridgeRetry = {
   ...retryMode,
+  ...(RETRY_PATCHED ? { phoneDelayMs: PHONE_DELAY_MS, placeholderDelayMs: PLACEHOLDER_DELAY_MS } : {}),
   forgetAsker: (a) => (retryMode.keepGroupMemory ? forgetAsker(a, { repeats: askerRepeats }) : false),
   onGroupKeys: (jid, sent, devices) => {
     groupKeys.posts += 1;

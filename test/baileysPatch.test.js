@@ -13,6 +13,7 @@ const stock = (file) => {
 };
 const RECV = 'lib/Socket/messages-recv.js';
 const SEND = 'lib/Socket/messages-send.js';
+const RETRY = 'lib/Utils/message-retry-manager.js';
 
 test('the patch is for the Baileys that is installed', () => {
   assert.equal(JSON.parse(installed('package.json')).version, PATCH_VERSION);
@@ -21,7 +22,8 @@ test('the patch is for the Baileys that is installed', () => {
 test('every edit finds its place exactly once, and a second run changes nothing', () => {
   const r = patchAll(stock);
   assert.equal(r.state, 'applied', JSON.stringify(r));
-  assert.deepEqual(Object.keys(r.files).sort(), [RECV, SEND].sort());
+  assert.deepEqual(Object.keys(r.files).sort(), [RECV, SEND, RETRY].sort());
+  assert.equal(r.files[RETRY].split(PATCH_MARK).length - 1, EDITS[RETRY].length);
   assert.equal(r.files[RECV].split(PATCH_MARK).length - 1, EDITS[RECV].length);
   assert.equal(r.files[SEND].split(PATCH_MARK).length - 1, EDITS[SEND].length);
   assert.equal(patchAll((f) => r.files[f]).state, 'already');
@@ -161,4 +163,36 @@ test('send side: the participants node is left out of a retry only under referen
   const src = patchAll(stock).files[SEND];
   assert.ok(src.includes('if (participants.length && !(isRetryResend && globalThis.__bridgeRetry?.referenceStanza)) {'));
   assert.ok(src.includes('globalThis.__bridgeRetry?.onGroupKeys?.(destinationJid, senderKeyRecipients.length, devices.length)'));
+});
+
+test('a message that did not decrypt: the phone is asked after the bridge\'s wait, stock when none is set', async () => {
+  const files = patchAll(stock).files;
+  // the patched retry manager, loaded as a module of its own
+  const { writeFileSync, rmSync } = await import('node:fs');
+  const file = new URL('./.retry-manager.patched.tmp.mjs', import.meta.url);
+  writeFileSync(file, files[RETRY]);
+  try {
+    const { MessageRetryManager } = await import(file.href);
+    const logger = { debug() {}, info() {}, warn() {}, error() {}, trace() {} };
+    const m = new MessageRetryManager(logger, 5);
+    // the bridge's wait
+    globalThis.__bridgeRetry = { phoneDelayMs: 30 };
+    let at = -1;
+    let t = Date.now();
+    m.schedulePhoneRequest('M1', () => { at = Date.now() - t; });
+    await new Promise((r) => setTimeout(r, 150));
+    assert.ok(at >= 20 && at < 140, `asked after ${at} ms`);
+    // no wait set: Baileys' own 3 s
+    delete globalThis.__bridgeRetry;
+    let asked = false;
+    m.schedulePhoneRequest('M2', () => { asked = true; });
+    await new Promise((r) => setTimeout(r, 150));
+    assert.equal(asked, false, 'stock waits 3 s');
+    m.cancelPendingPhoneRequest('M2');
+  } finally {
+    delete globalThis.__bridgeRetry;
+    rmSync(file, { force: true });
+  }
+  assert.ok(files[RETRY].includes('delay = (globalThis.__bridgeRetry?.phoneDelayMs ?? PHONE_REQUEST_DELAY)'));
+  assert.ok(files[RECV].includes('await delay(globalThis.__bridgeRetry?.placeholderDelayMs ?? 2000);'));
 });
