@@ -53,7 +53,7 @@ import makeWASocket, {
 import { makeRetryCounter } from './retryGuard.js';
 import { baileysPatched } from './baileysPatch.js';
 import {
-  parseMode, forgetAsker, makeRetryStats, guardLidLookup, makeBreather, breathingRepository, setInSlices, waitUntil,
+  parseMode, forgetAsker, makeRetryStats, guardLidLookup, makeBreather, breathingRepository, setInSlices, waitUntil, makeTtlCache,
 } from './retryMode.js';
 
 // The station's number must never show "מחובר/ת" to the drivers: the bridge is
@@ -210,7 +210,7 @@ async function getCachedGroupMetadata(sock, jid) {
 // Surfaced via /diag and printed once on startup. Bump this string when you
 // redeploy a behavioral change so you can read the version straight from
 // Railway logs.
-const BRIDGE_BUILD = 'phone-asked-sooner-2026-11-14';
+const BRIDGE_BUILD = 'quick-send-2026-11-14';
 
 /** How old a held private message may be and still be passed on. */
 const OFFLINE_PRIVATE_MAX_AGE_MS = 30 * 60_000;
@@ -742,7 +742,11 @@ function keysOf(keys, isLive, phone) {
 // a week; Baileys' own FAQ names this). Now one request reads all the
 // number's groups (groupFetchAllParticipating), kept 10 minutes; a group whose
 // members or settings change is dropped at once, so Baileys asks for it alone.
-const SEND_GROUPS = { ttlMs: 10 * 60_000, fetchTimeoutMs: 15_000 };
+// staleMs (2026-11-14): a list older than 10 minutes is still used for the
+// send at hand while a new one is read behind it — the first post of a ride
+// no longer waits for the read of all the number's groups (sends took 0.7 s
+// in the middle and up to 5.5 s; Michael: «מרגיש שיש השהייה עד שזה יוצא»).
+const SEND_GROUPS = { ttlMs: 10 * 60_000, staleMs: 60 * 60_000, fetchTimeoutMs: 15_000 };
 
 function keepSendGroups(s, all) {
   s.sendGroups = { at: Date.now(), map: new Map(Object.entries(all || {})) };
@@ -759,10 +763,12 @@ async function sendGroupMeta(s, jid) {
       .catch((err) => logger.warn({ phone: s.phone, err: err?.message }, 'send_groups_fetch_failed'))
       .finally(() => { s.sendGroupsLoading = null; });
   }
+  // An older list serves this send; the new one is being read behind it.
+  if (c && Date.now() - c.at < SEND_GROUPS.staleMs) return c.map.get(jid);
   if (s.sendGroupsLoading) await s.sendGroupsLoading;
   // Not there, or the read failed and the list is old: Baileys asks for this group itself, as before.
   const k = s.sendGroups;
-  return k && Date.now() - k.at < SEND_GROUPS.ttlMs ? k.map.get(jid) : undefined;
+  return k && Date.now() - k.at < SEND_GROUPS.staleMs ? k.map.get(jid) : undefined;
 }
 
 function dropSendGroup(s, jid) {
@@ -1236,6 +1242,12 @@ async function buildSocket(s, phone, { forceReset } = {}) {
     keepAliveIntervalMs: 10_000,
     // The groups' members from one read, not one request per message (sendGroupMeta).
     cachedGroupMetadata: (jid) => sendGroupMeta(s, jid),
+    // Who holds which devices, kept an hour (Baileys: 5 minutes — so nearly
+    // every group post asked WhatsApp again for the devices of the whole
+    // group before it left). WhatsApp's own notices of a device added or
+    // removed keep the list right meanwhile, and a device that missed a key
+    // asks for the post again (baileysPatch.js). The number's, across sockets.
+    userDevicesCache: (s.devicesCache = s.devicesCache || makeTtlCache({ ttlMs: DEVICES_TTL_MS })),
     // A LID question WhatsApp did not answer is not asked again per message, and
     // long runs of encryption let the number's loop breathe (retryMode.js). The
     // memory and the line are the number's: a reconnect keeps them.
@@ -2363,6 +2375,8 @@ async function pair(phone, { forceReset } = {}) {
 // (2026-11-10: one stuck number had frozen every number, all in one process).
 // `app` is a small table, not express: runRoute() calls a handler with the
 // request's body/query/params and returns what it answered.
+/** How long the devices of a group's members are kept (retryMode.js makeTtlCache). */
+const DEVICES_TTL_MS = Number(process.env.DEVICES_TTL_MIN || 60) * 60_000;
 /** How long a group post waits for a reconnecting number before it is refused. */
 // Well under the server's own 20-s wait for /send: a send it gave up on is
 // never tried again (it may have gone out), so the wait and the send together

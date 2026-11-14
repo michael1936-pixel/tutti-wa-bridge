@@ -295,3 +295,23 @@ test('key files: a big write goes in slices with a breath between, a small one a
   for (const w of writes) for (const [cat, items] of Object.entries(w)) Object.assign((merged[cat] = merged[cat] || {}), items);
   assert.deepEqual(merged, big);
 });
+
+test('devices cache: kept for its time, many at once, a removal and a full clear', async () => {
+  const { makeTtlCache } = await import('../retryMode.js');
+  let t = 0;
+  const c = makeTtlCache({ ttlMs: 1_000, max: 5, now: () => t });
+  c.set('a', [{ user: 'a', device: 0 }]);
+  c.mset([{ key: 'b', value: [1] }, { key: 'c', value: [2] }]);
+  assert.deepEqual(c.get('a'), [{ user: 'a', device: 0 }]);
+  assert.deepEqual(c.mget(['a', 'b', 'zzz']), { a: [{ user: 'a', device: 0 }], b: [1] });
+  c.del('b');
+  assert.equal(c.get('b'), undefined);
+  t = 1_001;
+  assert.equal(c.get('a'), undefined, 'past its time');
+  assert.deepEqual(c.mget(['c']), {});
+  // never grows past its size
+  for (let i = 0; i < 20; i++) c.set(`k${i}`, i);
+  assert.ok(c.size() <= 5);
+  c.flushAll();
+  assert.equal(c.size(), 0);
+});

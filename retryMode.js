@@ -309,3 +309,36 @@ export async function waitUntil(ready, { waitMs = 20_000, stepMs = 150, now = Da
     await sleep(stepMs);
   }
 }
+
+// ---- A small cache with a time limit (Baileys' CacheStore) ------------------------
+/** get / set / del / flushAll, and mget / mset as Baileys asks for many users at once. */
+export function makeTtlCache({ ttlMs, max = 200_000, now = Date.now } = {}) {
+  const held = new Map(); // key -> { v, exp }
+  const live = (key, t) => {
+    const e = held.get(key);
+    if (!e) return undefined;
+    if (e.exp <= t) { held.delete(key); return undefined; }
+    return e.v;
+  };
+  const put = (key, value, t) => {
+    held.set(key, { v: value, exp: t + ttlMs });
+    if (held.size > max) {
+      for (const [k, e] of held) if (e.exp <= t) held.delete(k);
+      if (held.size > max) { let drop = held.size - Math.floor(max * 0.9); for (const k of held.keys()) { if (drop-- <= 0) break; held.delete(k); } }
+    }
+  };
+  return {
+    get: (key) => live(key, now()),
+    set: (key, value) => { put(key, value, now()); return true; },
+    del: (key) => { held.delete(key); },
+    flushAll: () => { held.clear(); },
+    mget: (keys) => {
+      const t = now();
+      const out = {};
+      for (const key of keys || []) { const v = live(key, t); if (v !== undefined) out[key] = v; }
+      return out;
+    },
+    mset: (entries) => { const t = now(); for (const { key, value } of entries || []) put(key, value, t); return true; },
+    size: () => held.size,
+  };
+}
