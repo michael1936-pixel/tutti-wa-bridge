@@ -51,6 +51,7 @@ import makeWASocket, {
   DEFAULT_CONNECTION_CONFIG,
 } from 'baileys';
 import { makeRetryCounter, parseGroupLimit, RETRY_RULES } from './retryGuard.js';
+import { quotedOf } from './quoted.js';
 import { baileysPatched } from './baileysPatch.js';
 import {
   parseMode, forgetAsker, forgetAskers, makeRefusedAskers, makeRetryStats, guardLidLookup, makeBreather, breathingRepository, setInSlices, waitUntil, makeTtlCache,
@@ -210,7 +211,7 @@ async function getCachedGroupMetadata(sock, jid) {
 // Surfaced via /diag and printed once on startup. Bump this string when you
 // redeploy a behavioral change so you can read the version straight from
 // Railway logs.
-const BRIDGE_BUILD = 'forget-refused-2026-11-15';
+const BRIDGE_BUILD = 'quote-any-shape-2026-11-15';
 
 /** How old a held private message may be and still be passed on. */
 const OFFLINE_PRIVATE_MAX_AGE_MS = 30 * 60_000;
@@ -1754,21 +1755,11 @@ async function buildSocket(s, phone, { forceReset } = {}) {
     // The message the driver quoted, if any. A private "ת" on a swipe-reply
     // of the ride's post names the ride without a code — the webhook reads
     // quoted_text to find it.
-    const quotedCtx =
-      msg.extendedTextMessage?.contextInfo ||
-      msg.imageMessage?.contextInfo ||
-      msg.videoMessage?.contextInfo ||
-      null;
-    const quotedMsg = quotedCtx?.quotedMessage || null;
-    const quotedText = quotedMsg
-      ? (quotedMsg.conversation ||
-         quotedMsg.extendedTextMessage?.text ||
-         quotedMsg.imageMessage?.caption ||
-         quotedMsg.videoMessage?.caption ||
-         null)
-      : null;
+    // Read from whatever shape his WhatsApp sent the quote in (quoted.js).
+    const quotedPost = quotedOf(msg);
+    const quotedText = quotedPost.text;
     const quoted = quotedText
-      ? { quoted_text: String(quotedText).slice(0, 4000), quoted_wa_message_id: quotedCtx?.stanzaId || null }
+      ? { quoted_text: String(quotedText).slice(0, 4000), quoted_wa_message_id: quotedPost.id }
       : {};
 
         // WhatsApp often returns @lid (linked-id) instead of @s.whatsapp.net.
@@ -2136,20 +2127,12 @@ async function buildSocket(s, phone, { forceReset } = {}) {
     // Quoted message (driver tags a ride post in the group with "ת"/"ת5"/etc.).
     // The Lovable edge function uses these fields to link the reply to a ride
     // and open a private DM with the driver — same flow as a wa.me click.
-    const ctx =
-      m.message?.extendedTextMessage?.contextInfo ||
-      m.message?.imageMessage?.contextInfo ||
-      m.message?.videoMessage?.contextInfo ||
-      null;
-    const quotedMsg = ctx?.quotedMessage || null;
-    const quoted_text = quotedMsg
-      ? (quotedMsg.conversation ||
-         quotedMsg.extendedTextMessage?.text ||
-         quotedMsg.imageMessage?.caption ||
-         quotedMsg.videoMessage?.caption ||
-         null)
-      : null;
-    const quoted_wa_message_id = ctx?.stanzaId || null;
+    // Read from whatever shape his WhatsApp sent the quote in (quoted.js): the
+    // id goes on even when the quoted post's words cannot be read — the server
+    // then knows he answered a post, and whose (2026-11-15).
+    const quotedPost = quotedOf(m.message);
+    const quoted_text = quotedPost.text ? String(quotedPost.text).slice(0, 4000) : null;
+    const quoted_wa_message_id = quotedPost.id;
 
     const payload = {
       station_phone: phone, // session phone = end-user's phone
