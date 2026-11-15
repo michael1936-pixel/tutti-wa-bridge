@@ -54,7 +54,7 @@ import { makeRetryCounter, parseGroupLimit, RETRY_RULES } from './retryGuard.js'
 import { quotedOf } from './quoted.js';
 import { baileysPatched } from './baileysPatch.js';
 import {
-  parseMode, forgetAsker, forgetAskers, makeRefusedAskers, makeRetryStats, guardLidLookup, makeBreather, breathingRepository, setInSlices, waitUntil, makeTtlCache,
+  parseMode, forgetAsker, forgetAskers, makeRefusedAskers, makeUndecryptable, makeRetryStats, guardLidLookup, makeBreather, breathingRepository, setInSlices, waitUntil, makeTtlCache,
 } from './retryMode.js';
 
 // The station's number must never show "מחובר/ת" to the drivers: the bridge is
@@ -211,7 +211,7 @@ async function getCachedGroupMetadata(sock, jid) {
 // Surfaced via /diag and printed once on startup. Bump this string when you
 // redeploy a behavioral change so you can read the version straight from
 // Railway logs.
-const BRIDGE_BUILD = 'quote-any-shape-2026-11-15';
+const BRIDGE_BUILD = 'stop-decrypt-loops-2026-11-15';
 
 /** How old a held private message may be and still be passed on. */
 const OFFLINE_PRIVATE_MAX_AGE_MS = 30 * 60_000;
@@ -297,6 +297,20 @@ function storedForgetRefused() {
   }
 }
 let forgetRefused = storedForgetRefused();
+// A message that failed to decrypt five times is acknowledged and no longer asked
+// for (baileysPatch.js). On unless retry-mode.json says `stopLoops: false`.
+function storedStopLoops() {
+  try {
+    return JSON.parse(fs.readFileSync(RETRY_MODE_FILE, 'utf8')).stopLoops !== false;
+  } catch (_) {
+    return true;
+  }
+}
+let stopLoops = storedStopLoops();
+const undecryptable = makeUndecryptable();
+// How long the one lock of incoming messages waits after each "send again"
+// (Baileys: 250 ms — a quarter of a second in which no other message is read).
+const RETRY_REQUEST_DELAY_MS = Number(process.env.RETRY_REQUEST_DELAY_MS || 50);
 const REFUSED_FLUSH_MS = 1_500;
 async function flushRefusedAskers(s) {
   if (!s.refusedAskers?.size || s.refusedFlushing) return;
@@ -339,6 +353,7 @@ globalThis.__bridgeRetry = {
   ...retryMode,
   ...(RETRY_PATCHED ? { phoneDelayMs: PHONE_DELAY_MS, placeholderDelayMs: PLACEHOLDER_DELAY_MS } : {}),
   forgetAsker: (a) => (retryMode.keepGroupMemory ? forgetAsker(a, { repeats: askerRepeats }) : false),
+  undecryptable: (id) => (stopLoops ? undecryptable.failed(id) : false),
   onGroupKeys: (jid, sent, devices) => {
     groupKeys.posts += 1;
     groupKeys.devices += sent;
@@ -358,12 +373,13 @@ globalThis.__bridgeRetry = {
 setInterval(() => {
   for (const s of sessions.values()) {
     const resends = s.retryStats?.totals();
-    const sig = JSON.stringify([resends, s.lidStat, groupKeys.posts, groupKeys.full, s.refusedStat]);
+    const sig = JSON.stringify([resends, s.lidStat, groupKeys.posts, groupKeys.full, s.refusedStat, undecryptable.totals()]);
     if (sig === s.retryStatsSig) continue;
     s.retryStatsSig = sig;
     logger.info({
       phone: s.phone, patched: RETRY_PATCHED, mode: retryMode, resends,
       refused: s.refusedStat ? { ...s.refusedStat, on: forgetRefused } : null,
+      undecryptable: { ...undecryptable.totals(), on: stopLoops },
       lid: s.lidStat ? { ...s.lidStat, remembered: s.lidNone?.size || 0 } : null,
       groupKeys: { posts: groupKeys.posts, devices: groupKeys.devices, full: groupKeys.full },
       breaths: s.breathe?.pauses?.() || 0,
@@ -392,6 +408,15 @@ export function setRetryLimit(raw) {
   retryRules.group.perMinute = parseGroupLimit(raw, was);
   if (was !== retryRules.group.perMinute) logger.warn({ was, now: retryRules.group.perMinute }, 'retry_limit_changed');
   return retryRules.group.perMinute;
+}
+
+/** Turn the stop of never-decrypting messages on or off while running (POST /retry-mode). */
+export function setStopLoops(v) {
+  if (typeof v === 'boolean' && v !== stopLoops) {
+    logger.warn({ was: stopLoops, now: v }, 'retry_stop_loops_changed');
+    stopLoops = v;
+  }
+  return stopLoops;
 }
 
 /** Turn the forgetting of refused askers on or off while running (POST /retry-mode). */
@@ -1353,6 +1378,7 @@ async function buildSocket(s, phone, { forceReset } = {}) {
     // number (2026-10-28) — a resend of ours that is old, or one too many in a
     // minute, is answered "sent too many times" (retryGuard.js).
     msgRetryCounterCache: retryCounterFor(s, phone),
+    retryRequestDelayMs: RETRY_REQUEST_DELAY_MS,
     // Critical: when WA asks us to resend (retry receipt), supply the
     // original message content. Without this the recipient sees
     // "Waiting for this message. This may take a while."
@@ -2932,6 +2958,7 @@ export function snapshotOf(phone) {
       mode: { ...retryMode },
       groupPerMinute: retryRules.group.perMinute,
       refused: s.refusedStat ? { ...s.refusedStat, on: forgetRefused } : null,
+      undecryptable: { ...undecryptable.totals(), on: stopLoops },
       stats: s.retryStats?.totals() || null,
       lid: s.lidStat ? { ...s.lidStat, remembered: s.lidNone?.size || 0 } : null,
       groupKeys: { posts: groupKeys.posts, devices: groupKeys.devices, full: groupKeys.full },

@@ -165,6 +165,37 @@ export async function forgetAskers({ keys, group, participants, lidMapping, txKe
   return typeof keys.transaction === 'function' && txKey ? keys.transaction(work, txKey) : work();
 }
 
+// ---- A message that never decrypts is not asked for without end ---------------
+/**
+ * `failed(id)` — the message failed to decrypt once more. -> true when it has
+ * already been asked for `max` times: the patch then acknowledges it and stops
+ * (baileysPatch.js undecryptable_is_not_asked_forever). Kept `ttlMs` per message.
+ */
+export function makeUndecryptable({ max = 5, ttlMs = 60 * 60_000, cap = 5_000, now = Date.now } = {}) {
+  const seen = new Map(); // id -> { n, t }
+  const stat = { messages: 0, stopped: 0 };
+  return {
+    failed(id) {
+      if (!id) return false;
+      const t = now();
+      let e = seen.get(id);
+      if (!e || t - e.t > ttlMs) {
+        e = { n: 0, t };
+        seen.delete(id);
+        seen.set(id, e);
+        // The oldest go first (a Map keeps the order they were put in).
+        while (seen.size > cap) seen.delete(seen.keys().next().value);
+      }
+      e.n += 1;
+      if (e.n <= max) return false;
+      if (e.n === max + 1) stat.messages += 1;
+      stat.stopped += 1;
+      return true;
+    },
+    totals: () => ({ ...stat }),
+  };
+}
+
 // ---- Resends and WhatsApp's rejections, counted by who asked -------------------
 /**
  * `resend(key)` — a resend let through for `${msgId}:${participant}`;

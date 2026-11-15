@@ -27,6 +27,7 @@ import {
   setRetryMode,
   setRetryLimit,
   setForgetRefused,
+  setStopLoops,
   restoreSession,
   loadPurposes,
   shutdownSessions,
@@ -82,6 +83,7 @@ process.on('message', async (m) => {
     setRetryMode(m.mode);
     if (m.groupPerMinute != null) setRetryLimit(m.groupPerMinute);
     if (typeof m.forgetRefused === 'boolean') setForgetRefused(m.forgetRefused);
+    if (typeof m.stopLoops === 'boolean') setStopLoops(m.stopLoops);
     send({ t: 'state', snap: snapshotOf(PHONE) });
     return;
   }

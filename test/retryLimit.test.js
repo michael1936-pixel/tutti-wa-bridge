@@ -41,8 +41,8 @@ test('group limit: it rides with the mode and never changes it', () => {
   assert.deepEqual(parseMode({ groupPerMinute: 120 }, { keepGroupMemory: true, referenceStanza: true, phonesToParticipant: false }),
     { keepGroupMemory: true, referenceStanza: true, phonesToParticipant: false });
   const server = readFileSync(new URL('../server.js', import.meta.url), 'utf8');
-  assert.ok(server.includes("JSON.stringify({ ...mode, groupPerMinute, forgetRefused })"));
-  assert.ok(server.includes("w.child.send({ t: 'retry_mode', mode, groupPerMinute, forgetRefused })"));
+  assert.ok(server.includes("JSON.stringify({ ...mode, groupPerMinute, forgetRefused, stopLoops })"));
+  assert.ok(server.includes("w.child.send({ t: 'retry_mode', mode, groupPerMinute, forgetRefused, stopLoops })"));
   const session = readFileSync(new URL('../session.js', import.meta.url), 'utf8');
   assert.ok(session.includes('rules: retryRules,'));
   const worker = readFileSync(new URL('../worker.js', import.meta.url), 'utf8');

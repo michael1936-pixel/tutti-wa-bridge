@@ -94,6 +94,29 @@ export const EDITS = {
         '                }',
       ].join('\n'),
     },
+    // 15.11.2026, the feed's tail (messages 10–90 s late, minutes at a time): a
+    // message that does not decrypt is asked for again inside the ONE lock every
+    // incoming message of the number passes through, with a 250 ms wait, and then
+    // answered with an error (nack 500) — so it comes again. After five times
+    // Baileys ERASES its count (markRetryFailed) and starts over: two bots' posts
+    // went round every 0.6 s, 200–800 times each, and every other message waited
+    // behind them. The bridge counts by itself (retryMode.js makeUndecryptable):
+    // from the sixth failure the message is acknowledged plainly and left to the
+    // number's own phone — no request, no wait, no error.
+    {
+      name: 'undecryptable_is_not_asked_forever',
+      find: /const encNode = getBinaryNodeChild\(node, 'enc'\);\s*await sendRetryRequest\(node, !encNode\);/g,
+      put: [
+        `/* ${PATCH_MARK} */`,
+        '                                if (globalThis.__bridgeRetry?.undecryptable?.(msg.key?.id)) {',
+        '                                    acked = true;',
+        '                                    await sendMessageAck(node);',
+        '                                    return;',
+        '                                }',
+        "                                const encNode = getBinaryNodeChild(node, 'enc');",
+        '                                await sendRetryRequest(node, !encNode);',
+      ].join('\n'),
+    },
   ],
   // A message that does not decrypt is asked again from its sender, and — when
   // the sender's copy has not come — from the number's own phone, which holds
