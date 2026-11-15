@@ -99,6 +99,72 @@ export async function forgetAsker({ keys, group, participant, lidMapping }, { re
   return true;
 }
 
+// ---- Members REFUSED a resend still get the key with the next post -------------
+// 2026-11-15, "בהמתנה להודעה זו" on members' phones, post after post: a resend
+// refused by the limit (retryGuard.js — too many a minute, too old) ended in
+// Baileys before anything was forgotten, so the group's memory went on saying
+// the member holds the key. He did not: every later post failed on his phone
+// too, he asked again, and was refused again — 12,000 refusals in 18 minutes
+// on 17 posts. A refused asker is forgotten like an answered one: he misses
+// the post he asked for, and the next post carries the key to him.
+
+/** The refused askers gathered between two writes: group -> the devices that asked. */
+export function makeRefusedAskers({ maxPerGroup = 3_000 } = {}) {
+  let groups = new Map();
+  return {
+    note(group, participant) {
+      if (!group || !participant) return;
+      let set = groups.get(group);
+      if (!set) groups.set(group, (set = new Set()));
+      if (set.size < maxPerGroup) set.add(String(participant));
+    },
+    /** What was gathered; the gathering starts anew. */
+    take() {
+      const out = groups;
+      groups = new Map();
+      return out;
+    },
+    get size() { return groups.size; },
+  };
+}
+
+/**
+ * Forget that these askers hold the group's key — all the devices of each,
+ * nobody else. One read and one write of the group's memory, inside the key
+ * store's transaction of the number (`txKey`: the one a post is sent under), so
+ * a post going out at that moment neither undoes it nor is changed half-way.
+ * WhatsApp is asked nothing: an asker's LID is turned into his number only
+ * from what the store already knows. -> how many remembered devices were forgotten.
+ */
+export async function forgetAskers({ keys, group, participants, lidMapping, txKey }) {
+  if (!keys || !group || !participants?.length) return 0;
+  const users = new Set();
+  await Promise.all(participants.map(async (p) => {
+    const user = userOf(p);
+    if (!user) return;
+    users.add(user);
+    if (!isLid(p)) return;
+    try {
+      const alt = await capped(lidMapping?.getPNForLID?.(p), 1_500);
+      if (alt) users.add(userOf(alt));
+    } catch (_) { /* his number is not known — his LID is forgotten */ }
+  }));
+  if (!users.size) return 0;
+  const work = async () => {
+    const mem = (await keys.get('sender-key-memory', [group]))?.[group];
+    if (!mem || typeof mem !== 'object') return 0;
+    const next = {};
+    let dropped = 0;
+    for (const [jid, held] of Object.entries(mem)) {
+      if (users.has(userOf(jid))) dropped += 1;
+      else next[jid] = held;
+    }
+    if (dropped) await keys.set({ 'sender-key-memory': { [group]: next } });
+    return dropped;
+  };
+  return typeof keys.transaction === 'function' && txKey ? keys.transaction(work, txKey) : work();
+}
+
 // ---- Resends and WhatsApp's rejections, counted by who asked -------------------
 /**
  * `resend(key)` — a resend let through for `${msgId}:${participant}`;

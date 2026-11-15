@@ -70,7 +70,7 @@ export function retryKeyId(key) {
 
 /**
  * Baileys' msgRetryCounterCache for one number. `ourMessage(id)` is the sent
- * message ({ ts, group }) or nothing; `onSkip(why, kind, id)` is told of
+ * message ({ ts, group }) or nothing; `onSkip(why, kind, id, key)` is told of
  * every resend not made, `onAllow(key, kind)` of every one let through. A
  * number keeps one counter across its sockets, so a restart does not start
  * the storm over.
@@ -100,7 +100,7 @@ export function makeRetryCounter({ ourMessage, onSkip, onAllow, rules = RETRY_RU
       // Told once per resend let through (`key` = `${msgId}:${participant}`).
       try { onAllow?.(key, kind); } catch (_) { /* a count never stops the answer */ }
     } else {
-      try { onSkip?.(verdict, kind, retryKeyId(key)); } catch (_) { /* a log line never stops the answer */ }
+      try { onSkip?.(verdict, kind, retryKeyId(key), key); } catch (_) { /* a log line never stops the answer */ }
     }
     verdicts.set(key, { verdict, exp: t + VERDICT_MS });
     return verdict;

@@ -26,6 +26,7 @@ import {
   restartSocket,
   setRetryMode,
   setRetryLimit,
+  setForgetRefused,
   restoreSession,
   loadPurposes,
   shutdownSessions,
@@ -80,6 +81,7 @@ process.on('message', async (m) => {
   if (m.t === 'retry_mode') {
     setRetryMode(m.mode);
     if (m.groupPerMinute != null) setRetryLimit(m.groupPerMinute);
+    if (typeof m.forgetRefused === 'boolean') setForgetRefused(m.forgetRefused);
     send({ t: 'state', snap: snapshotOf(PHONE) });
     return;
   }

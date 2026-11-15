@@ -115,6 +115,14 @@ function storedGroupLimit() {
     return parseGroupLimit(process.env.BRIDGE_RETRY_GROUP_PER_MINUTE);
   }
 }
+/** Whether refused askers are forgotten (session.js); on unless the file says false. */
+function storedForgetRefused() {
+  try {
+    return JSON.parse(fs.readFileSync(RETRY_MODE_FILE, 'utf8')).forgetRefused !== false;
+  } catch (_) {
+    return true;
+  }
+}
 let BAILEYS_PKG_VERSION = 'unknown';
 
 async function reportWatchdog(event, fields = {}, level = 'warn') {
@@ -454,6 +462,7 @@ app.get('/diag', (_req, res) => {
     baileys_retry_patch: RETRY_PATCH.state,
     retry_mode: storedRetryMode(),
     retry_group_per_minute: storedGroupLimit(),
+    retry_forget_refused: storedForgetRefused(),
     watchdog_webhook_configured: !!WATCHDOG_WEBHOOK_URL,
     event_loop_lag_ms: lastLagMs,
     workers: local ? [] : [...workers.values()].filter((w) => !w.removed).map((w) => ({
@@ -493,20 +502,22 @@ app.post('/retry-mode', async (req, res) => {
     const mode = typeof body.mode === 'string' ? parseMode(body.mode) : parseMode(body, storedRetryMode());
     // The group limit rides with the mode: given -> set; not given -> kept as it was.
     const groupPerMinute = parseGroupLimit(body.groupPerMinute, storedGroupLimit());
-    await fs.promises.writeFile(RETRY_MODE_FILE, JSON.stringify({ ...mode, groupPerMinute }), 'utf8');
+    const forgetRefused = typeof body.forgetRefused === 'boolean' ? body.forgetRefused : storedForgetRefused();
+    await fs.promises.writeFile(RETRY_MODE_FILE, JSON.stringify({ ...mode, groupPerMinute, forgetRefused }), 'utf8');
     const told = [];
     if (local) {
       local.setRetryMode(mode);
       local.setRetryLimit(groupPerMinute);
+      local.setForgetRefused(forgetRefused);
       told.push('local');
     } else {
       for (const w of workers.values()) {
         if (!w.child || w.state !== 'up' || w.removed) continue;
-        try { w.child.send({ t: 'retry_mode', mode, groupPerMinute }); told.push(w.phone); } catch (_) { /* it reads the file at its next start */ }
+        try { w.child.send({ t: 'retry_mode', mode, groupPerMinute, forgetRefused }); told.push(w.phone); } catch (_) { /* it reads the file at its next start */ }
       }
     }
-    logger.warn({ mode, groupPerMinute, told }, 'retry_mode_set');
-    res.json({ ok: true, patch: RETRY_PATCH.state, mode, groupPerMinute, told });
+    logger.warn({ mode, groupPerMinute, forgetRefused, told }, 'retry_mode_set');
+    res.json({ ok: true, patch: RETRY_PATCH.state, mode, groupPerMinute, forgetRefused, told });
   } catch (e) {
     res.status(500).json({ ok: false, error: e?.message || String(e) });
   }

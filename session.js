@@ -53,7 +53,7 @@ import makeWASocket, {
 import { makeRetryCounter, parseGroupLimit, RETRY_RULES } from './retryGuard.js';
 import { baileysPatched } from './baileysPatch.js';
 import {
-  parseMode, forgetAsker, makeRetryStats, guardLidLookup, makeBreather, breathingRepository, setInSlices, waitUntil, makeTtlCache,
+  parseMode, forgetAsker, forgetAskers, makeRefusedAskers, makeRetryStats, guardLidLookup, makeBreather, breathingRepository, setInSlices, waitUntil, makeTtlCache,
 } from './retryMode.js';
 
 // The station's number must never show "מחובר/ת" to the drivers: the bridge is
@@ -210,7 +210,7 @@ async function getCachedGroupMetadata(sock, jid) {
 // Surfaced via /diag and printed once on startup. Bump this string when you
 // redeploy a behavioral change so you can read the version straight from
 // Railway logs.
-const BRIDGE_BUILD = 'retry-limit-live-2026-11-15';
+const BRIDGE_BUILD = 'forget-refused-2026-11-15';
 
 /** How old a held private message may be and still be passed on. */
 const OFFLINE_PRIVATE_MAX_AGE_MS = 30 * 60_000;
@@ -286,6 +286,45 @@ const retryRules = {
   group: { ...RETRY_RULES.group, perMinute: storedGroupLimit() },
   private: { ...RETRY_RULES.private },
 };
+// A member refused a resend is still forgotten, so the next post carries him the
+// key (retryMode.js forgetAskers). On unless retry-mode.json says `forgetRefused: false`.
+function storedForgetRefused() {
+  try {
+    return JSON.parse(fs.readFileSync(RETRY_MODE_FILE, 'utf8')).forgetRefused !== false;
+  } catch (_) {
+    return true;
+  }
+}
+let forgetRefused = storedForgetRefused();
+const REFUSED_FLUSH_MS = 1_500;
+async function flushRefusedAskers(s) {
+  if (!s.refusedAskers?.size || s.refusedFlushing) return;
+  const sock = s.sock;
+  const keys = sock?.authState?.keys;
+  if (!keys) return; // no socket now: kept for the next round
+  s.refusedFlushing = true;
+  const batch = s.refusedAskers.take();
+  try {
+    for (const [group, askers] of batch) {
+      const dropped = await forgetAskers({
+        keys, group, participants: [...askers],
+        lidMapping: sock.signalRepository?.lidMapping,
+        txKey: sock.authState?.creds?.me?.id,
+      });
+      s.refusedStat.asked += askers.size;
+      s.refusedStat.forgotten += dropped;
+    }
+  } catch (e) {
+    logger.warn({ phone: s.phone, err: e?.message || String(e) }, 'refused_askers_forget_failed');
+  } finally {
+    s.refusedFlushing = false;
+  }
+}
+// Started here, outside any key-store transaction: a timer set while a message is
+// handled would carry that transaction's context into the write.
+setInterval(() => {
+  for (const s of sessions.values()) void flushRefusedAskers(s);
+}, REFUSED_FLUSH_MS).unref?.();
 // Members who ask again while nothing of theirs is in a group's memory (forgetAsker).
 const askerRepeats = new Map();
 // How many devices group posts carried the group's key to (measured by the patch).
@@ -318,11 +357,12 @@ globalThis.__bridgeRetry = {
 setInterval(() => {
   for (const s of sessions.values()) {
     const resends = s.retryStats?.totals();
-    const sig = JSON.stringify([resends, s.lidStat, groupKeys.posts, groupKeys.full]);
+    const sig = JSON.stringify([resends, s.lidStat, groupKeys.posts, groupKeys.full, s.refusedStat]);
     if (sig === s.retryStatsSig) continue;
     s.retryStatsSig = sig;
     logger.info({
       phone: s.phone, patched: RETRY_PATCHED, mode: retryMode, resends,
+      refused: s.refusedStat ? { ...s.refusedStat, on: forgetRefused } : null,
       lid: s.lidStat ? { ...s.lidStat, remembered: s.lidNone?.size || 0 } : null,
       groupKeys: { posts: groupKeys.posts, devices: groupKeys.devices, full: groupKeys.full },
       breaths: s.breathe?.pauses?.() || 0,
@@ -351,6 +391,15 @@ export function setRetryLimit(raw) {
   retryRules.group.perMinute = parseGroupLimit(raw, was);
   if (was !== retryRules.group.perMinute) logger.warn({ was, now: retryRules.group.perMinute }, 'retry_limit_changed');
   return retryRules.group.perMinute;
+}
+
+/** Turn the forgetting of refused askers on or off while running (POST /retry-mode). */
+export function setForgetRefused(v) {
+  if (typeof v === 'boolean' && v !== forgetRefused) {
+    logger.warn({ was: forgetRefused, now: v }, 'retry_forget_refused_changed');
+    forgetRefused = v;
+  }
+  return forgetRefused;
 }
 
 function authDirFor(phone) {
@@ -554,7 +603,8 @@ function rememberOutgoing(phone, id, content, jid) {
   if (!id || !content) return;
   const m = getOutgoingMap(phone);
   // group: whether a resend of it is held to the group's limit (retryGuard.js).
-  m.set(id, { content, ts: Date.now(), group: String(jid || '').endsWith('@g.us') });
+  // jid: the group a refused asker is forgotten in (flushRefusedAskers).
+  m.set(id, { content, ts: Date.now(), group: String(jid || '').endsWith('@g.us'), jid: String(jid || '') });
   // Evict oldest entries past the limit (Map preserves insertion order).
   while (m.size > OUTGOING_CACHE_LIMIT) {
     const oldestKey = m.keys().next().value;
@@ -573,6 +623,8 @@ function rememberOutgoing(phone, id, content, jid) {
 function retryCounterFor(s, phone) {
   if (s.retryCounter) return s.retryCounter;
   s.retrySkipped = {};
+  s.refusedAskers = makeRefusedAskers();
+  s.refusedStat = { asked: 0, forgotten: 0 };
   let pending = {};
   let loggedAt = 0;
   s.retryStats = s.retryStats || makeRetryStats();
@@ -582,7 +634,13 @@ function retryCounterFor(s, phone) {
     rules: retryRules,
     // A resend let through, by who asked — a phone or a linked device (retry_stats).
     onAllow: (key) => { s.retryStats.resend(key); },
-    onSkip: (why, kind) => {
+    onSkip: (why, kind, id, key) => {
+      // Refused, yet without the group's key: marked so, for the next post (flushRefusedAskers).
+      if (kind === 'group' && forgetRefused && retryMode.keepGroupMemory) {
+        const group = outgoingCache.get(phone)?.get(id)?.jid;
+        const at = String(key ?? '').indexOf(':');
+        if (group && at > 0) s.refusedAskers.note(group, String(key).slice(at + 1));
+      }
       const k = `${kind}_${why}`;
       s.retrySkipped[k] = (s.retrySkipped[k] || 0) + 1;
       pending[k] = (pending[k] || 0) + 1;
@@ -2890,6 +2948,7 @@ export function snapshotOf(phone) {
       patched: RETRY_PATCHED,
       mode: { ...retryMode },
       groupPerMinute: retryRules.group.perMinute,
+      refused: s.refusedStat ? { ...s.refusedStat, on: forgetRefused } : null,
       stats: s.retryStats?.totals() || null,
       lid: s.lidStat ? { ...s.lidStat, remembered: s.lidNone?.size || 0 } : null,
       groupKeys: { posts: groupKeys.posts, devices: groupKeys.devices, full: groupKeys.full },
