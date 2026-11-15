@@ -48,6 +48,7 @@ import {
 } from './watchdog.js';
 import { applyBaileysPatch } from './baileysPatch.js';
 import { parseMode } from './retryMode.js';
+import { parseGroupLimit } from './retryGuard.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -104,6 +105,14 @@ function storedRetryMode() {
     return parseMode(JSON.parse(fs.readFileSync(RETRY_MODE_FILE, 'utf8')));
   } catch (_) {
     return parseMode(process.env.BRIDGE_RETRY_MODE);
+  }
+}
+/** The group resend limit kept beside the mode (retryGuard.js GROUP_PER_MINUTE). */
+function storedGroupLimit() {
+  try {
+    return parseGroupLimit(JSON.parse(fs.readFileSync(RETRY_MODE_FILE, 'utf8')).groupPerMinute);
+  } catch (_) {
+    return parseGroupLimit(process.env.BRIDGE_RETRY_GROUP_PER_MINUTE);
   }
 }
 let BAILEYS_PKG_VERSION = 'unknown';
@@ -444,6 +453,7 @@ app.get('/diag', (_req, res) => {
     // The retry patch (baileysPatch.js): its state at boot and the mode in force.
     baileys_retry_patch: RETRY_PATCH.state,
     retry_mode: storedRetryMode(),
+    retry_group_per_minute: storedGroupLimit(),
     watchdog_webhook_configured: !!WATCHDOG_WEBHOOK_URL,
     event_loop_lag_ms: lastLagMs,
     workers: local ? [] : [...workers.values()].filter((w) => !w.removed).map((w) => ({
@@ -481,19 +491,22 @@ app.post('/retry-mode', async (req, res) => {
   try {
     const body = req.body || {};
     const mode = typeof body.mode === 'string' ? parseMode(body.mode) : parseMode(body, storedRetryMode());
-    await fs.promises.writeFile(RETRY_MODE_FILE, JSON.stringify(mode), 'utf8');
+    // The group limit rides with the mode: given -> set; not given -> kept as it was.
+    const groupPerMinute = parseGroupLimit(body.groupPerMinute, storedGroupLimit());
+    await fs.promises.writeFile(RETRY_MODE_FILE, JSON.stringify({ ...mode, groupPerMinute }), 'utf8');
     const told = [];
     if (local) {
       local.setRetryMode(mode);
+      local.setRetryLimit(groupPerMinute);
       told.push('local');
     } else {
       for (const w of workers.values()) {
         if (!w.child || w.state !== 'up' || w.removed) continue;
-        try { w.child.send({ t: 'retry_mode', mode }); told.push(w.phone); } catch (_) { /* it reads the file at its next start */ }
+        try { w.child.send({ t: 'retry_mode', mode, groupPerMinute }); told.push(w.phone); } catch (_) { /* it reads the file at its next start */ }
       }
     }
-    logger.warn({ mode, told }, 'retry_mode_set');
-    res.json({ ok: true, patch: RETRY_PATCH.state, mode, told });
+    logger.warn({ mode, groupPerMinute, told }, 'retry_mode_set');
+    res.json({ ok: true, patch: RETRY_PATCH.state, mode, groupPerMinute, told });
   } catch (e) {
     res.status(500).json({ ok: false, error: e?.message || String(e) });
   }

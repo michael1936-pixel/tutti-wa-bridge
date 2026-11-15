@@ -25,6 +25,7 @@ import {
   snapshotOf,
   restartSocket,
   setRetryMode,
+  setRetryLimit,
   restoreSession,
   loadPurposes,
   shutdownSessions,
@@ -78,6 +79,7 @@ process.on('message', async (m) => {
   // The retry patch's mode, switched while running (server.js POST /retry-mode).
   if (m.t === 'retry_mode') {
     setRetryMode(m.mode);
+    if (m.groupPerMinute != null) setRetryLimit(m.groupPerMinute);
     send({ t: 'state', snap: snapshotOf(PHONE) });
     return;
   }

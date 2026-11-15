@@ -30,6 +30,23 @@ export const RETRY_RULES = {
   private: { maxAgeMs: 2 * 60 * 60_000, perMinute: 60 },
 };
 
+/**
+ * The group limit may be set while the bridge runs (POST /retry-mode
+ * { groupPerMinute }, 2026-11-15): since the retry patch a resend goes to the
+ * asking device alone, so 30 a minute left most members who asked without the
+ * post ("בהמתנה להודעה זו" on their phones) — 22,000 asks refused in 18 hours
+ * against 1,200 answered. Never under the first limit, never without a ceiling.
+ */
+export const GROUP_PER_MINUTE = { min: 30, max: 600 };
+
+/** A limit asked for -> a whole number inside the bounds; the base when it is none. */
+export function parseGroupLimit(raw, base = RETRY_RULES.group.perMinute) {
+  if (raw == null || raw === '' || typeof raw === 'boolean') return base;
+  const n = Math.round(Number(raw));
+  if (!Number.isFinite(n)) return base;
+  return Math.min(GROUP_PER_MINUTE.max, Math.max(GROUP_PER_MINUTE.min, n));
+}
+
 /** One retry asks the counter several times; it gets one answer. */
 const VERDICT_MS = 30_000;
 /** As Baileys' own counter (NodeCache, stdTTL 1h). */

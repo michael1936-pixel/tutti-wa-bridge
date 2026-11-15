@@ -50,7 +50,7 @@ import makeWASocket, {
   downloadMediaMessage,
   DEFAULT_CONNECTION_CONFIG,
 } from 'baileys';
-import { makeRetryCounter } from './retryGuard.js';
+import { makeRetryCounter, parseGroupLimit, RETRY_RULES } from './retryGuard.js';
 import { baileysPatched } from './baileysPatch.js';
 import {
   parseMode, forgetAsker, makeRetryStats, guardLidLookup, makeBreather, breathingRepository, setInSlices, waitUntil, makeTtlCache,
@@ -210,7 +210,7 @@ async function getCachedGroupMetadata(sock, jid) {
 // Surfaced via /diag and printed once on startup. Bump this string when you
 // redeploy a behavioral change so you can read the version straight from
 // Railway logs.
-const BRIDGE_BUILD = 'group-invite-2026-11-14';
+const BRIDGE_BUILD = 'retry-limit-live-2026-11-15';
 
 /** How old a held private message may be and still be passed on. */
 const OFFLINE_PRIVATE_MAX_AGE_MS = 30 * 60_000;
@@ -273,6 +273,19 @@ function storedRetryMode() {
   }
 }
 let retryMode = RETRY_PATCHED ? storedRetryMode() : { ...STOCK_MODE };
+// The resend limits in force. The group's a-minute limit is kept beside the mode
+// (retry-mode.json `groupPerMinute`) and set while running (setRetryLimit).
+function storedGroupLimit() {
+  try {
+    return parseGroupLimit(JSON.parse(fs.readFileSync(RETRY_MODE_FILE, 'utf8')).groupPerMinute);
+  } catch (_) {
+    return parseGroupLimit(process.env.BRIDGE_RETRY_GROUP_PER_MINUTE);
+  }
+}
+const retryRules = {
+  group: { ...RETRY_RULES.group, perMinute: storedGroupLimit() },
+  private: { ...RETRY_RULES.private },
+};
 // Members who ask again while nothing of theirs is in a group's memory (forgetAsker).
 const askerRepeats = new Map();
 // How many devices group posts carried the group's key to (measured by the patch).
@@ -330,6 +343,14 @@ export function setRetryMode(raw) {
     logger.warn({ phone: s.phone, was, now: next, counted }, 'retry_mode_changed');
   }
   return { patched: true, mode: { ...next } };
+}
+
+/** Set how many group resends a minute a number answers, while running (POST /retry-mode). */
+export function setRetryLimit(raw) {
+  const was = retryRules.group.perMinute;
+  retryRules.group.perMinute = parseGroupLimit(raw, was);
+  if (was !== retryRules.group.perMinute) logger.warn({ was, now: retryRules.group.perMinute }, 'retry_limit_changed');
+  return retryRules.group.perMinute;
 }
 
 function authDirFor(phone) {
@@ -557,6 +578,8 @@ function retryCounterFor(s, phone) {
   s.retryStats = s.retryStats || makeRetryStats();
   s.retryCounter = makeRetryCounter({
     ourMessage: (id) => outgoingCache.get(phone)?.get(id),
+    // Read at every verdict: the group limit is set while running.
+    rules: retryRules,
     // A resend let through, by who asked — a phone or a linked device (retry_stats).
     onAllow: (key) => { s.retryStats.resend(key); },
     onSkip: (why, kind) => {
@@ -2866,6 +2889,7 @@ export function snapshotOf(phone) {
     retry: {
       patched: RETRY_PATCHED,
       mode: { ...retryMode },
+      groupPerMinute: retryRules.group.perMinute,
       stats: s.retryStats?.totals() || null,
       lid: s.lidStat ? { ...s.lidStat, remembered: s.lidNone?.size || 0 } : null,
       groupKeys: { posts: groupKeys.posts, devices: groupKeys.devices, full: groupKeys.full },
