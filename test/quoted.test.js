@@ -39,6 +39,6 @@ test('quote: words that cannot be read still hand on the id; no quote hands on n
 test('quote: both forwards — the group feed and the private line — read it this way', () => {
   const session = readFileSync(new URL('../session.js', import.meta.url), 'utf8');
   assert.ok(session.includes("import { quotedOf } from './quoted.js';"));
-  assert.equal(session.split('quotedOf(').length - 1, 2);
+  assert.equal(session.split('quotedOf(').length - 1, 3);
   assert.ok(!session.includes('quotedMsg.extendedTextMessage?.text'));
 });

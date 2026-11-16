@@ -125,5 +125,5 @@ test('the session answers its own devices and shows it in /diag', () => {
   const session = readFileSync(new URL('../session.js', import.meta.url), 'utf8');
   assert.ok(session.includes("isOwn: (participant) => isOwnParticipant(participant, s.sock?.authState?.creds?.me),"));
   assert.ok(session.includes('ownAnswered: s.retryOwnAnswered || 0,'));
-  assert.ok(session.includes("const BRIDGE_BUILD = 'own-phone-fair-retries-2026-11-18'"));
+  assert.ok(session.includes("const BRIDGE_BUILD = 'chat-marks-send-2026-11-18'"));
 });

@@ -211,7 +211,7 @@ async function getCachedGroupMetadata(sock, jid) {
 // Surfaced via /diag and printed once on startup. Bump this string when you
 // redeploy a behavioral change so you can read the version straight from
 // Railway logs.
-const BRIDGE_BUILD = 'own-phone-fair-retries-2026-11-18';
+const BRIDGE_BUILD = 'chat-marks-send-2026-11-18';
 
 /** How old a held private message may be and still be passed on. */
 const OFFLINE_PRIVATE_MAX_AGE_MS = 30 * 60_000;
@@ -1511,6 +1511,11 @@ async function buildSocket(s, phone, { forceReset } = {}) {
     if (purposeOf(phone)) return;
     const jid = m.key.remoteJid || '';
     if (!jid || jid.endsWith('@g.us') || jid.endsWith('@broadcast') || jid.endsWith('@newsletter') || jid.startsWith('status@')) return;
+    // A mark put on a message (👍), or taken off it: reported on its own, so
+    // the app's chat shows what WhatsApp shows (Michael, 2026-11-16: «כולל
+    // סימונים על הודעה שנראה אותם»).
+    const mark = chatReaction(m);
+    if (mark) { void postChatSync({ kind: 'reaction', station_phone: phone, ...mark }); return; }
     const text = chatSyncText(m.message);
     if (!text) return;
     const peer = extractRealPhoneDigits(phone, m);
@@ -1526,6 +1531,8 @@ async function buildSocket(s, phone, { forceReset } = {}) {
       wa_message_id: m.key.id,
       // Sent through this bridge's API (the system), or typed on the phone.
       via_api: fromMe && !!outgoingCache.get(phone)?.has(m.key.id),
+      // The message it answers (a swipe-reply), so the app draws it too.
+      ...chatQuoted(m.message),
     };
     const audio = chatSyncInner(m.message)?.audioMessage;
     if (!audio) { void postChatSync(body); return; }
@@ -1535,6 +1542,22 @@ async function buildSocket(s, phone, { forceReset } = {}) {
       const media = await chatSyncVoice(m, audio);
       await postChatSync(media ? { ...body, media } : body, media ? 30_000 : 8000);
     })();
+  }
+
+  // The message a private message answers: { quoted: { id, text } }, or nothing.
+  function chatQuoted(message) {
+    const q = quotedOf(message);
+    if (!q.id) return {};
+    return { quoted: { id: String(q.id).slice(0, 200), text: q.text ? String(q.text).slice(0, 4000) : null } };
+  }
+
+  // A mark on a message: which message, the emoji ('' = taken off), and whose
+  // mark it is. Null for anything that is not a mark.
+  function chatReaction(m) {
+    const r = chatSyncInner(m.message)?.reactionMessage;
+    const id = r?.key?.id;
+    if (!r || !id) return null;
+    return { wa_message_id: String(id).slice(0, 200), emoji: String(r.text || '').slice(0, 16), from_me: !!m.key.fromMe };
   }
 
   // The recording of a voice note, as base64 — null when it cannot be had.
@@ -2593,6 +2616,33 @@ app.post('/edit', async (req, res) => {
     res.json({ ok: true });
   } catch (e) {
     logger.error({ phone, jid: targetJid, err: e?.message }, 'edit_failed');
+    res.status(500).json({ ok: false, error: e?.message || String(e) });
+  }
+});
+
+// A mark (emoji) on a message in a private chat, from the app's WhatsApp chat
+// (Michael, 2026-11-18: «לעשות למבקש מהווצאפ לייק על תגובה»). An empty emoji
+// takes the mark off. fromMe: the message was sent by this number.
+//
+// Body: { session, jid, id, fromMe, emoji }
+app.post('/react', async (req, res) => {
+  const { jid, id, fromMe, emoji, session } = req.body || {};
+  const phone = String(session || '').replace(/\D/g, '');
+  if (!phone || !jid || !id) return res.status(400).json({ error: 'jid, id, session required' });
+  const s = sessions.get(phone);
+  if (!s || s.status !== 'connected' || !s.sock) {
+    return res.status(409).json({ error: 'session_missing', status: s?.status ?? 'not_started' });
+  }
+  const targetJid = String(jid);
+  try {
+    await s.sock.sendMessage(targetJid, {
+      react: { text: String(emoji || '').slice(0, 16), key: { remoteJid: targetJid, fromMe: fromMe === true, id: String(id) } },
+    });
+    void markOffline(s.sock, phone);
+    logger.info({ phone, jid: targetJid, msgId: String(id) }, 'react_ok');
+    res.json({ ok: true });
+  } catch (e) {
+    logger.error({ phone, jid: targetJid, err: e?.message }, 'react_failed');
     res.status(500).json({ ok: false, error: e?.message || String(e) });
   }
 });
