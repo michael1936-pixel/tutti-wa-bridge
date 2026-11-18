@@ -50,7 +50,7 @@ import makeWASocket, {
   downloadMediaMessage,
   DEFAULT_CONNECTION_CONFIG,
 } from 'baileys';
-import { makeRetryCounter, parseGroupLimit, RETRY_RULES } from './retryGuard.js';
+import { isOwnParticipant, makeRetryCounter, parseGroupLimit, RETRY_RULES } from './retryGuard.js';
 import { quotedOf } from './quoted.js';
 import { baileysPatched } from './baileysPatch.js';
 import {
@@ -211,7 +211,7 @@ async function getCachedGroupMetadata(sock, jid) {
 // Surfaced via /diag and printed once on startup. Bump this string when you
 // redeploy a behavioral change so you can read the version straight from
 // Railway logs.
-const BRIDGE_BUILD = 'stop-decrypt-loops-2026-11-15';
+const BRIDGE_BUILD = 'own-phone-fair-retries-2026-11-18';
 
 /** How old a held private message may be and still be passed on. */
 const OFFLINE_PRIVATE_MAX_AGE_MS = 30 * 60_000;
@@ -379,6 +379,7 @@ setInterval(() => {
     logger.info({
       phone: s.phone, patched: RETRY_PATCHED, mode: retryMode, resends,
       refused: s.refusedStat ? { ...s.refusedStat, on: forgetRefused } : null,
+      ownAnswered: s.retryOwnAnswered || 0,
       undecryptable: { ...undecryptable.totals(), on: stopLoops },
       lid: s.lidStat ? { ...s.lidStat, remembered: s.lidNone?.size || 0 } : null,
       groupKeys: { posts: groupKeys.posts, devices: groupKeys.devices, full: groupKeys.full },
@@ -658,8 +659,10 @@ function retryCounterFor(s, phone) {
     ourMessage: (id) => outgoingCache.get(phone)?.get(id),
     // Read at every verdict: the group limit is set while running.
     rules: retryRules,
-    // A resend let through, by who asked — a phone or a linked device (retry_stats).
-    onAllow: (key) => { s.retryStats.resend(key); },
+    // The number's own devices (his phone): answered always (retryGuard.js isOwnParticipant).
+    isOwn: (participant) => isOwnParticipant(participant, s.sock?.authState?.creds?.me),
+    // A resend let through, by who asked — a phone or a linked device (retry_stats); own devices counted too.
+    onAllow: (key, _kind, own) => { s.retryStats.resend(key); if (own) s.retryOwnAnswered = (s.retryOwnAnswered || 0) + 1; },
     onSkip: (why, kind, id, key) => {
       // Refused, yet without the group's key: marked so, for the next post (flushRefusedAskers).
       if (kind === 'group' && forgetRefused && retryMode.keepGroupMemory) {
@@ -2958,6 +2961,7 @@ export function snapshotOf(phone) {
       mode: { ...retryMode },
       groupPerMinute: retryRules.group.perMinute,
       refused: s.refusedStat ? { ...s.refusedStat, on: forgetRefused } : null,
+      ownAnswered: s.retryOwnAnswered || 0,
       undecryptable: { ...undecryptable.totals(), on: stopLoops },
       stats: s.retryStats?.totals() || null,
       lid: s.lidStat ? { ...s.lidStat, remembered: s.lidNone?.size || 0 } : null,

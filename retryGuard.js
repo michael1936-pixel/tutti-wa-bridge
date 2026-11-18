@@ -26,9 +26,29 @@ export const RETRY_SKIP_COUNT = 99;
  * worth resending for longer, and asks for little.
  */
 export const RETRY_RULES = {
-  group: { maxAgeMs: 15 * 60_000, perMinute: 30 },
+  // perAsker (2026-11-18): one device is answered `count` times in `windowMs`,
+  // whatever the minute's limit — and no more, so the minute's limit serves
+  // distinct members. A member refused is never healed (an answered resend
+  // fetches him fresh keys — assertSessions; a refused one gets nothing), so
+  // 058-711-5623 answered 90 a minute of 2,400 asks a minute at 15:23 on
+  // 2026-11-17 (35 posts a minute): the same devices asked again on every post.
+  group: { maxAgeMs: 15 * 60_000, perMinute: 30, perAsker: { count: 2, windowMs: 10 * 60_000 } },
   private: { maxAgeMs: 2 * 60 * 60_000, perMinute: 60 },
 };
+
+/**
+ * The number's own devices (Michael's phone is the primary of 058-711-5623;
+ * the bridge is a linked device of it): their asks are answered always, outside
+ * every limit — his own post stood on his phone as "בהמתנה להודעה זו" when the
+ * minute's limit refused him with the rest (2026-11-17 15:23, 2026-11-15, 2026-11-11).
+ * `me` = creds.me ({ id, lid }); a participant under either name is his.
+ */
+export function isOwnParticipant(participant, me) {
+  const user = (jid) => String(jid ?? '').split('@')[0].split(':')[0].split('_')[0];
+  const p = user(participant);
+  if (!p || !me) return false;
+  return [me.id, me.lid].some((j) => j && user(j) === p);
+}
 
 /**
  * The group limit may be set while the bridge runs (POST /retry-mode
@@ -53,12 +73,25 @@ const VERDICT_MS = 30_000;
 const COUNT_TTL_MS = 60 * 60_000;
 const SWEEP_MS = 60_000;
 
-/** May this resend of our message go: 'ok', 'too_old' or 'too_many'. */
-export function retryVerdict({ ageMs, group, recentCount }, rules = RETRY_RULES) {
+/**
+ * May this resend of our message go: 'ok', 'too_old', 'too_often' (this device
+ * had its share of the window) or 'too_many' (the minute's limit). An own
+ * device is 'ok' whenever the message is not too old.
+ */
+export function retryVerdict({ ageMs, group, recentCount, askerCount = 0, own = false }, rules = RETRY_RULES) {
   const r = group ? rules.group : rules.private;
   if (!(ageMs <= r.maxAgeMs)) return 'too_old';
+  if (own) return 'ok';
+  if (r.perAsker && askerCount >= r.perAsker.count) return 'too_often';
   if (recentCount >= r.perMinute) return 'too_many';
   return 'ok';
+}
+
+/** The asker of `${msgId}:${participant}` — the participant (a device), or ''. */
+export function retryKeyParticipant(key) {
+  const k = String(key ?? '');
+  const at = k.indexOf(':');
+  return at < 0 ? '' : k.slice(at + 1);
 }
 
 /** `${msgId}:${participant}` — the participant may hold ':' (a device). */
@@ -75,10 +108,11 @@ export function retryKeyId(key) {
  * number keeps one counter across its sockets, so a restart does not start
  * the storm over.
  */
-export function makeRetryCounter({ ourMessage, onSkip, onAllow, rules = RETRY_RULES, now = Date.now }) {
+export function makeRetryCounter({ ourMessage, onSkip, onAllow, isOwn, rules = RETRY_RULES, now = Date.now }) {
   const counts = new Map(); // key -> { v, exp }
   const verdicts = new Map(); // key -> { verdict, exp }
   const recent = { group: [], private: [] }; // times of resends let through
+  const answered = new Map(); // participant -> times of group resends let through to him
   let sweptAt = 0;
 
   const sweep = (t) => {
@@ -86,6 +120,11 @@ export function makeRetryCounter({ ourMessage, onSkip, onAllow, rules = RETRY_RU
     sweptAt = t;
     for (const [k, e] of counts) if (e.exp <= t) counts.delete(k);
     for (const [k, e] of verdicts) if (e.exp <= t) verdicts.delete(k);
+    const win = rules.group?.perAsker?.windowMs ?? 0;
+    for (const [p, list] of answered) {
+      const kept = list.filter((x) => t - x < win);
+      if (kept.length) answered.set(p, kept); else answered.delete(p);
+    }
   };
 
   const verdictOf = (key, mine, t) => {
@@ -94,11 +133,18 @@ export function makeRetryCounter({ ourMessage, onSkip, onAllow, rules = RETRY_RU
     // A message saved before this guard has no group mark: held to the group's rule.
     const kind = mine.group === false ? 'private' : 'group';
     recent[kind] = recent[kind].filter((x) => t - x < 60_000);
-    const verdict = retryVerdict({ ageMs: t - Number(mine.ts), group: kind === 'group', recentCount: recent[kind].length }, rules);
+    const participant = retryKeyParticipant(key);
+    let own = false;
+    try { own = kind === 'group' && !!isOwn?.(participant); } catch (_) { own = false; }
+    const win = rules.group?.perAsker?.windowMs ?? 0;
+    const mine_ = kind === 'group' && participant ? (answered.get(participant) || []).filter((x) => t - x < win) : [];
+    const verdict = retryVerdict({ ageMs: t - Number(mine.ts), group: kind === 'group', recentCount: recent[kind].length, askerCount: mine_.length, own }, rules);
     if (verdict === 'ok') {
-      recent[kind].push(t);
+      // An own device is answered outside the minute's limit.
+      if (!own) recent[kind].push(t);
+      if (kind === 'group' && participant) answered.set(participant, [...mine_, t]);
       // Told once per resend let through (`key` = `${msgId}:${participant}`).
-      try { onAllow?.(key, kind); } catch (_) { /* a count never stops the answer */ }
+      try { onAllow?.(key, kind, own); } catch (_) { /* a count never stops the answer */ }
     } else {
       try { onSkip?.(verdict, kind, retryKeyId(key), key); } catch (_) { /* a log line never stops the answer */ }
     }
@@ -131,6 +177,7 @@ export function makeRetryCounter({ ourMessage, onSkip, onAllow, rules = RETRY_RU
     flushAll() {
       counts.clear();
       verdicts.clear();
+      answered.clear();
       recent.group = [];
       recent.private = [];
     },
