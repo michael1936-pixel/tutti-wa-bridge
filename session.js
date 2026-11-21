@@ -190,6 +190,10 @@ const PAYMENT_PROOF_URL = process.env.PAYMENT_PROOF_WEBHOOK_URL
 // and each of its database round trips cost ~200 ms (feed_timing, 2026-11-07).
 const GROUP_FEED_WEBHOOK_URL = process.env.GROUP_FEED_WEBHOOK_URL || '';
 const GROUP_FEED_WEBHOOK_SECRET = process.env.GROUP_FEED_WEBHOOK_SECRET || '';
+// Group messages of all the numbers leave through ONE sender (server.js), in
+// packs when it is busy (feedPack.js, 2026-11-21). "off": every number sends
+// its own, one call a message, as before.
+const GROUP_FEED_PACK = String(process.env.GROUP_FEED_PACK || 'on').toLowerCase() !== 'off';
 
 // Lightweight in-memory cache for groupMetadata lookups so we don't hammer
 // WhatsApp on every inbound group message. 5 min TTL is plenty — group
@@ -211,7 +215,7 @@ async function getCachedGroupMetadata(sock, jid) {
 // Surfaced via /diag and printed once on startup. Bump this string when you
 // redeploy a behavioral change so you can read the version straight from
 // Railway logs.
-const BRIDGE_BUILD = 'chat-marks-send-2026-11-18';
+const BRIDGE_BUILD = 'feed-packs-2026-11-21';
 
 /** How old a held private message may be and still be passed on. */
 const OFFLINE_PRIVATE_MAX_AGE_MS = 30 * 60_000;
@@ -2211,6 +2215,12 @@ async function buildSocket(s, phone, { forceReset } = {}) {
     // (504 idle timeouts for 8 minutes). Now at most GROUP_FORWARD_LIMIT go at
     // a time and the rest wait their turn — every message still goes, one call
     // each; a 5xx or a network error is tried once more after a short pause.
+    if (GROUP_FEED_PACK && typeof process.send === 'function' && process.connected) {
+      try {
+        process.send({ t: 'group_feed', payload });
+        return;
+      } catch (_) { /* the supervisor is gone: this number sends it itself, below */ }
+    }
     await groupForwardSlot(async () => {
       for (let attempt = 1; attempt <= 2; attempt++) {
         try {

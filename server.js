@@ -49,6 +49,7 @@ import {
 import { applyBaileysPatch } from './baileysPatch.js';
 import { parseMode } from './retryMode.js';
 import { parseGroupLimit } from './retryGuard.js';
+import { makeFeedPacker, feedPoster } from './feedPack.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -91,6 +92,24 @@ const WD = {
 };
 
 const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
+
+// The one sender of every number's group messages (feedPack.js, 2026-11-21):
+// alone while a lane is free, in packs when all are busy. The numbers hand
+// their messages over the IPC channel ({ t: 'group_feed', payload }).
+const feedPacker = makeFeedPacker({
+  post: feedPoster({ url: GROUP_FEED_WEBHOOK_URL, secret: GROUP_FEED_WEBHOOK_SECRET }),
+  lanes: Number(process.env.GROUP_FEED_PACK_LANES || 3),
+  max: Number(process.env.GROUP_FEED_PACK_MAX || 40),
+  onResult: (m, r) => logger.info(
+    { phone: m.station_phone, jid: m.wa_group_jid, msgId: m.wa_message_id, status: r.status, body: r.body, attempt: r.attempt, packed: r.packed, queued: r.queued },
+    'group_feed_forward_result',
+  ),
+  onError: (m, err, r) => logger.error(
+    { phone: m?.station_phone, jid: m?.wa_group_jid, err: err?.message, attempt: r.attempt, packed: r.packed },
+    'group_feed forward failed',
+  ),
+  onBacklog: (b) => logger.warn(b, 'group_forward_backlog'),
+});
 
 // ---------------------------------------------------------------------------
 // Reporting a watchdog action: a log line always, and the app when configured.
@@ -250,6 +269,9 @@ async function startWorker(phone) {
         w.pending.delete(m.id);
         p.resolve({ code: m.code, body: m.body });
       }
+    } else if (m.t === 'group_feed') {
+      // A group message of this number, on its way to the server (feedPack.js).
+      if (m.payload && typeof m.payload === 'object') void feedPacker.add(m.payload);
     } else if (m.t === 'event') {
       if (m.event === 'session_stuck_restart') {
         void reportWatchdog('watchdog_restart_number', { phone, reason: 'query_timeouts', action: 'socket', ...(m.fields || {}) });
@@ -460,6 +482,7 @@ app.get('/diag', (_req, res) => {
     webhook_secret_configured: !!WEBHOOK_SECRET,
     group_feed_webhook_url_configured: !!GROUP_FEED_WEBHOOK_URL,
     group_feed_webhook_secret_configured: !!GROUP_FEED_WEBHOOK_SECRET,
+    group_feed_pack: feedPacker.stats(),
     api_key_configured: !!API_KEY,
     auth_root: AUTH_ROOT,
     sessions: sessionsInfo,
