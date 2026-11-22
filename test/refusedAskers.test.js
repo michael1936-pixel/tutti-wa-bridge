@@ -81,7 +81,28 @@ test('a refusal is told with who asked, and the session marks him for the next p
   assert.ok(session.includes("if (group && at > 0) s.refusedAskers.note(group, String(key).slice(at + 1));"));
   assert.ok(session.includes("jid: String(jid || '') });"));
   // The write is started by a module-level timer, never from inside a handled message.
-  assert.ok(session.includes('for (const s of sessions.values()) void flushRefusedAskers(s);'));
+  assert.ok(session.includes('for (const s of sessions.values()) { void flushRefusedAskers(s); void flushOwnKeyGroups(s); }'));
   const worker = readFileSync(new URL('../worker.js', import.meta.url), 'utf8');
   assert.ok(worker.includes("if (typeof m.forgetRefused === 'boolean') setForgetRefused(m.forgetRefused);"));
+});
+
+// 2026-11-22: his own post stood on his own phone as "בהמתנה להודעה זו" again - the
+// number's own devices now get the group's key with every post.
+test('own devices: forgotten in the group after a post, under the number and under its LID, nobody else', async () => {
+  const memory = { 'g1@g.us': { '972587115623:0@s.whatsapp.net': true, '972587115623:7@s.whatsapp.net': true, '4701339:0@lid': true, '972500000001:0@s.whatsapp.net': true, '99887:3@lid': true } };
+  const keys = fakeKeys(memory, { tx: true });
+  const me = { id: '972587115623:12@s.whatsapp.net', lid: '4701339:12@lid' };
+  const dropped = await forgetAskers({ keys, group: 'g1@g.us', participants: [me.id, me.lid], txKey: me.id });
+  assert.equal(dropped, 3);
+  assert.deepEqual(Object.keys(memory['g1@g.us']).sort(), ['972500000001:0@s.whatsapp.net', '99887:3@lid']);
+  assert.deepEqual(keys.txKeys, [me.id]);
+});
+
+test('own devices: wired - every group message of ours marks its group, the timer forgets, the ask is written down', () => {
+  const src = readFileSync(new URL('../session.js', import.meta.url), 'utf8');
+  assert.ok(src.includes('noteOwnForNextPost(phone, jid);'));
+  assert.ok(src.includes('{ void flushRefusedAskers(s); void flushOwnKeyGroups(s); }'));
+  assert.ok(src.includes("participants: [me.id, me.lid].filter(Boolean),"));
+  assert.ok(src.includes("'own_device_resend'"));
+  assert.ok(src.includes("if (!OWN_KEY_EVERY_POST || !forgetRefused || !retryMode.keepGroupMemory) return;"));
 });

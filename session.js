@@ -215,7 +215,7 @@ async function getCachedGroupMetadata(sock, jid) {
 // Surfaced via /diag and printed once on startup. Bump this string when you
 // redeploy a behavioral change so you can read the version straight from
 // Railway logs.
-const BRIDGE_BUILD = 'feed-packs-2026-11-21';
+const BRIDGE_BUILD = 'own-key-every-post-2026-11-22';
 
 /** How old a held private message may be and still be passed on. */
 const OFFLINE_PRIVATE_MAX_AGE_MS = 30 * 60_000;
@@ -316,6 +316,48 @@ const undecryptable = makeUndecryptable();
 // (Baileys: 250 ms — a quarter of a second in which no other message is read).
 const RETRY_REQUEST_DELAY_MS = Number(process.env.RETRY_REQUEST_DELAY_MS || 50);
 const REFUSED_FLUSH_MS = 1_500;
+// The number's own devices get the group's key with EVERY post of ours
+// (2026-11-22, Michael: «אסור שזה יקרה» - his own post stood on his phone as
+// "בהמתנה להודעה זו" for minutes again: the phone asked, and the answer came
+// late, in the minutes WhatsApp was refusing sends as "rate-overlimit"). After a
+// post to a group the own devices are forgotten in that group's memory, so the
+// next post there carries them the key and the phone has nothing to ask for.
+// One more device a post. Off: OWN_KEY_EVERY_POST=off, or forgetRefused: false.
+const OWN_KEY_EVERY_POST = String(process.env.OWN_KEY_EVERY_POST || 'on').toLowerCase() !== 'off';
+function noteOwnForNextPost(phone, jid) {
+  if (!OWN_KEY_EVERY_POST || !forgetRefused || !retryMode.keepGroupMemory) return;
+  const group = String(jid || '');
+  if (!group.endsWith('@g.us')) return;
+  const s = sessions.get(phone);
+  if (!s) return;
+  (s.ownKeyGroups = s.ownKeyGroups || new Set()).add(group);
+}
+async function flushOwnKeyGroups(s) {
+  if (!s.ownKeyGroups?.size || s.ownKeyFlushing) return;
+  const sock = s.sock;
+  const keys = sock?.authState?.keys;
+  const me = sock?.authState?.creds?.me;
+  if (!keys || !me?.id) return; // no socket now: kept for the next round
+  s.ownKeyFlushing = true;
+  const groups = [...s.ownKeyGroups];
+  s.ownKeyGroups = new Set();
+  s.ownKeyStat = s.ownKeyStat || { posts: 0, forgotten: 0 };
+  try {
+    for (const group of groups) {
+      const dropped = await forgetAskers({
+        keys, group, participants: [me.id, me.lid].filter(Boolean),
+        lidMapping: sock.signalRepository?.lidMapping,
+        txKey: me.id,
+      });
+      s.ownKeyStat.posts += 1;
+      s.ownKeyStat.forgotten += dropped;
+    }
+  } catch (e) {
+    logger.warn({ phone: s.phone, err: e?.message || String(e) }, 'own_key_forget_failed');
+  } finally {
+    s.ownKeyFlushing = false;
+  }
+}
 async function flushRefusedAskers(s) {
   if (!s.refusedAskers?.size || s.refusedFlushing) return;
   const sock = s.sock;
@@ -342,7 +384,7 @@ async function flushRefusedAskers(s) {
 // Started here, outside any key-store transaction: a timer set while a message is
 // handled would carry that transaction's context into the write.
 setInterval(() => {
-  for (const s of sessions.values()) void flushRefusedAskers(s);
+  for (const s of sessions.values()) { void flushRefusedAskers(s); void flushOwnKeyGroups(s); }
 }, REFUSED_FLUSH_MS).unref?.();
 // Members who ask again while nothing of theirs is in a group's memory (forgetAsker).
 const askerRepeats = new Map();
@@ -377,13 +419,14 @@ globalThis.__bridgeRetry = {
 setInterval(() => {
   for (const s of sessions.values()) {
     const resends = s.retryStats?.totals();
-    const sig = JSON.stringify([resends, s.lidStat, groupKeys.posts, groupKeys.full, s.refusedStat, undecryptable.totals()]);
+    const sig = JSON.stringify([resends, s.lidStat, groupKeys.posts, groupKeys.full, s.refusedStat, s.ownKeyStat, undecryptable.totals()]);
     if (sig === s.retryStatsSig) continue;
     s.retryStatsSig = sig;
     logger.info({
       phone: s.phone, patched: RETRY_PATCHED, mode: retryMode, resends,
       refused: s.refusedStat ? { ...s.refusedStat, on: forgetRefused } : null,
       ownAnswered: s.retryOwnAnswered || 0,
+      ownKey: s.ownKeyStat ? { ...s.ownKeyStat, on: OWN_KEY_EVERY_POST && forgetRefused } : { posts: 0, forgotten: 0, on: OWN_KEY_EVERY_POST && forgetRefused },
       undecryptable: { ...undecryptable.totals(), on: stopLoops },
       lid: s.lidStat ? { ...s.lidStat, remembered: s.lidNone?.size || 0 } : null,
       groupKeys: { posts: groupKeys.posts, devices: groupKeys.devices, full: groupKeys.full },
@@ -636,6 +679,7 @@ function rememberOutgoing(phone, id, content, jid) {
   // group: whether a resend of it is held to the group's limit (retryGuard.js).
   // jid: the group a refused asker is forgotten in (flushRefusedAskers).
   m.set(id, { content, ts: Date.now(), group: String(jid || '').endsWith('@g.us'), jid: String(jid || '') });
+  noteOwnForNextPost(phone, jid);
   // Evict oldest entries past the limit (Map preserves insertion order).
   while (m.size > OUTGOING_CACHE_LIMIT) {
     const oldestKey = m.keys().next().value;
@@ -666,7 +710,16 @@ function retryCounterFor(s, phone) {
     // The number's own devices (his phone): answered always (retryGuard.js isOwnParticipant).
     isOwn: (participant) => isOwnParticipant(participant, s.sock?.authState?.creds?.me),
     // A resend let through, by who asked — a phone or a linked device (retry_stats); own devices counted too.
-    onAllow: (key, _kind, own) => { s.retryStats.resend(key); if (own) s.retryOwnAnswered = (s.retryOwnAnswered || 0) + 1; },
+    onAllow: (key, _kind, own) => {
+      s.retryStats.resend(key);
+      if (!own) return;
+      s.retryOwnAnswered = (s.retryOwnAnswered || 0) + 1;
+      // Which message his own phone asked for, and how long after it left (2026-11-22).
+      const at = String(key ?? '').indexOf(':');
+      const id = at > 0 ? String(key).slice(0, at) : String(key ?? '');
+      const mine = outgoingCache.get(phone)?.get(id);
+      logger.info({ phone, msgId: id, jid: mine?.jid || null, ageMs: mine?.ts ? Date.now() - mine.ts : null, asker: at > 0 ? String(key).slice(at + 1) : null }, 'own_device_resend');
+    },
     onSkip: (why, kind, id, key) => {
       // Refused, yet without the group's key: marked so, for the next post (flushRefusedAskers).
       if (kind === 'group' && forgetRefused && retryMode.keepGroupMemory) {
@@ -3022,6 +3075,7 @@ export function snapshotOf(phone) {
       groupPerMinute: retryRules.group.perMinute,
       refused: s.refusedStat ? { ...s.refusedStat, on: forgetRefused } : null,
       ownAnswered: s.retryOwnAnswered || 0,
+      ownKey: s.ownKeyStat ? { ...s.ownKeyStat, on: OWN_KEY_EVERY_POST && forgetRefused } : { posts: 0, forgotten: 0, on: OWN_KEY_EVERY_POST && forgetRefused },
       undecryptable: { ...undecryptable.totals(), on: stopLoops },
       stats: s.retryStats?.totals() || null,
       lid: s.lidStat ? { ...s.lidStat, remembered: s.lidNone?.size || 0 } : null,
