@@ -54,7 +54,7 @@ import { isOwnParticipant, makeRetryCounter, parseGroupLimit, RETRY_RULES } from
 import { quotedOf } from './quoted.js';
 import { baileysPatched } from './baileysPatch.js';
 import {
-  parseMode, forgetAsker, forgetAskers, makeRefusedAskers, makeUndecryptable, makeRetryStats, guardLidLookup, makeBreather, breathingRepository, setInSlices, waitUntil, makeTtlCache,
+  parseMode, forgetAsker, forgetAskers, makeRefusedAskers, makeHealer, userOf, makeUndecryptable, makeRetryStats, guardLidLookup, makeBreather, breathingRepository, setInSlices, waitUntil, makeTtlCache,
 } from './retryMode.js';
 
 // The station's number must never show "מחובר/ת" to the drivers: the bridge is
@@ -215,7 +215,7 @@ async function getCachedGroupMetadata(sock, jid) {
 // Surfaced via /diag and printed once on startup. Bump this string when you
 // redeploy a behavioral change so you can read the version straight from
 // Railway logs.
-const BRIDGE_BUILD = 'own-key-every-post-2026-11-22';
+const BRIDGE_BUILD = 'heal-refused-2026-11-22';
 
 /** How old a held private message may be and still be passed on. */
 const OFFLINE_PRIVATE_MAX_AGE_MS = 30 * 60_000;
@@ -358,6 +358,33 @@ async function flushOwnKeyGroups(s) {
     s.ownKeyFlushing = false;
   }
 }
+// A refused asker is healed (retryMode.js makeHealer): a fresh session for up to
+// 40 devices in ONE question to WhatsApp every 1.5 s, and his devices read anew
+// by the next post. Off: HEAL_REFUSED=off, or forgetRefused: false.
+const HEAL_REFUSED = String(process.env.HEAL_REFUSED || 'on').toLowerCase() !== 'off';
+async function flushHeal(s) {
+  if (!HEAL_REFUSED || !forgetRefused || !s.healer?.waiting || s.healing) return;
+  const sock = s.sock;
+  if (!sock?.assertSessions || s.status !== 'connected') return; // kept for the next round
+  s.healing = true;
+  const batch = s.healer.take();
+  try {
+    for (const p of batch) { try { s.devicesCache?.del?.(userOf(p)); } catch (_) { /* the list is read anew anyway in an hour */ } }
+    await Promise.race([
+      sock.assertSessions(batch, true),
+      new Promise((_, reject) => { const t = setTimeout(() => reject(new Error('heal_timeout')), 20_000); t.unref?.(); }),
+    ]);
+    s.healer.done(batch.length, true);
+  } catch (e) {
+    s.healer.done(batch.length, false);
+    if (Date.now() - (s.healWarnAt || 0) > 60_000) {
+      s.healWarnAt = Date.now();
+      logger.warn({ phone: s.phone, devices: batch.length, err: e?.message || String(e) }, 'refused_askers_heal_failed');
+    }
+  } finally {
+    s.healing = false;
+  }
+}
 async function flushRefusedAskers(s) {
   if (!s.refusedAskers?.size || s.refusedFlushing) return;
   const sock = s.sock;
@@ -384,7 +411,7 @@ async function flushRefusedAskers(s) {
 // Started here, outside any key-store transaction: a timer set while a message is
 // handled would carry that transaction's context into the write.
 setInterval(() => {
-  for (const s of sessions.values()) { void flushRefusedAskers(s); void flushOwnKeyGroups(s); }
+  for (const s of sessions.values()) { void flushRefusedAskers(s); void flushOwnKeyGroups(s); void flushHeal(s); }
 }, REFUSED_FLUSH_MS).unref?.();
 // Members who ask again while nothing of theirs is in a group's memory (forgetAsker).
 const askerRepeats = new Map();
@@ -419,7 +446,7 @@ globalThis.__bridgeRetry = {
 setInterval(() => {
   for (const s of sessions.values()) {
     const resends = s.retryStats?.totals();
-    const sig = JSON.stringify([resends, s.lidStat, groupKeys.posts, groupKeys.full, s.refusedStat, s.ownKeyStat, undecryptable.totals()]);
+    const sig = JSON.stringify([resends, s.lidStat, groupKeys.posts, groupKeys.full, s.refusedStat, s.ownKeyStat, s.healer?.stats(), undecryptable.totals()]);
     if (sig === s.retryStatsSig) continue;
     s.retryStatsSig = sig;
     logger.info({
@@ -427,6 +454,7 @@ setInterval(() => {
       refused: s.refusedStat ? { ...s.refusedStat, on: forgetRefused } : null,
       ownAnswered: s.retryOwnAnswered || 0,
       ownKey: s.ownKeyStat ? { ...s.ownKeyStat, on: OWN_KEY_EVERY_POST && forgetRefused } : { posts: 0, forgotten: 0, on: OWN_KEY_EVERY_POST && forgetRefused },
+      heal: s.healer ? { ...s.healer.stats(), on: HEAL_REFUSED && forgetRefused } : null,
       undecryptable: { ...undecryptable.totals(), on: stopLoops },
       lid: s.lidStat ? { ...s.lidStat, remembered: s.lidNone?.size || 0 } : null,
       groupKeys: { posts: groupKeys.posts, devices: groupKeys.devices, full: groupKeys.full },
@@ -699,6 +727,7 @@ function retryCounterFor(s, phone) {
   if (s.retryCounter) return s.retryCounter;
   s.retrySkipped = {};
   s.refusedAskers = makeRefusedAskers();
+  s.healer = makeHealer();
   s.refusedStat = { asked: 0, forgotten: 0 };
   let pending = {};
   let loggedAt = 0;
@@ -726,6 +755,8 @@ function retryCounterFor(s, phone) {
         const group = outgoingCache.get(phone)?.get(id)?.jid;
         const at = String(key ?? '').indexOf(':');
         if (group && at > 0) s.refusedAskers.note(group, String(key).slice(at + 1));
+        // ... and healed, so the key the next post carries him can be read (flushHeal).
+        if (at > 0) s.healer.note(String(key).slice(at + 1));
       }
       const k = `${kind}_${why}`;
       s.retrySkipped[k] = (s.retrySkipped[k] || 0) + 1;
@@ -3076,6 +3107,7 @@ export function snapshotOf(phone) {
       refused: s.refusedStat ? { ...s.refusedStat, on: forgetRefused } : null,
       ownAnswered: s.retryOwnAnswered || 0,
       ownKey: s.ownKeyStat ? { ...s.ownKeyStat, on: OWN_KEY_EVERY_POST && forgetRefused } : { posts: 0, forgotten: 0, on: OWN_KEY_EVERY_POST && forgetRefused },
+      heal: s.healer ? { ...s.healer.stats(), on: HEAL_REFUSED && forgetRefused } : null,
       undecryptable: { ...undecryptable.totals(), on: stopLoops },
       stats: s.retryStats?.totals() || null,
       lid: s.lidStat ? { ...s.lidStat, remembered: s.lidNone?.size || 0 } : null,

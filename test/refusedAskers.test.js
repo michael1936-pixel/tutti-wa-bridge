@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { forgetAskers, makeRefusedAskers } from '../retryMode.js';
+import { forgetAskers, makeRefusedAskers, makeHealer } from '../retryMode.js';
 import { makeRetryCounter, RETRY_RULES } from '../retryGuard.js';
 
 // 2026-11-15, "בהמתנה להודעה זו": a member refused a resend stayed marked as holding the group's key.
@@ -81,7 +81,7 @@ test('a refusal is told with who asked, and the session marks him for the next p
   assert.ok(session.includes("if (group && at > 0) s.refusedAskers.note(group, String(key).slice(at + 1));"));
   assert.ok(session.includes("jid: String(jid || '') });"));
   // The write is started by a module-level timer, never from inside a handled message.
-  assert.ok(session.includes('for (const s of sessions.values()) { void flushRefusedAskers(s); void flushOwnKeyGroups(s); }'));
+  assert.ok(session.includes('for (const s of sessions.values()) { void flushRefusedAskers(s); void flushOwnKeyGroups(s); void flushHeal(s); }'));
   const worker = readFileSync(new URL('../worker.js', import.meta.url), 'utf8');
   assert.ok(worker.includes("if (typeof m.forgetRefused === 'boolean') setForgetRefused(m.forgetRefused);"));
 });
@@ -101,8 +101,43 @@ test('own devices: forgotten in the group after a post, under the number and und
 test('own devices: wired - every group message of ours marks its group, the timer forgets, the ask is written down', () => {
   const src = readFileSync(new URL('../session.js', import.meta.url), 'utf8');
   assert.ok(src.includes('noteOwnForNextPost(phone, jid);'));
-  assert.ok(src.includes('{ void flushRefusedAskers(s); void flushOwnKeyGroups(s); }'));
+  assert.ok(src.includes('void flushRefusedAskers(s); void flushOwnKeyGroups(s);'));
   assert.ok(src.includes("participants: [me.id, me.lid].filter(Boolean),"));
   assert.ok(src.includes("'own_device_resend'"));
   assert.ok(src.includes("if (!OWN_KEY_EVERY_POST || !forgetRefused || !retryMode.keepGroupMemory) return;"));
+});
+
+// 2026-11-22: a refused asker was never healed (Baileys heals only inside a resend), so
+// the same devices asked after every post, for weeks.
+test('healer: a refused device is queued once, healed in batches, and not again for half an hour', () => {
+  let t = 0;
+  const h = makeHealer({ batch: 2, now: () => t });
+  h.note('111:0@lid'); h.note('111:0@lid'); h.note('222:3@lid'); h.note('972500000001:5@s.whatsapp.net');
+  assert.equal(h.waiting, 3);
+  assert.deepEqual(h.take(), ['111:0@lid', '222:3@lid']);
+  h.done(2, true);
+  assert.deepEqual(h.take(), ['972500000001:5@s.whatsapp.net']);
+  h.done(1, false);
+  assert.deepEqual(h.take(), []);
+  t = 60_000;
+  h.note('111:0@lid'); // soon after: the next post has not reached him yet
+  assert.equal(h.waiting, 0);
+  t = 10 * 60_000;
+  h.note('111:0@lid'); // long after he was healed, and still asking
+  assert.equal(h.waiting, 0);
+  t = 31 * 60_000;
+  h.note('111:0@lid');
+  assert.equal(h.waiting, 1);
+  const s = h.stats();
+  assert.deepEqual([s.asked, s.queued, s.healed, s.failed, s.batches, s.again], [7, 4, 2, 1, 2, 2]);
+  assert.deepEqual([s.lid, s.pn, s.phone, s.linked], [6, 1, 5, 2]);
+});
+
+test('healer: wired - a refusal queues the asker, the timer heals with one question and reads his devices anew', () => {
+  const src = readFileSync(new URL('../session.js', import.meta.url), 'utf8');
+  assert.ok(src.includes('if (at > 0) s.healer.note(String(key).slice(at + 1));'));
+  assert.ok(src.includes('void flushHeal(s);'));
+  assert.ok(src.includes('sock.assertSessions(batch, true),'));
+  assert.ok(src.includes('s.devicesCache?.del?.(userOf(p));'));
+  assert.ok(src.includes("if (!HEAL_REFUSED || !forgetRefused || !s.healer?.waiting || s.healing) return;"));
 });

@@ -165,6 +165,62 @@ export async function forgetAskers({ keys, group, participants, lidMapping, txKe
   return typeof keys.transaction === 'function' && txKey ? keys.transaction(work, txKey) : work();
 }
 
+// ---- A member REFUSED a resend is healed, so he stops asking --------------------
+// 2026-11-22 ("בהמתנה להודעה זו" on members' phones, Michael: «אסור אסור שזה
+// יקרה»): ~57 devices asked after every post of ours, for weeks, and ~50 of them
+// were refused by the limit. Baileys heals an asker only inside the resend it
+// makes (a fresh session from his retry receipt / assertSessions(force),
+// messages-recv.js sendMessagesAgain) - a refused asker got none of it: he was
+// forgotten in the group's memory, the next post carried him the key over the
+// SAME broken session (or not at all, his device missing from the cached device
+// list), and he asked again on every post, for ever.
+// Now a refused asker is also (a) given a fresh session, many askers in one
+// question to WhatsApp, and (b) dropped from the cached device list, so the next
+// post reads his devices anew. One device is healed once in `everyMs`.
+// `again` counts a device refused again long after it was healed: if that stays
+// high, the cause is elsewhere.
+export function makeHealer({ everyMs = 30 * 60_000, againAfterMs = 3 * 60_000, batch = 40, max = 20_000, now = Date.now } = {}) {
+  const healedAt = new Map(); // participant -> when he was last put in a batch
+  const queue = new Set();
+  const stat = { asked: 0, queued: 0, healed: 0, failed: 0, batches: 0, again: 0, lid: 0, pn: 0, phone: 0, linked: 0 };
+  return {
+    /** A refused group ask of this device. */
+    note(participant) {
+      const p = String(participant ?? '');
+      if (!p.includes('@')) return;
+      const t = now();
+      stat.asked += 1;
+      if (isLid(p)) stat.lid += 1; else stat.pn += 1;
+      const device = Number(p.split('@')[0].split(':')[1] || 0);
+      if (device > 0) stat.linked += 1; else stat.phone += 1;
+      const at = healedAt.get(p);
+      if (at !== undefined) {
+        if (t - at > againAfterMs) stat.again += 1;
+        if (t - at < everyMs) return;
+      }
+      if (queue.size < max && !queue.has(p)) { queue.add(p); stat.queued += 1; }
+    },
+    /** The next devices to heal - at most `batch`; they count as healed from now. */
+    take() {
+      const t = now();
+      const out = [];
+      for (const p of queue) {
+        out.push(p);
+        queue.delete(p);
+        healedAt.delete(p);
+        healedAt.set(p, t);
+        if (out.length >= batch) break;
+      }
+      // The oldest go first (a Map keeps the order they were put in).
+      while (healedAt.size > max) healedAt.delete(healedAt.keys().next().value);
+      return out;
+    },
+    done(n, ok) { stat.batches += 1; if (ok) stat.healed += n; else stat.failed += n; },
+    get waiting() { return queue.size; },
+    stats: () => ({ ...stat, waiting: queue.size, known: healedAt.size }),
+  };
+}
+
 // ---- A message that never decrypts is not asked for without end ---------------
 /**
  * `failed(id)` — the message failed to decrypt once more. -> true when it has
