@@ -71,3 +71,60 @@ test('phonesToParticipant answers a member\'s phone alone - but never the number
   const session = readFileSync(new URL('../session.js', import.meta.url), 'utf8');
   assert.ok(session.includes('isOwn: (participant) => { for (const s of sessions.values()) if (isOwnParticipant(participant, s.sock?.authState?.creds?.me)) return true; return false; },'));
 });
+
+// 2026-11-24 20:55, his «רק היסודי»: when even the copies stop reaching his phone, a fresh
+// session with it - by itself, at most once in half an hour; and when his phone's identity
+// changes (Baileys skips the number's own phone there).
+test('three copies in a row that did not reach his phone ask for a fresh session - once', () => {
+  let t = 0;
+  const w = makeOwnWatch({ now: () => t });
+  for (const id of ['A', 'B', 'C']) w.expect(id, 'g@g.us');
+  t = 21_000;
+  assert.equal(w.due().length, 3);
+  t = 70_000;
+  assert.equal(w.needsReset(), false, 'not yet a minute after the copies');
+  t = 82_000;
+  assert.equal(w.needsReset(), true);
+  assert.equal(w.needsReset(), false, 'asked once');
+  w.resetDone('streak');
+  const s = w.stats();
+  assert.equal(s.missed, 3);
+  assert.equal(s.resets, 1);
+  assert.equal(s.reset_streak, 1);
+  assert.equal(s.streak, 0);
+});
+
+test('a receipt in between breaks the streak; and never twice in half an hour', () => {
+  let t = 0;
+  const w = makeOwnWatch({ now: () => t });
+  for (const id of ['A', 'B']) w.expect(id, 'g@g.us');
+  t = 21_000; w.due();
+  t = 90_000;
+  assert.equal(w.needsReset(), false, 'two misses only');
+  w.expect('C', 'g@g.us');
+  w.delivered('C'); // his phone took one: the streak starts over
+  assert.equal(w.stats().streak, 0);
+  for (const id of ['D', 'E', 'F']) w.expect(id, 'g@g.us');
+  t = 120_000; w.due();
+  t = 190_000;
+  assert.equal(w.needsReset(), true);
+  w.resetDone('streak');
+  for (const id of ['G', 'H', 'I']) w.expect(id, 'g@g.us');
+  t = 220_000; w.due();
+  t = 290_000;
+  assert.equal(w.needsReset(), false, 'within half an hour of the last reset');
+  t = 190_000 + 31 * 60_000;
+  assert.equal(w.needsReset(), true);
+});
+
+test('wired: a streak or his phone\'s new identity renews the session with his phone, both names', () => {
+  const session = readFileSync(new URL('../session.js', import.meta.url), 'utf8');
+  assert.ok(session.includes("if (s.ownWatch.needsReset()) await resetOwnSession(s, 'streak');"));
+  assert.ok(session.includes("if (String(action) === 'skipped_self_primary') {"));
+  assert.ok(session.includes("if (isOwnParticipant(from, s.sock?.authState?.creds?.me)) void resetOwnSession(s, 'identity');"));
+  assert.ok(session.includes('const jids = [`${userOf(me.id)}@s.whatsapp.net`, me.lid ? `${userOf(me.lid)}@lid` : null].filter(Boolean);'));
+  assert.ok(session.includes('sock.assertSessions(jids, true),'));
+  // the needsReset check comes before "no copies due": a quiet minute still heals
+  const flush = session.slice(session.indexOf('async function flushOwnWatch(s) {'), session.indexOf('async function flushRefusedAskers(s) {'));
+  assert.ok(flush.indexOf("needsReset()") < flush.indexOf('if (!due.length) return;'));
+});

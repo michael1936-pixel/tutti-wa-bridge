@@ -697,10 +697,16 @@ export async function forgetEverywhere({ keys, groups, participants, lidMapping,
 // devices within `waitMs`, the post is sent again to his phone alone (a private
 // copy to his own device, not a post to the group), at most `perMinute` a minute.
 
-export function makeOwnWatch({ waitMs = 20_000, maxAgeMs = 5 * 60_000, perMinute = 30, max = 3_000, now = Date.now } = {}) {
-  const posts = new Map(); // msgId -> { at, group, delivered, resent }
+// When even the copy does not reach it (2026-11-24 20:55: 5623's own phone took 20% of
+// our posts in time and only 13 of 116 copies - 3887's took 88%): the private session
+// with his phone is broken, and both the group's key in each post and the copy travel
+// on it. `missAfterMs` after a copy with no receipt it is a miss; `streakMin` misses in
+// a row ask for a fresh session with his phone (needsReset), at most once in `resetEveryMs`.
+export function makeOwnWatch({ waitMs = 20_000, maxAgeMs = 5 * 60_000, perMinute = 30, max = 3_000, missAfterMs = 60_000, streakMin = 3, resetEveryMs = 30 * 60_000, now = Date.now } = {}) {
+  const posts = new Map(); // msgId -> { at, group, delivered, resent, resentAt, missed }
   const sentAt = [];       // resend times, for the minute's cap
-  const stat = { posts: 0, delivered: 0, late_delivered: 0, resent: 0, resend_ok: 0, resend_failed: 0, capped: 0, receipts: 0 };
+  const stat = { posts: 0, delivered: 0, late_delivered: 0, resent: 0, resend_ok: 0, resend_failed: 0, capped: 0, receipts: 0, missed: 0, streak: 0, resets: 0 };
+  let resetAt = -Infinity;
   return {
     /** A group post of ours went out. */
     expect(msgId, group) {
@@ -716,6 +722,7 @@ export function makeOwnWatch({ waitMs = 20_000, maxAgeMs = 5 * 60_000, perMinute
       if (!p || p.delivered) return;
       p.delivered = true;
       stat[p.resent ? 'late_delivered' : 'delivered'] += 1;
+      stat.streak = 0; // his phone takes our posts again
     },
     /** The posts to send again to the own phone now (each once), within the minute's cap. */
     due() {
@@ -729,6 +736,7 @@ export function makeOwnWatch({ waitMs = 20_000, maxAgeMs = 5 * 60_000, perMinute
         if (age > maxAgeMs) { p.resent = true; continue; } // too old to help: let go
         if (sentAt.length >= perMinute) { stat.capped += 1; break; }
         p.resent = true;
+        p.resentAt = t;
         sentAt.push(t);
         stat.resent += 1;
         out.push({ id, group: p.group });
@@ -736,6 +744,22 @@ export function makeOwnWatch({ waitMs = 20_000, maxAgeMs = 5 * 60_000, perMinute
       return out;
     },
     done(ok) { stat[ok ? 'resend_ok' : 'resend_failed'] += 1; },
+    /** True once when the copies stopped helping: `streakMin` in a row (and none in `resetEveryMs`). */
+    needsReset() {
+      const t = now();
+      for (const p of posts.values()) {
+        if (p.delivered || !p.resentAt || p.missed || t - p.resentAt < missAfterMs) continue;
+        p.missed = true;
+        stat.missed += 1;
+        stat.streak += 1;
+      }
+      if (stat.streak < streakMin || t - resetAt < resetEveryMs) return false;
+      resetAt = t;
+      stat.streak = 0;
+      return true;
+    },
+    /** A fresh session with his phone was made (by a streak, or his phone's identity changed). */
+    resetDone(why) { stat.resets += 1; stat[`reset_${why}`] = (stat[`reset_${why}`] || 0) + 1; resetAt = now(); stat.streak = 0; },
     stats: () => ({ ...stat, watching: [...posts.values()].filter((p) => !p.delivered && !p.resent).length }),
   };
 }

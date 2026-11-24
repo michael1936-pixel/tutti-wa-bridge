@@ -219,7 +219,7 @@ async function getCachedGroupMetadata(sock, jid) {
 // Surfaced via /diag and printed once on startup. Bump this string when you
 // redeploy a behavioral change so you can read the version straight from
 // Railway logs.
-const BRIDGE_BUILD = 'no-heal-old-asks-2026-11-24';
+const BRIDGE_BUILD = 'own-phone-self-heal-2026-11-24';
 
 /** How old a held private message may be and still be passed on. */
 const OFFLINE_PRIVATE_MAX_AGE_MS = 30 * 60_000;
@@ -445,12 +445,40 @@ function ownPhoneJid(me) {
   if (me?.lid) return `${userOf(me.lid)}@lid`;
   return me?.id ? `${userOf(me.id)}@s.whatsapp.net` : null;
 }
+// A fresh private session with the number's own phone (2026-11-24, his «רק היסודי»):
+// when the copies stop reaching it (makeOwnWatch needsReset), or when WhatsApp says his
+// phone's identity changed - Baileys renews every member's session then, but skips the
+// number's own phone ('skipped_self_primary', identity-change-handler.js), so after a
+// reinstall or a restore his phone could not read our posts again. Both his names.
+async function resetOwnSession(s, why) {
+  const sock = s.sock;
+  const me = sock?.authState?.creds?.me;
+  if (!sock?.assertSessions || !me?.id || s.status !== 'connected' || s.ownResetting) return false;
+  const jids = [`${userOf(me.id)}@s.whatsapp.net`, me.lid ? `${userOf(me.lid)}@lid` : null].filter(Boolean);
+  s.ownResetting = true;
+  try {
+    await Promise.race([
+      sock.assertSessions(jids, true),
+      new Promise((_, reject) => { const t = setTimeout(() => reject(new Error('own_reset_timeout')), 20_000); t.unref?.(); }),
+    ]);
+    (s.ownWatch = s.ownWatch || makeOwnWatch()).resetDone(why);
+    logger.warn({ phone: s.phone, why, jids }, 'own_phone_session_reset');
+    return true;
+  } catch (e) {
+    logger.warn({ phone: s.phone, why, err: e?.message || String(e) }, 'own_phone_session_reset_failed');
+    return false;
+  } finally {
+    s.ownResetting = false;
+  }
+}
 async function flushOwnWatch(s) {
   if (!OWN_PHONE_WATCH || !s.ownWatch || s.ownWatchFlushing) return;
   const sock = s.sock;
   const me = sock?.authState?.creds?.me;
   const own = ownPhoneJid(me);
   if (!sock?.relayMessage || !own || s.status !== 'connected') return;
+  // The copies stopped reaching his phone: a fresh session with it first.
+  if (s.ownWatch.needsReset()) await resetOwnSession(s, 'streak');
   const due = s.ownWatch.due();
   if (!due.length) return;
   s.ownWatchFlushing = true;
@@ -527,7 +555,12 @@ globalThis.__bridgeRetry = {
   isOwn: (participant) => { for (const s of sessions.values()) if (isOwnParticipant(participant, s.sock?.authState?.creds?.me)) return true; return false; },
   // A member's identity changed (not his companion device's alone: Baileys skips those; not ours).
   onIdentityChange: (from, action) => {
-    if (['invalid_notification', 'no_identity_node', 'skipped_self_primary'].includes(String(action))) return;
+    // The number's own phone changed its identity: Baileys skips it - the bridge renews the session itself.
+    if (String(action) === 'skipped_self_primary') {
+      if (OWN_PHONE_WATCH) for (const s of sessions.values()) if (isOwnParticipant(from, s.sock?.authState?.creds?.me)) void resetOwnSession(s, 'identity');
+      return;
+    }
+    if (['invalid_notification', 'no_identity_node'].includes(String(action))) return;
     noteChangedMember(from, 'identity');
   },
   // A member's devices: a new one, or his list changed - forgotten in every group (a removed one has nothing to get).
