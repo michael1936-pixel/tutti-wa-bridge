@@ -84,7 +84,7 @@ test('a server that does not take packs: every message goes alone, and packs res
   assert.equal(p.stats().packs, true);
 });
 
-test('a pack that fails on the way is sent again message by message', async () => {
+test('a pack that fails on the way twice is sent again message by message', async () => {
   const calls = [];
   const post = async (body) => {
     calls.push(body);
@@ -99,7 +99,86 @@ test('a pack that fails on the way is sent again message by message', async () =
   const all = ['a', 'b', 'c'].map((id) => p.add(msg(id)));
   release();
   await Promise.all(all);
-  assert.deepEqual(calls.map((c) => (c.batch ? 'pack' : c.wa_message_id)), ['a', 'pack', 'b', 'c']);
+  assert.deepEqual(calls.map((c) => (c.batch ? 'pack' : c.wa_message_id)), ['a', 'pack', 'pack', 'b', 'c']);
+  assert.equal(p.stats().failed_packs, 2);
+  assert.equal(p.stats().sent_alone_after, 2);
+});
+
+// 2026-11-24: no flood - a failed pack is tried once more as a pack, then its messages go a few at a time.
+test('a pack the server fails (5xx) is sent once more as the same pack, and taken - nothing goes alone', async () => {
+  const calls = [];
+  let packTries = 0;
+  const post = async (body) => {
+    calls.push(body);
+    if (body.batch) {
+      packTries++;
+      if (packTries === 1) return { status: 503, text: 'busy' };
+      return { status: 200, text: JSON.stringify({ results: body.batch.map(() => ({ status: 200 })) }) };
+    }
+    return { status: 200, text: '{"ok":true}' };
+  };
+  let release;
+  const first = new Promise((r) => { release = r; });
+  let n = 0;
+  const gated = async (body) => { if (n++ === 0) await first; return post(body); };
+  const seen = [];
+  const p = makeFeedPacker({ post: gated, lanes: 1, sleep: async () => {}, onResult: (m, r) => seen.push([m.wa_message_id, r.attempt, r.packed]) });
+  const all = ['a', 'b', 'c', 'd'].map((id) => p.add(msg(id)));
+  release();
+  await Promise.all(all);
+  assert.deepEqual(calls.map((c) => (c.batch ? `pack${c.batch.length}` : c.wa_message_id)), ['a', 'pack3', 'pack3']);
+  assert.deepEqual(seen, [['a', 1, 1], ['b', 2, 3], ['c', 2, 3], ['d', 2, 3]]);
+  assert.equal(p.stats().packs, true, 'a failure is not a refusal: packs go on');
+  assert.equal(p.stats().sent_alone_after, 0);
+});
+
+test('a pack that fails twice: its 60 messages go alone a few at a time, never all at once', async () => {
+  let inFlight = 0;
+  let most = 0;
+  const lone = [];
+  const post = async (body) => {
+    if (body.batch) throw new Error('timeout');
+    inFlight++; most = Math.max(most, inFlight);
+    lone.push(body.wa_message_id);
+    await tick();
+    inFlight--;
+    return { status: 200, text: '{"ok":true}' };
+  };
+  let release;
+  const first = new Promise((r) => { release = r; });
+  let n = 0;
+  const gated = async (body) => { if (n++ === 0) await first; return post(body); };
+  const p = makeFeedPacker({ post: gated, lanes: 1, max: 60, aloneAtOnce: 4, sleep: async () => {} });
+  const ids = Array.from({ length: 61 }, (_, i) => `m${i}`);
+  const all = ids.map((id) => p.add(msg(id)));
+  release();
+  await Promise.all(all);
+  assert.equal(lone.length, 61, 'every message answered - nothing dropped');
+  assert.ok(most <= 4, `at most 4 alone at once, saw ${most}`);
+});
+
+test('many lanes failing together stay within lanes x aloneAtOnce requests at once', async () => {
+  let inFlight = 0;
+  let most = 0;
+  let answered = 0;
+  const post = async (body) => {
+    inFlight++; most = Math.max(most, inFlight);
+    await tick(); await tick();
+    inFlight--;
+    if (body.batch) return { status: 502, text: 'bad gateway' };
+    answered++;
+    return { status: 200, text: '{"ok":true}' };
+  };
+  const p = makeFeedPacker({ post, lanes: 12, max: 60, aloneAtOnce: 4, sleep: async () => {} });
+  const all = Array.from({ length: 12 + 12 * 60 }, (_, i) => p.add(msg(`m${i}`)));
+  await Promise.all(all);
+  assert.equal(answered, 12 + 12 * 60);
+  assert.ok(most <= 12 * 4, `at most 48 requests at once, saw ${most}`);
+});
+
+test('wired: the server shows the failed packs in /diag', () => {
+  const server = readFileSync(new URL('../server.js', import.meta.url), 'utf8');
+  assert.ok(server.includes('group_feed_pack: { ...feedPacker.stats(),'));
 });
 
 test('a lone message that the server fails is tried once more', async () => {

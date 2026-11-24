@@ -16,6 +16,13 @@
 // Nothing is dropped: a pack the server does not take as a pack (an older
 // function, a refusal, a failure) is sent again message by message, the old
 // way; after a refusal the packs rest for a minute and everything goes alone.
+//
+// No flood (2026-11-24): a pack that FAILS (5xx, a network error, a timeout) is
+// first sent once more as the same pack - to the next copy of the function -
+// and only if that fails too do its messages go alone, a few at a time
+// (`aloneAtOnce`), never all together. Before, every failed pack became up to
+// `max` requests at the same moment: with 12 lanes x 60 that is ~720 requests
+// at once into a server that has just failed under load.
 // =============================================================================
 
 export function makeFeedPacker({
@@ -24,7 +31,8 @@ export function makeFeedPacker({
   aloneLanes = 64,            // ... while they rest (the old limit)
   max = 40,                   // messages in one pack
   restMs = 60_000,            // after a refusal, no packs for this long
-  retryMs = 3_000,            // the pause before the second try of a lone message
+  retryMs = 3_000,            // the pause before the second try of a lone message (and of a failed pack)
+  aloneAtOnce = 4,            // a failed pack's messages: this many alone at a time
   onResult = () => {},        // (payload, { status, body, attempt, packed, queued })
   onError = () => {},         // (payload | null, err, { attempt, packed })
   onBacklog = () => {},       // ({ queued, busy })
@@ -35,6 +43,8 @@ export function makeFeedPacker({
   let busy = 0;
   let restUntil = 0;
   let warnAt = 0;
+  let failedPacks = 0;        // pack tries not taken (shown in /diag)
+  let sentAloneAfter = 0;     // messages that went alone after their pack was not taken
 
   const packsOn = () => now() >= restUntil;
 
@@ -61,31 +71,44 @@ export function makeFeedPacker({
     }
   }
 
+  // A failed pack's messages alone, a few at a time - never all of them at once.
+  async function sendFewAtOnce(payloads) {
+    const step = Math.max(1, aloneAtOnce);
+    sentAloneAfter += payloads.length;
+    for (let i = 0; i < payloads.length; i += step) {
+      await Promise.all(payloads.slice(i, i + step).map((p) => sendAlone(p, false)));
+    }
+  }
+
   async function sendPack(payloads) {
     if (payloads.length === 1) return sendAlone(payloads[0]);
-    let refused = false;
-    try {
-      payloads.forEach((p) => stamp(p, true));
-      const resp = await post({ batch: payloads });
-      let answer = null;
-      try { answer = JSON.parse(resp.text || ''); } catch (_) { /* not a pack's answer */ }
-      const results = answer && Array.isArray(answer.results) ? answer.results : null;
-      if (resp.status === 200 && results && results.length === payloads.length) {
-        payloads.forEach((p, i) => {
-          const r = results[i] || {};
-          onResult(p, { status: Number(r.status) || 200, body: JSON.stringify(r).slice(0, 200), attempt: 1, packed: payloads.length, queued: waiting.length });
-        });
-        return;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      let refused = false;
+      try {
+        payloads.forEach((p) => stamp(p, attempt === 1));
+        const resp = await post({ batch: payloads });
+        let answer = null;
+        try { answer = JSON.parse(resp.text || ''); } catch (_) { /* not a pack's answer */ }
+        const results = answer && Array.isArray(answer.results) ? answer.results : null;
+        if (resp.status === 200 && results && results.length === payloads.length) {
+          payloads.forEach((p, i) => {
+            const r = results[i] || {};
+            onResult(p, { status: Number(r.status) || 200, body: JSON.stringify(r).slice(0, 200), attempt, packed: payloads.length, queued: waiting.length });
+          });
+          return;
+        }
+        // Not taken as a pack (an older function answers 400): the old way, and no packs for a while.
+        refused = resp.status < 500;
+        onError(null, new Error(`pack_not_taken_${resp.status}`), { attempt, packed: payloads.length });
+      } catch (err) {
+        onError(null, err, { attempt, packed: payloads.length });
       }
-      // Not taken as a pack (an older function answers 400): the old way, and no packs for a while.
-      refused = resp.status < 500;
-      onError(null, new Error(`pack_not_taken_${resp.status}`), { attempt: 1, packed: payloads.length });
-    } catch (err) {
-      onError(null, err, { attempt: 1, packed: payloads.length });
+      failedPacks++;
+      if (refused) { restUntil = now() + restMs; break; }
+      // A failure (5xx, network, timeout): the same pack once more - it goes to the next copy.
+      await sleep(retryMs);
     }
-    if (refused) restUntil = now() + restMs;
-    else await sleep(retryMs);
-    await Promise.all(payloads.map((p) => sendAlone(p, false)));
+    await sendFewAtOnce(payloads);
   }
 
   function pump() {
@@ -114,7 +137,7 @@ export function makeFeedPacker({
         pump();
       });
     },
-    stats: () => ({ queued: waiting.length, busy, packs: packsOn() }),
+    stats: () => ({ queued: waiting.length, busy, packs: packsOn(), failed_packs: failedPacks, sent_alone_after: sentAloneAfter }),
   };
 }
 
