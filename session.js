@@ -219,7 +219,7 @@ async function getCachedGroupMetadata(sock, jid) {
 // Surfaced via /diag and printed once on startup. Bump this string when you
 // redeploy a behavioral change so you can read the version straight from
 // Railway logs.
-const BRIDGE_BUILD = 'own-phone-watch-2026-11-24';
+const BRIDGE_BUILD = 'no-heal-old-asks-2026-11-24';
 
 /** How old a held private message may be and still be passed on. */
 const OFFLINE_PRIVATE_MAX_AGE_MS = 30 * 60_000;
@@ -366,8 +366,14 @@ async function flushOwnKeyGroups(s) {
 // 40 devices in ONE question to WhatsApp every 1.5 s, and his devices read anew
 // by the next post. Off: HEAL_REFUSED=off, or forgetRefused: false.
 const HEAL_REFUSED = String(process.env.HEAL_REFUSED || 'on').toLowerCase() !== 'off';
+// At most HEAL_BATCH devices every HEAL_GAP_MS (2026-11-24: was 40 every 1.5 s - 1,600 forced
+// sessions a minute in a storm). 20 every 5 s = 240 a minute; the rest wait their turn.
+const HEAL_BATCH = Math.max(1, Number(process.env.HEAL_BATCH || 20));
+const HEAL_GAP_MS = Math.max(1_500, Number(process.env.HEAL_GAP_MS || 5_000));
 async function flushHeal(s) {
   if (!HEAL_REFUSED || !forgetRefused || !s.healer?.waiting || s.healing) return;
+  if (Date.now() - (s.healAt || 0) < HEAL_GAP_MS) return;
+  s.healAt = Date.now();
   const sock = s.sock;
   if (!sock?.assertSessions || s.status !== 'connected') return; // kept for the next round
   s.healing = true;
@@ -849,7 +855,7 @@ function retryCounterFor(s, phone) {
   if (s.retryCounter) return s.retryCounter;
   s.retrySkipped = {};
   s.refusedAskers = makeRefusedAskers();
-  s.healer = makeHealer();
+  s.healer = makeHealer({ batch: HEAL_BATCH });
   // Who asks again and why: on his member's cached device list or not (retryMode.js makeAskerProbe).
   s.askerProbe = s.askerProbe || makeAskerProbe();
   s.refusedStat = { asked: 0, forgotten: 0 };
@@ -881,8 +887,12 @@ function retryCounterFor(s, phone) {
         const group = outgoingCache.get(phone)?.get(id)?.jid;
         const at = String(key ?? '').indexOf(':');
         if (group && at > 0) s.refusedAskers.note(group, String(key).slice(at + 1));
-        // ... and healed, so the key the next post carries him can be read (flushHeal).
-        if (at > 0) s.healer.note(String(key).slice(at + 1));
+        // ... and healed, so the key the next post carries him can be read (flushHeal) - but not for
+        // a post too old to answer: after a restart tens of thousands of such asks come at once
+        // (2026-11-24 16:40: 46,614 in minutes), and healing each one clogged the number - its
+        // incoming group messages were up to 9 minutes late (16:52-17:08). Forgetting stays.
+        if (at > 0 && why !== 'too_old') s.healer.note(String(key).slice(at + 1));
+        else if (at > 0) s.healSkippedOld = (s.healSkippedOld || 0) + 1;
       }
       const k = `${kind}_${why}`;
       s.retrySkipped[k] = (s.retrySkipped[k] || 0) + 1;
@@ -3238,7 +3248,7 @@ export function snapshotOf(phone) {
       refused: s.refusedStat ? { ...s.refusedStat, on: forgetRefused } : null,
       ownAnswered: s.retryOwnAnswered || 0,
       ownKey: s.ownKeyStat ? { ...s.ownKeyStat, on: OWN_KEY_EVERY_POST && forgetRefused } : { posts: 0, forgotten: 0, on: OWN_KEY_EVERY_POST && forgetRefused },
-      heal: s.healer ? { ...s.healer.stats(), on: HEAL_REFUSED && forgetRefused } : null,
+      heal: s.healer ? { ...s.healer.stats(), on: HEAL_REFUSED && forgetRefused, skippedOld: s.healSkippedOld || 0, batch: HEAL_BATCH, gapMs: HEAL_GAP_MS } : null,
       // Who asks for a group post again: on his member's cached device list or not (2026-11-24).
       askers: s.askerProbe ? { ...s.askerProbe.stats(), devicesTtlMin: DEVICES_TTL_MS / 60_000, postKeys: postKeys.stats() } : null,
       // Members whose identity or devices changed, forgotten in every group (2026-11-24).

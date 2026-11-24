@@ -135,9 +135,33 @@ test('healer: a refused device is queued once, healed in batches, and not again 
 
 test('healer: wired - a refusal queues the asker, the timer heals with one question and reads his devices anew', () => {
   const src = readFileSync(new URL('../session.js', import.meta.url), 'utf8');
-  assert.ok(src.includes('if (at > 0) s.healer.note(String(key).slice(at + 1));'));
+  assert.ok(src.includes("if (at > 0 && why !== 'too_old') s.healer.note(String(key).slice(at + 1));"));
   assert.ok(src.includes('void flushHeal(s);'));
   assert.ok(src.includes('sock.assertSessions(batch, true),'));
   assert.ok(src.includes('s.devicesCache?.del?.(userOf(p));'));
   assert.ok(src.includes("if (!HEAL_REFUSED || !forgetRefused || !s.healer?.waiting || s.healing) return;"));
+});
+
+// 2026-11-24 16:40: after a restart 46,614 asks for posts too old to answer came in
+// minutes; healing each clogged the number (its group messages up to 9 minutes late).
+test('healer: an ask for a post too old is forgotten but NOT healed, and healing is paced', () => {
+  const src = readFileSync(new URL('../session.js', import.meta.url), 'utf8');
+  // the refusal path: forgetting for every refusal, healing only when not too old
+  const onSkip = src.slice(src.indexOf('    onSkip: (why, kind, id, key) => {'), src.indexOf("      const k = `${kind}_${why}`;"));
+  assert.ok(onSkip.includes('s.refusedAskers.note(group, String(key).slice(at + 1));'));
+  assert.ok(onSkip.includes("if (at > 0 && why !== 'too_old') s.healer.note(String(key).slice(at + 1));"));
+  assert.ok(onSkip.includes('s.healSkippedOld = (s.healSkippedOld || 0) + 1;'));
+  // the pace: HEAL_BATCH devices every HEAL_GAP_MS (20 every 5 s by default)
+  assert.ok(src.includes("const HEAL_BATCH = Math.max(1, Number(process.env.HEAL_BATCH || 20));"));
+  assert.ok(src.includes("const HEAL_GAP_MS = Math.max(1_500, Number(process.env.HEAL_GAP_MS || 5_000));"));
+  assert.ok(src.includes('if (Date.now() - (s.healAt || 0) < HEAL_GAP_MS) return;'));
+  assert.ok(src.includes('s.healer = makeHealer({ batch: HEAL_BATCH });'));
+});
+
+test('healer: a storm of 10,000 devices is healed at most 20 at a time', () => {
+  let t = 0;
+  const h = makeHealer({ batch: 20, now: () => t });
+  for (let i = 0; i < 10_000; i++) h.note(`${i}@lid`);
+  assert.equal(h.take().length, 20);
+  assert.equal(h.waiting, 9_980);
 });
