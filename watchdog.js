@@ -60,6 +60,18 @@ export const ROUTES = [
     phoneOf: (req) => digits(req.query?.session || req.query?.phone || ''),
     missing: () => null, bad: { error: 'session required' },
   },
+  // Two routes of the numbers that were never routed here (2026-11-24): every
+  // call answered 404 "Cannot POST" - the app's mark on a driver's message
+  // never reached WhatsApp (whatsapp-chat-send), and the groups' invite links
+  // were never collected (wa-group-links-collect stops on a 404).
+  {
+    method: 'POST', path: '/react', key: 'POST /react', timeoutMs: 60_000, phoneOf: bodySession,
+    missing: (req) => !req.body?.jid || !req.body?.id, bad: { error: 'jid, id, session required' },
+  },
+  {
+    method: 'POST', path: '/group-invite', key: 'POST /group-invite', timeoutMs: 30_000, phoneOf: bodySession,
+    missing: (req) => !/^[0-9-]+@g\.us$/.test(String(req.body?.jid || '')), bad: { error: 'session and group jid required' },
+  },
 ];
 
 /**

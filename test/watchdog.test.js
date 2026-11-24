@@ -1,6 +1,7 @@
 // npm test (node --test test/*.test.js)  — the watchdog's and the router's rules, without WhatsApp.
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import {
   ROUTES,
   routeDecision,
@@ -172,9 +173,32 @@ test('routing: the routes answer their own 400 first, then 409 for an unknown nu
 test('every route the bridge had is routed', () => {
   const keys = ROUTES.map((r) => r.key).sort();
   assert.deepEqual(keys, [
-    'DELETE /session/:phone', 'GET /groups', 'POST /delete', 'POST /edit', 'POST /logout', 'POST /pair',
-    'POST /profile-pic', 'POST /reset', 'POST /reset-peer', 'POST /send', 'POST /send-reply', 'POST /session/:phone/logout',
+    'DELETE /session/:phone', 'GET /groups', 'POST /delete', 'POST /edit', 'POST /group-invite', 'POST /logout', 'POST /pair',
+    'POST /profile-pic', 'POST /react', 'POST /reset', 'POST /reset-peer', 'POST /send', 'POST /send-reply', 'POST /session/:phone/logout',
   ].sort());
+});
+
+test('every route a number answers (session.js) is routed by the server - none is left at 404 again', () => {
+  // 2026-11-24: /react and /group-invite lived in session.js but not in this list:
+  // every call answered 404 "Cannot POST" for two weeks.
+  const src = readFileSync(new URL('../session.js', import.meta.url), 'utf8');
+  const answered = [...src.matchAll(/^app\.(get|post|delete)\('([^']+)'/gm)].map((m) => `${m[1].toUpperCase()} ${m[2]}`);
+  assert.ok(answered.length >= 10);
+  const routed = new Set(ROUTES.map((r) => r.key));
+  assert.deepEqual(answered.filter((k) => !routed.has(k)), []);
+});
+
+test('the mark on a message and the invite link: by the number named, with the checks of the number itself', () => {
+  const known = (p) => p === '972500000001';
+  const react = route('POST /react');
+  assert.deepEqual(routeDecision(react, { body: { session: '972500000001', jid: 'a@s.whatsapp.net', id: 'X' } }, known), { phone: '972500000001' });
+  assert.deepEqual(routeDecision(react, { body: { session: '972500000001', jid: 'a@s.whatsapp.net' } }, known).reply,
+    { code: 400, body: { error: 'jid, id, session required' } });
+  assert.equal(routeDecision(react, { body: { session: '972500000002', jid: 'a@s.whatsapp.net', id: 'X' } }, known).reply.code, 409);
+  const invite = route('POST /group-invite');
+  assert.deepEqual(routeDecision(invite, { body: { session: '972500000001', jid: '120363000000000001@g.us' } }, known), { phone: '972500000001' });
+  assert.deepEqual(routeDecision(invite, { body: { session: '972500000001', jid: '972500000009@s.whatsapp.net' } }, known).reply,
+    { code: 400, body: { error: 'session and group jid required' } });
 });
 
 test('silence: a number that usually hears little is given the time of its own pace', () => {
