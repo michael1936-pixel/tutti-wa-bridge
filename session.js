@@ -54,7 +54,7 @@ import { isOwnParticipant, makeRetryCounter, parseGroupLimit, RETRY_RULES } from
 import { quotedOf } from './quoted.js';
 import { baileysPatched } from './baileysPatch.js';
 import {
-  parseMode, forgetAsker, forgetAskers, makeRefusedAskers, makeHealer, userOf, makeUndecryptable, makeRetryStats, guardLidLookup, makeBreather, breathingRepository, setInSlices, waitUntil, makeTtlCache,
+  parseMode, forgetAsker, forgetAskers, makeRefusedAskers, makeHealer, userOf, makeUndecryptable, makeRetryStats, makeAskerProbe, guardLidLookup, makeBreather, breathingRepository, setInSlices, waitUntil, makeTtlCache,
 } from './retryMode.js';
 
 // The station's number must never show "מחובר/ת" to the drivers: the bridge is
@@ -219,7 +219,7 @@ async function getCachedGroupMetadata(sock, jid) {
 // Surfaced via /diag and printed once on startup. Bump this string when you
 // redeploy a behavioral change so you can read the version straight from
 // Railway logs.
-const BRIDGE_BUILD = 'feed-pack-server-max-2026-11-24';
+const BRIDGE_BUILD = 'askers-probe-2026-11-24';
 
 /** How old a held private message may be and still be passed on. */
 const OFFLINE_PRIVATE_MAX_AGE_MS = 30 * 60_000;
@@ -459,6 +459,7 @@ setInterval(() => {
       ownAnswered: s.retryOwnAnswered || 0,
       ownKey: s.ownKeyStat ? { ...s.ownKeyStat, on: OWN_KEY_EVERY_POST && forgetRefused } : { posts: 0, forgotten: 0, on: OWN_KEY_EVERY_POST && forgetRefused },
       heal: s.healer ? { ...s.healer.stats(), on: HEAL_REFUSED && forgetRefused } : null,
+      askers: s.askerProbe ? (({ top, ...rest }) => rest)(s.askerProbe.stats()) : null,
       undecryptable: { ...undecryptable.totals(), on: stopLoops },
       lid: s.lidStat ? { ...s.lidStat, remembered: s.lidNone?.size || 0 } : null,
       groupKeys: { posts: groupKeys.posts, devices: groupKeys.devices, full: groupKeys.full },
@@ -727,11 +728,29 @@ function rememberOutgoing(phone, id, content, jid) {
  * (retryGuard.js) — one per number, kept across its sockets. Resends not made
  * are counted on the session (/diag) and logged at most once a minute.
  */
+/** One group ask into the askers' probe (key = '<msgId>:<device jid>'). Never throws. */
+function probeAsk(s, key, answered) {
+  const at = String(key ?? '').indexOf(':');
+  if (at <= 0 || !s.askerProbe) return;
+  const participant = String(key).slice(at + 1);
+  const note = (altParticipant) => { try { s.askerProbe.note({ participant, altParticipant, devicesCache: s.devicesCache, answered }); } catch (_) { /* a count never stops an answer */ } };
+  // His devices may be kept under his phone number (a group of numbers): his LID turned into it, from what the store knows.
+  let listed = null;
+  try { listed = s.devicesCache?.get?.(userOf(participant)); } catch (_) { listed = null; }
+  if (Array.isArray(listed) || !/@lid$/.test(participant)) return note(null);
+  Promise.race([
+    Promise.resolve(s.sock?.signalRepository?.lidMapping?.getPNForLID?.(participant)),
+    new Promise((resolve) => { const t = setTimeout(() => resolve(null), 500); t.unref?.(); }),
+  ]).then((pn) => note(pn || null), () => note(null));
+}
+
 function retryCounterFor(s, phone) {
   if (s.retryCounter) return s.retryCounter;
   s.retrySkipped = {};
   s.refusedAskers = makeRefusedAskers();
   s.healer = makeHealer();
+  // Who asks again and why: on his member's cached device list or not (retryMode.js makeAskerProbe).
+  s.askerProbe = s.askerProbe || makeAskerProbe();
   s.refusedStat = { asked: 0, forgotten: 0 };
   let pending = {};
   let loggedAt = 0;
@@ -743,8 +762,9 @@ function retryCounterFor(s, phone) {
     // The number's own devices (his phone): answered always (retryGuard.js isOwnParticipant).
     isOwn: (participant) => isOwnParticipant(participant, s.sock?.authState?.creds?.me),
     // A resend let through, by who asked — a phone or a linked device (retry_stats); own devices counted too.
-    onAllow: (key, _kind, own) => {
+    onAllow: (key, kind, own) => {
       s.retryStats.resend(key);
+      if (kind === 'group' && !own) probeAsk(s, key, true);
       if (!own) return;
       s.retryOwnAnswered = (s.retryOwnAnswered || 0) + 1;
       // Which message his own phone asked for, and how long after it left (2026-11-22).
@@ -754,6 +774,7 @@ function retryCounterFor(s, phone) {
       logger.info({ phone, msgId: id, jid: mine?.jid || null, ageMs: mine?.ts ? Date.now() - mine.ts : null, asker: at > 0 ? String(key).slice(at + 1) : null }, 'own_device_resend');
     },
     onSkip: (why, kind, id, key) => {
+      if (kind === 'group') probeAsk(s, key, false);
       // Refused, yet without the group's key: marked so, for the next post (flushRefusedAskers).
       if (kind === 'group' && forgetRefused && retryMode.keepGroupMemory) {
         const group = outgoingCache.get(phone)?.get(id)?.jid;
@@ -3112,6 +3133,8 @@ export function snapshotOf(phone) {
       ownAnswered: s.retryOwnAnswered || 0,
       ownKey: s.ownKeyStat ? { ...s.ownKeyStat, on: OWN_KEY_EVERY_POST && forgetRefused } : { posts: 0, forgotten: 0, on: OWN_KEY_EVERY_POST && forgetRefused },
       heal: s.healer ? { ...s.healer.stats(), on: HEAL_REFUSED && forgetRefused } : null,
+      // Who asks for a group post again: on his member's cached device list or not (2026-11-24).
+      askers: s.askerProbe ? { ...s.askerProbe.stats(), devicesTtlMin: DEVICES_TTL_MS / 60_000 } : null,
       undecryptable: { ...undecryptable.totals(), on: stopLoops },
       stats: s.retryStats?.totals() || null,
       lid: s.lidStat ? { ...s.lidStat, remembered: s.lidNone?.size || 0 } : null,

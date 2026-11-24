@@ -493,5 +493,89 @@ export function makeTtlCache({ ttlMs, max = 200_000, now = Date.now } = {}) {
     },
     mset: (entries) => { const t = now(); for (const { key, value } of entries || []) put(key, value, t); return true; },
     size: () => held.size,
+    /** How long ago this key's value was put (the askers' probe: how old a member's device list is). */
+    ageMs: (key) => { const e = held.get(key); const t = now(); return e && e.exp > t ? t - (e.exp - ttlMs) : null; },
+  };
+}
+
+// ---- Who asks again, and why (2026-11-24, Michael: «אני רוצה לפתור את זה מהשורש») ----
+// ~48 devices asked for every post of 058-711-5623 again; 98% were refused by the
+// limit, and 8,369 asks in 22 minutes came from devices healed already - forgetting
+// them and healing them did not stop them. A post carries the group's key only to
+// the devices on the CACHED list of each member (Baileys getUSyncDevices; the
+// bridge keeps that list DEVICES_TTL_MIN = 60 minutes, Baileys' own default is 5).
+// A device not on that list (a new WhatsApp Web, a new phone, a reinstall) never
+// gets the key until the list is read again - and asks after every post.
+// This only looks and counts (nothing is sent, nothing changes): for every device
+// that asks for a group post again - is his member's device list cached, is this
+// device on it, how old is the list, and how many times he asked.
+
+/** The asks of the last `windowMs`, by device: what was found, and how often each asked. */
+export function makeAskerProbe({ windowMs = 60 * 60_000, maxDevices = 50_000, now = Date.now } = {}) {
+  const totals = { asks: 0, no_list: 0, listed: 0, not_listed: 0, via_pn: 0, lid: 0, pn: 0, phone: 0, linked: 0, answered: 0, refused: 0 };
+  const byDevice = new Map(); // participant -> { asks, first, last, listed, notListed, noList, listAgeMs }
+  const listAges = [];        // age of the cached list at a not_listed ask (ms), the last 500
+  return {
+    /**
+     * One ask: `participant` the asking device's jid, `devicesCache` the number's
+     * cache of member devices (user -> [{ user, device, ... }]), `answered` true
+     * when a resend went out.
+     */
+    note({ participant, altParticipant, devicesCache, answered }) {
+      const jid = String(participant || '');
+      const user = userOf(jid);
+      if (!user) return;
+      const device = deviceOf(jid);
+      const t = now();
+      totals.asks += 1;
+      totals[isLid(jid) ? 'lid' : 'pn'] += 1;
+      totals[device === 0 ? 'phone' : 'linked'] += 1;
+      totals[answered ? 'answered' : 'refused'] += 1;
+      let list;
+      let listUser = user;
+      try { list = devicesCache?.get?.(user); } catch (_) { list = undefined; }
+      // A group of phone numbers keeps its members' devices under their numbers: the asker's LID turned into his number.
+      if (!Array.isArray(list) && altParticipant) {
+        try { const alt = devicesCache?.get?.(userOf(altParticipant)); if (Array.isArray(alt)) { list = alt; listUser = userOf(altParticipant); totals.via_pn += 1; } } catch (_) { /* not known */ }
+      }
+      let found;
+      if (!Array.isArray(list)) found = 'no_list';
+      else found = list.some((d) => Number(d?.device ?? 0) === device) ? 'listed' : 'not_listed';
+      totals[found] += 1;
+      let age = null;
+      if (found === 'not_listed') {
+        try { age = devicesCache?.ageMs?.(listUser) ?? null; } catch (_) { age = null; }
+        if (age != null) { listAges.push(age); if (listAges.length > 500) listAges.shift(); }
+      }
+      let e = byDevice.get(jid);
+      if (!e || t - e.last > windowMs) e = { asks: 0, first: t, last: t, listed: 0, notListed: 0, noList: 0 };
+      e.asks += 1;
+      e.last = t;
+      if (found === 'listed') e.listed += 1; else if (found === 'not_listed') e.notListed += 1; else e.noList += 1;
+      byDevice.delete(jid);
+      byDevice.set(jid, e); // newest last, so the oldest go first when full
+      if (byDevice.size > maxDevices) for (const k of byDevice.keys()) { byDevice.delete(k); if (byDevice.size <= maxDevices * 0.9) break; }
+    },
+    /** For /diag and the minute's log line. */
+    stats() {
+      const t = now();
+      const rep = { devices: 0, once: 0, two_to_five: 0, six_plus: 0, six_plus_not_listed: 0, six_plus_listed: 0 };
+      const top = [];
+      for (const [jid, e] of byDevice) {
+        if (t - e.last > windowMs) continue;
+        rep.devices += 1;
+        if (e.asks === 1) rep.once += 1; else if (e.asks <= 5) rep.two_to_five += 1; else {
+          rep.six_plus += 1;
+          if (e.notListed > e.listed) rep.six_plus_not_listed += 1; else if (e.listed > 0) rep.six_plus_listed += 1;
+        }
+        top.push({ jid, asks: e.asks, listed: e.listed, not_listed: e.notListed, no_list: e.noList, minutes: Math.round((e.last - e.first) / 60_000) });
+      }
+      top.sort((a, b) => b.asks - a.asks);
+      const sorted = [...listAges].sort((a, b) => a - b);
+      const mid = sorted.length ? Math.round(sorted[Math.floor(sorted.length / 2)] / 60_000) : null;
+      // The device's own number is kept to its last 4 digits (a LID is not a phone number, kept the same way).
+      const mask = (jid) => { const u = userOf(jid); return `…${u.slice(-4)}:${deviceOf(jid)}@${String(jid).split('@')[1] || ''}`; };
+      return { ...totals, repeat: rep, not_listed_list_age_min_p50: mid, top: top.slice(0, 8).map((x) => ({ ...x, jid: mask(x.jid) })) };
+    },
   };
 }
