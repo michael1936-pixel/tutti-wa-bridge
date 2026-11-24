@@ -49,7 +49,7 @@ import {
 import { applyBaileysPatch } from './baileysPatch.js';
 import { parseMode } from './retryMode.js';
 import { parseGroupLimit } from './retryGuard.js';
-import { makeFeedPacker, feedPoster } from './feedPack.js';
+import { makeFeedPacker, feedPosters, feedUrls } from './feedPack.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -97,7 +97,8 @@ const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
 // alone while a lane is free, in packs when all are busy. The numbers hand
 // their messages over the IPC channel ({ t: 'group_feed', payload }).
 const feedPacker = makeFeedPacker({
-  post: feedPoster({ url: GROUP_FEED_WEBHOOK_URL, secret: GROUP_FEED_WEBHOOK_SECRET }),
+  // One URL, or the copies of the function in turn (GROUP_FEED_WEBHOOK_URLS; 2026-11-24).
+  post: feedPosters({ urls: feedUrls(), secret: GROUP_FEED_WEBHOOK_SECRET }),
   lanes: Number(process.env.GROUP_FEED_PACK_LANES || 3),
   max: Number(process.env.GROUP_FEED_PACK_MAX || 40),
   onResult: (m, r) => logger.info(
@@ -482,7 +483,7 @@ app.get('/diag', (_req, res) => {
     webhook_secret_configured: !!WEBHOOK_SECRET,
     group_feed_webhook_url_configured: !!GROUP_FEED_WEBHOOK_URL,
     group_feed_webhook_secret_configured: !!GROUP_FEED_WEBHOOK_SECRET,
-    group_feed_pack: feedPacker.stats(),
+    group_feed_pack: { ...feedPacker.stats(), copies: feedUrls().filter(Boolean).length, lanes: Number(process.env.GROUP_FEED_PACK_LANES || 3), max: Number(process.env.GROUP_FEED_PACK_MAX || 40) },
     api_key_configured: !!API_KEY,
     auth_root: AUTH_ROOT,
     sessions: sessionsInfo,

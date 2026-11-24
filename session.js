@@ -188,7 +188,11 @@ const PAYMENT_PROOF_URL = process.env.PAYMENT_PROOF_WEBHOOK_URL
 // Every call to the server's functions carries x-region eu-central-1: it runs
 // beside the database (Frankfurt). From here the function ran in a far region,
 // and each of its database round trips cost ~200 ms (feed_timing, 2026-11-07).
-const GROUP_FEED_WEBHOOK_URL = process.env.GROUP_FEED_WEBHOOK_URL || '';
+// (Set only as GROUP_FEED_WEBHOOK_URLS - the copies of the function, 2026-11-24 - the first
+// copy is the number's own URL: a group message is never dropped for a missing URL.)
+const GROUP_FEED_WEBHOOK_URL = process.env.GROUP_FEED_WEBHOOK_URL
+  || String(process.env.GROUP_FEED_WEBHOOK_URLS || '').split(',').map((s) => s.trim()).find(Boolean)
+  || '';
 const GROUP_FEED_WEBHOOK_SECRET = process.env.GROUP_FEED_WEBHOOK_SECRET || '';
 // Group messages of all the numbers leave through ONE sender (server.js), in
 // packs when it is busy (feedPack.js, 2026-11-21). "off": every number sends

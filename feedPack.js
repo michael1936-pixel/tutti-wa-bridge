@@ -118,6 +118,28 @@ export function makeFeedPacker({
   };
 }
 
+/**
+ * Several copies of the server's function (2026-11-24, Michael: «חייב שזה יגיע ל 1000
+ * לפחות עם 0.7»): one copy tops out at ~400 messages a second - its requests slow each
+ * other down - and three copies side by side took 1,027 a second with every request
+ * answered (load test, 12 lanes x 60). Each request goes to the next copy in turn; a
+ * pack the copy did not take is sent again message by message, each to the next copy.
+ * One URL: exactly the poster of before.
+ */
+export function feedPosters({ urls, secret, fetchImpl = fetch, timeoutMs = 60_000 }) {
+  const list = (urls || []).map((u) => String(u || '').trim()).filter(Boolean);
+  if (list.length <= 1) return feedPoster({ url: list[0] || '', secret, fetchImpl, timeoutMs });
+  const posters = list.map((url) => feedPoster({ url, secret, fetchImpl, timeoutMs }));
+  let turn = 0;
+  return (body) => posters[turn++ % posters.length](body);
+}
+
+/** The copies' URLs: GROUP_FEED_WEBHOOK_URLS (comma separated), else the one GROUP_FEED_WEBHOOK_URL. */
+export function feedUrls(env = process.env) {
+  const many = String(env.GROUP_FEED_WEBHOOK_URLS || '').split(',').map((s) => s.trim()).filter(Boolean);
+  return many.length ? many : [String(env.GROUP_FEED_WEBHOOK_URL || '')];
+}
+
 /** The request itself: the same headers a lone message always carried. */
 export function feedPoster({ url, secret, fetchImpl = fetch, timeoutMs = 60_000 }) {
   return async (body) => {

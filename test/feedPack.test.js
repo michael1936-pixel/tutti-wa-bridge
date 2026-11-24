@@ -135,3 +135,67 @@ test('wired: a number hands its group messages to the one sender of all numbers'
   assert.ok(server.includes("} else if (m.t === 'group_feed') {"));
   assert.ok(server.includes('void feedPacker.add(m.payload);'));
 });
+
+// 2026-11-24: several copies of the server's function, each request to the next in turn.
+import { feedPosters, feedUrls } from '../feedPack.js';
+
+function fakeFetch() {
+  const hits = [];
+  const fetchImpl = async (url, init) => {
+    hits.push({ url, body: JSON.parse(init.body), secret: init.headers['X-Webhook-Secret'], region: init.headers['x-region'] });
+    return { status: 200, text: async () => JSON.stringify({ ok: true, url }) };
+  };
+  return { hits, fetchImpl };
+}
+
+test('one URL: the poster of before, every request to it', async () => {
+  const { hits, fetchImpl } = fakeFetch();
+  const post = feedPosters({ urls: ['https://x/fn'], secret: 's', fetchImpl });
+  await post({ a: 1 }); await post({ batch: [{ a: 2 }] });
+  assert.deepEqual(hits.map((h) => h.url), ['https://x/fn', 'https://x/fn']);
+  assert.equal(hits[0].secret, 's');
+  assert.equal(hits[0].region, 'eu-central-1');
+});
+
+test('three copies: each request to the next in turn, the same headers, the body untouched', async () => {
+  const { hits, fetchImpl } = fakeFetch();
+  const post = feedPosters({ urls: ['https://x/a', ' https://x/b ', '', 'https://x/c'], secret: 's', fetchImpl });
+  const answers = [];
+  for (let i = 0; i < 7; i++) answers.push(await post({ batch: [{ i }] }));
+  assert.deepEqual(hits.map((h) => h.url), ['https://x/a', 'https://x/b', 'https://x/c', 'https://x/a', 'https://x/b', 'https://x/c', 'https://x/a']);
+  assert.deepEqual(hits[4].body, { batch: [{ i: 4 }] });
+  assert.ok(hits.every((h) => h.secret === 's' && h.region === 'eu-central-1'));
+  assert.equal(answers[1].status, 200);
+});
+
+test('the URLs: GROUP_FEED_WEBHOOK_URLS when set, else the one of before', () => {
+  assert.deepEqual(feedUrls({ GROUP_FEED_WEBHOOK_URL: 'https://x/a' }), ['https://x/a']);
+  assert.deepEqual(feedUrls({ GROUP_FEED_WEBHOOK_URL: 'https://x/a', GROUP_FEED_WEBHOOK_URLS: 'https://x/a, https://x/b,https://x/c' }), ['https://x/a', 'https://x/b', 'https://x/c']);
+  assert.deepEqual(feedUrls({ GROUP_FEED_WEBHOOK_URLS: ' , ' , GROUP_FEED_WEBHOOK_URL: 'https://x/a' }), ['https://x/a']);
+});
+
+test('a pack the copy does not take goes again message by message - each to the next copy', async () => {
+  const hits = [];
+  const fetchImpl = async (url, init) => {
+    const body = JSON.parse(init.body);
+    hits.push({ url, packed: Array.isArray(body.batch) });
+    // copy b refuses packs (an older function), the others take them
+    if (Array.isArray(body.batch) && url.endsWith('/b')) return { status: 400, text: async () => '{"ok":false}' };
+    if (Array.isArray(body.batch)) return { status: 200, text: async () => JSON.stringify({ results: body.batch.map(() => ({ status: 200 })) }) };
+    return { status: 200, text: async () => '{"ok":true}' };
+  };
+  const post = feedPosters({ urls: ['https://x/a', 'https://x/b', 'https://x/c'], secret: 's', fetchImpl });
+  await post({ batch: [1, 2] });          // a takes it
+  const r = await post({ batch: [3, 4] }); // b refuses it
+  assert.equal(r.status, 400);
+  // what the packer does then: each message alone - and they land on c, then a
+  await post({ m: 3 }); await post({ m: 4 });
+  assert.deepEqual(hits.map((h) => `${h.url.slice(-1)}:${h.packed ? 'pack' : 'alone'}`), ['a:pack', 'b:pack', 'c:alone', 'a:alone']);
+});
+
+test('the server builds its sender from the URLs, and every number keeps a URL of its own', () => {
+  const server = readFileSync(new URL('../server.js', import.meta.url), 'utf8');
+  assert.ok(server.includes('post: feedPosters({ urls: feedUrls(), secret: GROUP_FEED_WEBHOOK_SECRET }),'));
+  const session = readFileSync(new URL('../session.js', import.meta.url), 'utf8');
+  assert.ok(session.includes("|| String(process.env.GROUP_FEED_WEBHOOK_URLS || '').split(',').map((s) => s.trim()).find(Boolean)"));
+});
