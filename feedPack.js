@@ -45,6 +45,7 @@ export function makeFeedPacker({
   let warnAt = 0;
   let failedPacks = 0;        // pack tries not taken (shown in /diag)
   let sentAloneAfter = 0;     // messages that went alone after their pack was not taken
+  let serverMax = Infinity;   // the most the server said it takes in one pack (bad_batch's max)
 
   const packsOn = () => now() >= restUntil;
 
@@ -97,6 +98,17 @@ export function makeFeedPacker({
           });
           return;
         }
+        // Too big for the server ({"error":"bad_batch","max":60}): from now on packs of its
+        // size, and this one goes as such packs, one after another in this lane - no rest,
+        // nothing alone (2026-11-24 load test: packs of 100 against a server of 60 rested the
+        // packs and sent 17,000 messages alone - ~25 a second, the app slowed for everyone).
+        const serverSays = Number(answer && answer.error === 'bad_batch' ? answer.max : NaN);
+        if (resp.status === 400 && Number.isInteger(serverSays) && serverSays >= 2 && serverSays < payloads.length) {
+          serverMax = serverSays;
+          onError(null, new Error(`pack_too_big_${payloads.length}_server_max_${serverSays}`), { attempt, packed: payloads.length });
+          for (let i = 0; i < payloads.length; i += serverSays) await sendPack(payloads.slice(i, i + serverSays));
+          return;
+        }
         // Not taken as a pack (an older function answers 400): the old way, and no packs for a while.
         refused = resp.status < 500;
         onError(null, new Error(`pack_not_taken_${resp.status}`), { attempt, packed: payloads.length });
@@ -113,7 +125,7 @@ export function makeFeedPacker({
 
   function pump() {
     while (waiting.length > 0 && busy < (packsOn() ? lanes : aloneLanes)) {
-      const take = waiting.splice(0, packsOn() ? max : 1);
+      const take = waiting.splice(0, packsOn() ? Math.min(max, serverMax) : 1);
       busy++;
       sendPack(take.map((w) => w.payload))
         .catch(() => { /* reported inside */ })
@@ -137,7 +149,7 @@ export function makeFeedPacker({
         pump();
       });
     },
-    stats: () => ({ queued: waiting.length, busy, packs: packsOn(), failed_packs: failedPacks, sent_alone_after: sentAloneAfter }),
+    stats: () => ({ queued: waiting.length, busy, packs: packsOn(), failed_packs: failedPacks, sent_alone_after: sentAloneAfter, server_max: Number.isFinite(serverMax) ? serverMax : null }),
   };
 }
 

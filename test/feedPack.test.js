@@ -176,6 +176,36 @@ test('many lanes failing together stay within lanes x aloneAtOnce requests at on
   assert.ok(most <= 12 * 4, `at most 48 requests at once, saw ${most}`);
 });
 
+test('a pack bigger than the server takes: split to its size, packs go on, nothing rests or goes alone', async () => {
+  const calls = [];
+  const post = async (body) => {
+    calls.push(body);
+    if (body.batch && body.batch.length > 60) return { status: 400, text: '{"ok":false,"error":"bad_batch","max":60}' };
+    if (body.batch) return { status: 200, text: JSON.stringify({ results: body.batch.map(() => ({ status: 200 })) }) };
+    return { status: 200, text: '{"ok":true}' };
+  };
+  let release;
+  const first = new Promise((r) => { release = r; });
+  let n = 0;
+  const gated = async (body) => { if (n++ === 0) await first; return post(body); };
+  const seen = new Map();
+  const p = makeFeedPacker({ post: gated, lanes: 1, max: 150, sleep: async () => {}, onResult: (m, r) => seen.set(m.wa_message_id, r.status) });
+  const all = Array.from({ length: 151 }, (_, i) => p.add(msg(`m${i}`)));
+  release();
+  await Promise.all(all);
+  // m0 alone, the 150 refused as too big, then 60 + 60 + 30 as packs
+  assert.deepEqual(calls.map((c) => (c.batch ? c.batch.length : 1)), [1, 150, 60, 60, 30]);
+  assert.equal(seen.size, 151);
+  assert.ok([...seen.values()].every((s) => s === 200));
+  assert.equal(p.stats().packs, true, 'no rest');
+  assert.equal(p.stats().sent_alone_after, 0);
+  assert.equal(p.stats().server_max, 60);
+  // the next packs are of the server's size at once
+  const more = Array.from({ length: 70 }, (_, i) => p.add(msg(`n${i}`)));
+  await Promise.all(more);
+  assert.ok(calls.slice(5).every((c) => !c.batch || c.batch.length <= 60));
+});
+
 test('wired: the server shows the failed packs in /diag', () => {
   const server = readFileSync(new URL('../server.js', import.meta.url), 'utf8');
   assert.ok(server.includes('group_feed_pack: { ...feedPacker.stats(),'));
