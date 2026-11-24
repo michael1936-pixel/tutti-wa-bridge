@@ -117,6 +117,28 @@ export const EDITS = {
         '                                await sendRetryRequest(node, !encNode);',
       ].join('\n'),
     },
+    // 2026-11-24: a member's identity changed (a reinstall, a new phone) or his
+    // devices changed - the bridge forgets him in every group's memory, so the next
+    // post in each carries him the key (session.js flushChangedMembers). Baileys
+    // itself only renews his private session / his device list.
+    {
+      name: 'member_identity_changed',
+      find: /if \(result\.action === 'no_identity_node'\) \{/g,
+      put: [
+        `try { globalThis.__bridgeRetry?.onIdentityChange?.(from, result?.action); } catch (_) { /* ${PATCH_MARK} */ }`,
+        "            if (result.action === 'no_identity_node') {",
+      ].join('\n'),
+    },
+    {
+      name: 'member_devices_changed',
+      find: /if \(!decoded\.length\)\s*return;\s*await devicesMutex\.mutex\(async \(\) => \{/g,
+      put: [
+        'if (!decoded.length)',
+        '            return;',
+        `        try { globalThis.__bridgeRetry?.onDevicesChange?.(tag, decoded.map(d => d.jid), from); } catch (_) { /* ${PATCH_MARK} */ }`,
+        '        await devicesMutex.mutex(async () => {',
+      ].join('\n'),
+    },
   ],
   // A message that does not decrypt is asked again from its sender, and — when
   // the sender's copy has not come — from the number's own phone, which holds

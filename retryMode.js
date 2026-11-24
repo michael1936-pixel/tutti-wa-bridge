@@ -613,3 +613,76 @@ export function makePostKeys({ ttlMs = 30 * 60_000, max = 4_000, now = Date.now 
     stats: () => ({ posts: posts.size, noted }),
   };
 }
+
+// ---- A member whose phone or devices changed: forgotten in EVERY group at once ----
+// 2026-11-24 (the askers' probe on 5623, 15:34-15:43): 84% of the asks for a post
+// came from devices the post did NOT carry the key to - the group's memory said
+// they held it. Baileys, on a member's "identity changed" (a reinstall, a new
+// phone), only renews the private session (identity-change-handler.js); on a
+// "devices" notification it only fixes the device list. Nothing tells the groups'
+// memories, so in every group we post to he is still marked as holding our key:
+// his phone fails on every group's next post and asks, group by group, and is
+// forgotten only in the group he asked in. Now such a member is forgotten in all
+// the number's groups at once - the next post in each carries him the key.
+
+/** The members whose identity or devices changed, gathered between two writes. */
+export function makeChangedMembers({ max = 5_000 } = {}) {
+  let jids = new Set();
+  const stat = { identity: 0, devices: 0, lid: 0, pn: 0, rounds: 0, groups: 0, forgotten: 0, failed: 0 };
+  return {
+    /** `why`: 'identity' | 'devices'. */
+    note(jid, why) {
+      const j = String(jid || '');
+      if (!userOf(j)) return;
+      stat[why === 'devices' ? 'devices' : 'identity'] += 1;
+      stat[isLid(j) ? 'lid' : 'pn'] += 1;
+      if (jids.size < max) jids.add(j);
+    },
+    take() { const out = jids; jids = new Set(); return [...out]; },
+    get size() { return jids.size; },
+    done(groups, forgotten, ok = true) { stat.rounds += 1; stat.groups += groups; stat.forgotten += forgotten; if (!ok) stat.failed += 1; },
+    stats: () => ({ ...stat, waiting: jids.size }),
+  };
+}
+
+/**
+ * Forget these members (all their devices, under their LID and their number) in
+ * every one of `groups`: ONE read of the groups' memories and ONE write of those
+ * that changed, inside the key store's transaction of the number (`txKey`, the
+ * one a post is sent under). -> { groups: memories changed, forgotten: devices }.
+ */
+export async function forgetEverywhere({ keys, groups, participants, lidMapping, txKey }) {
+  const list = [...new Set((groups || []).map(String).filter((g) => g.endsWith('@g.us')))];
+  if (!keys || !list.length || !participants?.length) return { groups: 0, forgotten: 0 };
+  const users = new Set();
+  await Promise.all(participants.map(async (p) => {
+    const user = userOf(p);
+    if (!user) return;
+    users.add(user);
+    try {
+      const alt = await capped(isLid(p) ? lidMapping?.getPNForLID?.(p) : lidMapping?.getLIDForPN?.(p), 1_500);
+      if (alt) users.add(userOf(alt));
+    } catch (_) { /* his other name is not known - this one is forgotten */ }
+  }));
+  if (!users.size) return { groups: 0, forgotten: 0 };
+  const work = async () => {
+    const mems = (await keys.get('sender-key-memory', list)) || {};
+    const write = {};
+    let forgotten = 0;
+    for (const group of list) {
+      const mem = mems[group];
+      if (!mem || typeof mem !== 'object') continue;
+      const next = {};
+      let dropped = 0;
+      for (const [jid, held] of Object.entries(mem)) {
+        if (users.has(userOf(jid))) dropped += 1;
+        else next[jid] = held;
+      }
+      if (dropped) { write[group] = next; forgotten += dropped; }
+    }
+    const changed = Object.keys(write).length;
+    if (changed) await keys.set({ 'sender-key-memory': write });
+    return { groups: changed, forgotten };
+  };
+  return typeof keys.transaction === 'function' && txKey ? keys.transaction(work, txKey) : work();
+}

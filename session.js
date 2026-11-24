@@ -54,7 +54,7 @@ import { isOwnParticipant, makeRetryCounter, parseGroupLimit, RETRY_RULES } from
 import { quotedOf } from './quoted.js';
 import { baileysPatched } from './baileysPatch.js';
 import {
-  parseMode, forgetAsker, forgetAskers, makeRefusedAskers, makeHealer, userOf, makeUndecryptable, makeRetryStats, makeAskerProbe, makePostKeys, guardLidLookup, makeBreather, breathingRepository, setInSlices, waitUntil, makeTtlCache,
+  parseMode, forgetAsker, forgetAskers, makeRefusedAskers, makeHealer, userOf, makeUndecryptable, makeRetryStats, makeAskerProbe, makePostKeys, makeChangedMembers, forgetEverywhere, guardLidLookup, makeBreather, breathingRepository, setInSlices, waitUntil, makeTtlCache,
 } from './retryMode.js';
 
 // The station's number must never show "מחובר/ת" to the drivers: the bridge is
@@ -219,7 +219,7 @@ async function getCachedGroupMetadata(sock, jid) {
 // Surfaced via /diag and printed once on startup. Bump this string when you
 // redeploy a behavioral change so you can read the version straight from
 // Railway logs.
-const BRIDGE_BUILD = 'askers-key-in-post-2026-11-24';
+const BRIDGE_BUILD = 'changed-members-everywhere-2026-11-24';
 
 /** How old a held private message may be and still be passed on. */
 const OFFLINE_PRIVATE_MAX_AGE_MS = 30 * 60_000;
@@ -389,6 +389,48 @@ async function flushHeal(s) {
     s.healing = false;
   }
 }
+// A member whose identity or devices changed is forgotten in EVERY group of the
+// number at once (retryMode.js forgetEverywhere): the next post in each group
+// carries him the key, instead of his phone failing and asking group by group
+// (2026-11-24: 84% of the asks for a post came from devices it did not carry the
+// key to). At most every 10 s, one read and one write of the groups' memories.
+// Off: CHANGED_MEMBERS=off, or forgetRefused: false, or keepGroupMemory off.
+const CHANGED_MEMBERS = String(process.env.CHANGED_MEMBERS || 'on').toLowerCase() !== 'off';
+const CHANGED_FLUSH_MS = 10_000;
+function noteChangedMember(jid, why) {
+  if (!CHANGED_MEMBERS) return;
+  for (const s of sessions.values()) {
+    const me = s.sock?.authState?.creds?.me;
+    const u = userOf(jid);
+    if (!u || (me && (u === userOf(me.id) || u === userOf(me.lid)))) continue; // his own: ownKey looks after them
+    (s.changedMembers = s.changedMembers || makeChangedMembers()).note(jid, why);
+  }
+}
+async function flushChangedMembers(s) {
+  if (!s.changedMembers?.size || s.changedFlushing) return;
+  if (!forgetRefused || !retryMode.keepGroupMemory) return;
+  if (Date.now() - (s.changedFlushAt || 0) < CHANGED_FLUSH_MS) return;
+  const sock = s.sock;
+  const keys = sock?.authState?.keys;
+  const groups = s.sendGroups?.map ? [...s.sendGroups.map.keys()] : [];
+  if (!keys || !groups.length) return; // no socket or no groups read yet: kept for the next round
+  s.changedFlushing = true;
+  s.changedFlushAt = Date.now();
+  const members = s.changedMembers.take();
+  try {
+    const r = await forgetEverywhere({
+      keys, groups, participants: members,
+      lidMapping: sock.signalRepository?.lidMapping,
+      txKey: sock.authState?.creds?.me?.id,
+    });
+    s.changedMembers.done(r.groups, r.forgotten, true);
+  } catch (e) {
+    s.changedMembers.done(0, 0, false);
+    logger.warn({ phone: s.phone, members: members.length, err: e?.message || String(e) }, 'changed_members_forget_failed');
+  } finally {
+    s.changedFlushing = false;
+  }
+}
 async function flushRefusedAskers(s) {
   if (!s.refusedAskers?.size || s.refusedFlushing) return;
   const sock = s.sock;
@@ -415,7 +457,7 @@ async function flushRefusedAskers(s) {
 // Started here, outside any key-store transaction: a timer set while a message is
 // handled would carry that transaction's context into the write.
 setInterval(() => {
-  for (const s of sessions.values()) { void flushRefusedAskers(s); void flushOwnKeyGroups(s); void flushHeal(s); }
+  for (const s of sessions.values()) { void flushRefusedAskers(s); void flushOwnKeyGroups(s); void flushHeal(s); void flushChangedMembers(s); }
 }, REFUSED_FLUSH_MS).unref?.();
 // Members who ask again while nothing of theirs is in a group's memory (forgetAsker).
 const askerRepeats = new Map();
@@ -434,6 +476,16 @@ globalThis.__bridgeRetry = {
   forgetAsker: (a) => (retryMode.keepGroupMemory ? forgetAsker(a, { repeats: askerRepeats }) : false),
   undecryptable: (id) => (stopLoops ? undecryptable.failed(id) : false),
   onGroupPost: (_jid, msgId, recipients) => { postKeys.note(msgId, recipients); },
+  // A member's identity changed (not his companion device's alone: Baileys skips those; not ours).
+  onIdentityChange: (from, action) => {
+    if (['invalid_notification', 'no_identity_node', 'skipped_self_primary'].includes(String(action))) return;
+    noteChangedMember(from, 'identity');
+  },
+  // A member's devices: a new one, or his list changed - forgotten in every group (a removed one has nothing to get).
+  onDevicesChange: (tag, jids, from) => {
+    if (tag === 'add') for (const j of jids || []) noteChangedMember(j, 'devices');
+    else if (tag === 'update') noteChangedMember(from || (jids || [])[0], 'devices');
+  },
   onGroupKeys: (jid, sent, devices) => {
     groupKeys.posts += 1;
     groupKeys.devices += sent;
@@ -463,6 +515,7 @@ setInterval(() => {
       ownKey: s.ownKeyStat ? { ...s.ownKeyStat, on: OWN_KEY_EVERY_POST && forgetRefused } : { posts: 0, forgotten: 0, on: OWN_KEY_EVERY_POST && forgetRefused },
       heal: s.healer ? { ...s.healer.stats(), on: HEAL_REFUSED && forgetRefused } : null,
       askers: s.askerProbe ? (({ top, ...rest }) => rest)(s.askerProbe.stats()) : null,
+      changed: s.changedMembers ? s.changedMembers.stats() : null,
       undecryptable: { ...undecryptable.totals(), on: stopLoops },
       lid: s.lidStat ? { ...s.lidStat, remembered: s.lidNone?.size || 0 } : null,
       groupKeys: { posts: groupKeys.posts, devices: groupKeys.devices, full: groupKeys.full },
@@ -3139,6 +3192,8 @@ export function snapshotOf(phone) {
       heal: s.healer ? { ...s.healer.stats(), on: HEAL_REFUSED && forgetRefused } : null,
       // Who asks for a group post again: on his member's cached device list or not (2026-11-24).
       askers: s.askerProbe ? { ...s.askerProbe.stats(), devicesTtlMin: DEVICES_TTL_MS / 60_000, postKeys: postKeys.stats() } : null,
+      // Members whose identity or devices changed, forgotten in every group (2026-11-24).
+      changed: s.changedMembers ? { ...s.changedMembers.stats(), on: CHANGED_MEMBERS } : { on: CHANGED_MEMBERS },
       undecryptable: { ...undecryptable.totals(), on: stopLoops },
       stats: s.retryStats?.totals() || null,
       lid: s.lidStat ? { ...s.lidStat, remembered: s.lidNone?.size || 0 } : null,
