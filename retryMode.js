@@ -686,3 +686,56 @@ export async function forgetEverywhere({ keys, groups, participants, lidMapping,
   };
   return typeof keys.transaction === 'function' && txKey ? keys.transaction(work, txKey) : work();
 }
+
+// ---- The number's own phone: every post of ours reaches it (2026-11-24) --------
+// Michael's phone - the number's own phone - showed «בהמתנה להודעה זו» on our posts
+// the moment members' phones were answered alone (phonesToParticipant, 16:26).
+// It had NOT asked (no own ask counted): it failed some of our posts silently, and
+// until then every member phone's ask re-sent the post to the WHOLE group - him
+// included - which repaired his copy without anyone knowing. Now his phone is
+// watched itself: after each group post, if no receipt of ours comes from his own
+// devices within `waitMs`, the post is sent again to his phone alone (a private
+// copy to his own device, not a post to the group), at most `perMinute` a minute.
+
+export function makeOwnWatch({ waitMs = 20_000, maxAgeMs = 5 * 60_000, perMinute = 30, max = 3_000, now = Date.now } = {}) {
+  const posts = new Map(); // msgId -> { at, group, delivered, resent }
+  const sentAt = [];       // resend times, for the minute's cap
+  const stat = { posts: 0, delivered: 0, late_delivered: 0, resent: 0, resend_ok: 0, resend_failed: 0, capped: 0, receipts: 0 };
+  return {
+    /** A group post of ours went out. */
+    expect(msgId, group) {
+      if (!msgId) return;
+      posts.set(msgId, { at: now(), group: String(group || ''), delivered: false, resent: false });
+      stat.posts += 1;
+      if (posts.size > max) for (const k of posts.keys()) { posts.delete(k); if (posts.size <= max * 0.9) break; }
+    },
+    /** A receipt from one of our own devices for this post. */
+    delivered(msgId) {
+      stat.receipts += 1;
+      const p = posts.get(msgId);
+      if (!p || p.delivered) return;
+      p.delivered = true;
+      stat[p.resent ? 'late_delivered' : 'delivered'] += 1;
+    },
+    /** The posts to send again to the own phone now (each once), within the minute's cap. */
+    due() {
+      const t = now();
+      while (sentAt.length && t - sentAt[0] > 60_000) sentAt.shift();
+      const out = [];
+      for (const [id, p] of posts) {
+        if (p.delivered || p.resent) continue;
+        const age = t - p.at;
+        if (age < waitMs) continue;
+        if (age > maxAgeMs) { p.resent = true; continue; } // too old to help: let go
+        if (sentAt.length >= perMinute) { stat.capped += 1; break; }
+        p.resent = true;
+        sentAt.push(t);
+        stat.resent += 1;
+        out.push({ id, group: p.group });
+      }
+      return out;
+    },
+    done(ok) { stat[ok ? 'resend_ok' : 'resend_failed'] += 1; },
+    stats: () => ({ ...stat, watching: [...posts.values()].filter((p) => !p.delivered && !p.resent).length }),
+  };
+}

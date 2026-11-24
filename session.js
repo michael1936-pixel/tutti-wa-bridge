@@ -54,7 +54,7 @@ import { isOwnParticipant, makeRetryCounter, parseGroupLimit, RETRY_RULES } from
 import { quotedOf } from './quoted.js';
 import { baileysPatched } from './baileysPatch.js';
 import {
-  parseMode, forgetAsker, forgetAskers, makeRefusedAskers, makeHealer, userOf, makeUndecryptable, makeRetryStats, makeAskerProbe, makePostKeys, makeChangedMembers, forgetEverywhere, guardLidLookup, makeBreather, breathingRepository, setInSlices, waitUntil, makeTtlCache,
+  parseMode, forgetAsker, forgetAskers, makeRefusedAskers, makeHealer, userOf, makeUndecryptable, makeRetryStats, makeAskerProbe, makePostKeys, makeChangedMembers, forgetEverywhere, makeOwnWatch, guardLidLookup, makeBreather, breathingRepository, setInSlices, waitUntil, makeTtlCache,
 } from './retryMode.js';
 
 // The station's number must never show "מחובר/ת" to the drivers: the bridge is
@@ -219,7 +219,7 @@ async function getCachedGroupMetadata(sock, jid) {
 // Surfaced via /diag and printed once on startup. Bump this string when you
 // redeploy a behavioral change so you can read the version straight from
 // Railway logs.
-const BRIDGE_BUILD = 'changed-members-everywhere-2026-11-24';
+const BRIDGE_BUILD = 'own-phone-watch-2026-11-24';
 
 /** How old a held private message may be and still be passed on. */
 const OFFLINE_PRIVATE_MAX_AGE_MS = 30 * 60_000;
@@ -431,6 +431,44 @@ async function flushChangedMembers(s) {
     s.changedFlushing = false;
   }
 }
+// The number's own phone gets every post of ours (retryMode.js makeOwnWatch,
+// 2026-11-24): no receipt from his own devices 20 s after a group post -> the post
+// once more to his phone alone. Off: OWN_PHONE_WATCH=off.
+const OWN_PHONE_WATCH = String(process.env.OWN_PHONE_WATCH || 'on').toLowerCase() !== 'off';
+function ownPhoneJid(me) {
+  if (me?.lid) return `${userOf(me.lid)}@lid`;
+  return me?.id ? `${userOf(me.id)}@s.whatsapp.net` : null;
+}
+async function flushOwnWatch(s) {
+  if (!OWN_PHONE_WATCH || !s.ownWatch || s.ownWatchFlushing) return;
+  const sock = s.sock;
+  const me = sock?.authState?.creds?.me;
+  const own = ownPhoneJid(me);
+  if (!sock?.relayMessage || !own || s.status !== 'connected') return;
+  const due = s.ownWatch.due();
+  if (!due.length) return;
+  s.ownWatchFlushing = true;
+  try {
+    try { await sock.assertSessions?.([own], false); } catch (_) { /* the send says if it cannot */ }
+    for (const { id, group } of due) {
+      const entry = outgoingCache.get(s.phone)?.get(id);
+      if (!entry?.content || !group) { s.ownWatch.done(false); continue; }
+      try {
+        // Baileys' retry path: one copy to this device, wrapped as sent by us (deviceSentMessage) with the group's key.
+        await sock.relayMessage(group, entry.content, { messageId: id, participant: { jid: own, count: 1 } });
+        s.ownWatch.done(true);
+      } catch (e) {
+        s.ownWatch.done(false);
+        if (Date.now() - (s.ownWatchWarnAt || 0) > 60_000) {
+          s.ownWatchWarnAt = Date.now();
+          logger.warn({ phone: s.phone, msgId: id, err: e?.message || String(e) }, 'own_phone_copy_failed');
+        }
+      }
+    }
+  } finally {
+    s.ownWatchFlushing = false;
+  }
+}
 async function flushRefusedAskers(s) {
   if (!s.refusedAskers?.size || s.refusedFlushing) return;
   const sock = s.sock;
@@ -457,7 +495,7 @@ async function flushRefusedAskers(s) {
 // Started here, outside any key-store transaction: a timer set while a message is
 // handled would carry that transaction's context into the write.
 setInterval(() => {
-  for (const s of sessions.values()) { void flushRefusedAskers(s); void flushOwnKeyGroups(s); void flushHeal(s); void flushChangedMembers(s); }
+  for (const s of sessions.values()) { void flushRefusedAskers(s); void flushOwnKeyGroups(s); void flushHeal(s); void flushChangedMembers(s); void flushOwnWatch(s); }
 }, REFUSED_FLUSH_MS).unref?.();
 // Members who ask again while nothing of theirs is in a group's memory (forgetAsker).
 const askerRepeats = new Map();
@@ -475,7 +513,12 @@ globalThis.__bridgeRetry = {
   ...(RETRY_PATCHED ? { phoneDelayMs: PHONE_DELAY_MS, placeholderDelayMs: PLACEHOLDER_DELAY_MS } : {}),
   forgetAsker: (a) => (retryMode.keepGroupMemory ? forgetAsker(a, { repeats: askerRepeats }) : false),
   undecryptable: (id) => (stopLoops ? undecryptable.failed(id) : false),
-  onGroupPost: (_jid, msgId, recipients) => { postKeys.note(msgId, recipients); },
+  onGroupPost: (jid, msgId, recipients) => {
+    postKeys.note(msgId, recipients);
+    if (OWN_PHONE_WATCH) for (const s of sessions.values()) (s.ownWatch = s.ownWatch || makeOwnWatch()).expect(msgId, jid);
+  },
+  // A phone that asks is answered alone (phonesToParticipant) - but the number's own phone keeps the stock way.
+  isOwn: (participant) => { for (const s of sessions.values()) if (isOwnParticipant(participant, s.sock?.authState?.creds?.me)) return true; return false; },
   // A member's identity changed (not his companion device's alone: Baileys skips those; not ours).
   onIdentityChange: (from, action) => {
     if (['invalid_notification', 'no_identity_node', 'skipped_self_primary'].includes(String(action))) return;
@@ -516,6 +559,7 @@ setInterval(() => {
       heal: s.healer ? { ...s.healer.stats(), on: HEAL_REFUSED && forgetRefused } : null,
       askers: s.askerProbe ? (({ top, ...rest }) => rest)(s.askerProbe.stats()) : null,
       changed: s.changedMembers ? s.changedMembers.stats() : null,
+      ownWatch: s.ownWatch ? s.ownWatch.stats() : null,
       undecryptable: { ...undecryptable.totals(), on: stopLoops },
       lid: s.lidStat ? { ...s.lidStat, remembered: s.lidNone?.size || 0 } : null,
       groupKeys: { posts: groupKeys.posts, devices: groupKeys.devices, full: groupKeys.full },
@@ -2580,7 +2624,12 @@ async function buildSocket(s, phone, { forceReset } = {}) {
         const recv = r?.receipt;
         const type = String(recv?.type || '').toLowerCase();
         const jid = r?.key?.remoteJid;
-        if (!jid || jid.endsWith('@g.us')) continue;
+        // A receipt from one of our own devices for a group post of ours: it reached his phone (makeOwnWatch).
+        if (jid && jid.endsWith('@g.us')) {
+          if (s.ownWatch && r?.key?.id && isOwnParticipant(recv?.userJid, sock.authState?.creds?.me)) s.ownWatch.delivered(r.key.id);
+          continue;
+        }
+        if (!jid) continue;
         const isBad = type === 'retry' || type === 'error' || !!recv?.error || !!recv?.phash;
         if (!isBad) continue;
         logger.warn({ phone, jid, msgId: r?.key?.id, type }, 'bad_ack_detected');
@@ -3194,6 +3243,8 @@ export function snapshotOf(phone) {
       askers: s.askerProbe ? { ...s.askerProbe.stats(), devicesTtlMin: DEVICES_TTL_MS / 60_000, postKeys: postKeys.stats() } : null,
       // Members whose identity or devices changed, forgotten in every group (2026-11-24).
       changed: s.changedMembers ? { ...s.changedMembers.stats(), on: CHANGED_MEMBERS } : { on: CHANGED_MEMBERS },
+      // His own phone: posts that got no receipt from it in 20 s, sent again to it alone (2026-11-24).
+      ownWatch: s.ownWatch ? { ...s.ownWatch.stats(), on: OWN_PHONE_WATCH } : { on: OWN_PHONE_WATCH },
       undecryptable: { ...undecryptable.totals(), on: stopLoops },
       stats: s.retryStats?.totals() || null,
       lid: s.lidStat ? { ...s.lidStat, remembered: s.lidNone?.size || 0 } : null,

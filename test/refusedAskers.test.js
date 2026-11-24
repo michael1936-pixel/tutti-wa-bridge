@@ -81,7 +81,7 @@ test('a refusal is told with who asked, and the session marks him for the next p
   assert.ok(session.includes("if (group && at > 0) s.refusedAskers.note(group, String(key).slice(at + 1));"));
   assert.ok(session.includes("jid: String(jid || '') });"));
   // The write is started by a module-level timer, never from inside a handled message.
-  assert.ok(session.includes('for (const s of sessions.values()) { void flushRefusedAskers(s); void flushOwnKeyGroups(s); void flushHeal(s); void flushChangedMembers(s); }'));
+  assert.ok(session.includes('for (const s of sessions.values()) { void flushRefusedAskers(s); void flushOwnKeyGroups(s); void flushHeal(s); void flushChangedMembers(s); void flushOwnWatch(s); }'));
   const worker = readFileSync(new URL('../worker.js', import.meta.url), 'utf8');
   assert.ok(worker.includes("if (typeof m.forgetRefused === 'boolean') setForgetRefused(m.forgetRefused);"));
 });

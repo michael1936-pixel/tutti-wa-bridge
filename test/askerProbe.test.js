@@ -141,7 +141,7 @@ test('the probe counts asks by whether the post carried him the key', () => {
 
 test('wired: every group post tells which devices got the key, and every ask is looked up in it', () => {
   const session = readFileSync(new URL('../session.js', import.meta.url), 'utf8');
-  assert.ok(session.includes('onGroupPost: (_jid, msgId, recipients) => { postKeys.note(msgId, recipients); },'));
+  assert.ok(session.includes('onGroupPost: (jid, msgId, recipients) => {\n    postKeys.note(msgId, recipients);'));
   assert.ok(session.includes('keyInPost: postKeys.keyIn(msgId, participant, altParticipant)'));
   const patch = readFileSync(new URL('../baileysPatch.js', import.meta.url), 'utf8');
   assert.ok(patch.includes("globalThis.__bridgeRetry?.onGroupPost?.(destinationJid, msgId, senderKeyRecipients, devices.length)"));

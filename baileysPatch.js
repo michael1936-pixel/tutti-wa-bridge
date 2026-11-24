@@ -58,7 +58,7 @@ export const EDITS = {
     {
       name: 'phone_retry_to_the_phone_alone',
       find: /const sendToAll = !jidDecode\(participant\)\?\.device;/g,
-      put: `const sendToAll = !jidDecode(participant)?.device && !(isJidGroup(remoteJid) && globalThis.__bridgeRetry?.phonesToParticipant); /* ${PATCH_MARK} */`,
+      put: `const sendToAll = !jidDecode(participant)?.device && !(isJidGroup(remoteJid) && globalThis.__bridgeRetry?.phonesToParticipant && !globalThis.__bridgeRetry?.isOwn?.(participant)); /* ${PATCH_MARK} */`,
     },
     {
       name: 'only_the_asker_is_forgotten',
