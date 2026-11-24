@@ -94,6 +94,55 @@ test('wired: every group ask - answered or refused - goes to the probe, and /dia
   const session = readFileSync(new URL('../session.js', import.meta.url), 'utf8');
   assert.ok(session.includes("if (kind === 'group' && !own) probeAsk(s, key, true);"));
   assert.ok(session.includes("if (kind === 'group') probeAsk(s, key, false);"));
-  assert.ok(session.includes('askers: s.askerProbe ? { ...s.askerProbe.stats(), devicesTtlMin: DEVICES_TTL_MS / 60_000 } : null,'));
+  assert.ok(session.includes('askers: s.askerProbe ? { ...s.askerProbe.stats(), devicesTtlMin: DEVICES_TTL_MS / 60_000, postKeys: postKeys.stats() } : null,'));
   assert.ok(session.includes('s.askerProbe = s.askerProbe || makeAskerProbe();'));
+});
+
+// 2026-11-24, the second look: did the post he asks for carry the group's key to his very device?
+import { makePostKeys } from '../retryMode.js';
+
+test('a post\'s key recipients: got / not / unknown, the same device however written', () => {
+  const k = makePostKeys();
+  k.note('M1', ['111@lid', '222:3@lid']);
+  k.note('M2', []); // a post that carried the key to nobody
+  assert.equal(k.keyIn('M1', '111:0@lid'), 'got');
+  assert.equal(k.keyIn('M1', '222:3@lid'), 'got');
+  assert.equal(k.keyIn('M1', '222:4@lid'), 'not');
+  assert.equal(k.keyIn('M1', '222@s.whatsapp.net'), 'not', 'a number is not his LID');
+  assert.equal(k.keyIn('M2', '111@lid'), 'not');
+  assert.equal(k.keyIn('M3', '111@lid'), 'unknown');
+  assert.equal(k.keyIn('M1', null, '111@lid'), 'got', 'his other name counts');
+});
+
+test('posts are kept a while, and at most so many', () => {
+  let t = 0;
+  const k = makePostKeys({ ttlMs: 1_000, max: 10, now: () => t });
+  k.note('A', ['1@lid']);
+  t = 2_000;
+  assert.equal(k.keyIn('A', '1@lid'), 'unknown');
+  for (let i = 0; i < 25; i++) k.note(`P${i}`, ['1@lid']);
+  assert.ok(k.stats().posts <= 10);
+  assert.equal(k.keyIn('P24', '1@lid'), 'got');
+});
+
+test('the probe counts asks by whether the post carried him the key', () => {
+  const p = makeAskerProbe();
+  const devicesCache = cacheWith({ '7': [0] });
+  for (let i = 0; i < 6; i++) p.note({ participant: '7@lid', devicesCache, keyInPost: 'got' });
+  p.note({ participant: '8@lid', devicesCache, keyInPost: 'not' });
+  p.note({ participant: '9@lid', devicesCache });
+  const s = p.stats();
+  assert.equal(s.got_key_in_post, 6);
+  assert.equal(s.no_key_in_post, 1);
+  assert.equal(s.post_unknown, 1);
+  assert.equal(s.repeat.six_plus_mostly_got_key, 1);
+  assert.equal(s.top[0].got_key, 6);
+});
+
+test('wired: every group post tells which devices got the key, and every ask is looked up in it', () => {
+  const session = readFileSync(new URL('../session.js', import.meta.url), 'utf8');
+  assert.ok(session.includes('onGroupPost: (_jid, msgId, recipients) => { postKeys.note(msgId, recipients); },'));
+  assert.ok(session.includes('keyInPost: postKeys.keyIn(msgId, participant, altParticipant)'));
+  const patch = readFileSync(new URL('../baileysPatch.js', import.meta.url), 'utf8');
+  assert.ok(patch.includes("globalThis.__bridgeRetry?.onGroupPost?.(destinationJid, msgId, senderKeyRecipients, devices.length)"));
 });

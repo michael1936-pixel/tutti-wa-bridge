@@ -54,7 +54,7 @@ import { isOwnParticipant, makeRetryCounter, parseGroupLimit, RETRY_RULES } from
 import { quotedOf } from './quoted.js';
 import { baileysPatched } from './baileysPatch.js';
 import {
-  parseMode, forgetAsker, forgetAskers, makeRefusedAskers, makeHealer, userOf, makeUndecryptable, makeRetryStats, makeAskerProbe, guardLidLookup, makeBreather, breathingRepository, setInSlices, waitUntil, makeTtlCache,
+  parseMode, forgetAsker, forgetAskers, makeRefusedAskers, makeHealer, userOf, makeUndecryptable, makeRetryStats, makeAskerProbe, makePostKeys, guardLidLookup, makeBreather, breathingRepository, setInSlices, waitUntil, makeTtlCache,
 } from './retryMode.js';
 
 // The station's number must never show "מחובר/ת" to the drivers: the bridge is
@@ -219,7 +219,7 @@ async function getCachedGroupMetadata(sock, jid) {
 // Surfaced via /diag and printed once on startup. Bump this string when you
 // redeploy a behavioral change so you can read the version straight from
 // Railway logs.
-const BRIDGE_BUILD = 'askers-probe-2026-11-24';
+const BRIDGE_BUILD = 'askers-key-in-post-2026-11-24';
 
 /** How old a held private message may be and still be passed on. */
 const OFFLINE_PRIVATE_MAX_AGE_MS = 30 * 60_000;
@@ -421,6 +421,8 @@ setInterval(() => {
 const askerRepeats = new Map();
 // How many devices group posts carried the group's key to (measured by the patch).
 const groupKeys = { posts: 0, devices: 0, full: 0, loggedAt: 0 };
+// Which devices each group post carried the key to (patch: onGroupPost) - for the askers' probe.
+const postKeys = makePostKeys();
 // How soon the number's own phone is asked for a message that did not decrypt
 // (Baileys: 3 s + 2 s; baileysPatch.js). The sender's own resend still comes
 // first when it is quick; a message that arrives twice is kept once by the server.
@@ -431,6 +433,7 @@ globalThis.__bridgeRetry = {
   ...(RETRY_PATCHED ? { phoneDelayMs: PHONE_DELAY_MS, placeholderDelayMs: PLACEHOLDER_DELAY_MS } : {}),
   forgetAsker: (a) => (retryMode.keepGroupMemory ? forgetAsker(a, { repeats: askerRepeats }) : false),
   undecryptable: (id) => (stopLoops ? undecryptable.failed(id) : false),
+  onGroupPost: (_jid, msgId, recipients) => { postKeys.note(msgId, recipients); },
   onGroupKeys: (jid, sent, devices) => {
     groupKeys.posts += 1;
     groupKeys.devices += sent;
@@ -733,7 +736,8 @@ function probeAsk(s, key, answered) {
   const at = String(key ?? '').indexOf(':');
   if (at <= 0 || !s.askerProbe) return;
   const participant = String(key).slice(at + 1);
-  const note = (altParticipant) => { try { s.askerProbe.note({ participant, altParticipant, devicesCache: s.devicesCache, answered }); } catch (_) { /* a count never stops an answer */ } };
+  const msgId = String(key).slice(0, at);
+  const note = (altParticipant) => { try { s.askerProbe.note({ participant, altParticipant, devicesCache: s.devicesCache, answered, keyInPost: postKeys.keyIn(msgId, participant, altParticipant) }); } catch (_) { /* a count never stops an answer */ } };
   // His devices may be kept under his phone number (a group of numbers): his LID turned into it, from what the store knows.
   let listed = null;
   try { listed = s.devicesCache?.get?.(userOf(participant)); } catch (_) { listed = null; }
@@ -3134,7 +3138,7 @@ export function snapshotOf(phone) {
       ownKey: s.ownKeyStat ? { ...s.ownKeyStat, on: OWN_KEY_EVERY_POST && forgetRefused } : { posts: 0, forgotten: 0, on: OWN_KEY_EVERY_POST && forgetRefused },
       heal: s.healer ? { ...s.healer.stats(), on: HEAL_REFUSED && forgetRefused } : null,
       // Who asks for a group post again: on his member's cached device list or not (2026-11-24).
-      askers: s.askerProbe ? { ...s.askerProbe.stats(), devicesTtlMin: DEVICES_TTL_MS / 60_000 } : null,
+      askers: s.askerProbe ? { ...s.askerProbe.stats(), devicesTtlMin: DEVICES_TTL_MS / 60_000, postKeys: postKeys.stats() } : null,
       undecryptable: { ...undecryptable.totals(), on: stopLoops },
       stats: s.retryStats?.totals() || null,
       lid: s.lidStat ? { ...s.lidStat, remembered: s.lidNone?.size || 0 } : null,

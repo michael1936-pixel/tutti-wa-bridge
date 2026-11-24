@@ -148,6 +148,17 @@ export const EDITS = {
         `                    try { globalThis.__bridgeRetry?.onGroupKeys?.(destinationJid, senderKeyRecipients.length, devices.length); } catch (_) { /* ${PATCH_MARK} */ }`,
       ].join('\n'),
     },
+    // 2026-11-24 (the askers' probe): every group post says which devices it carried
+    // the group's key to - also none - so an ask for that post can be told apart:
+    // "he got the key in it and still could not read it" from "we thought he held it".
+    {
+      name: 'group_post_key_recipients',
+      find: /await authState\.keys\.set\(\{ 'sender-key-memory': \{ \[jid\]: senderKeyMap \} \}\);/g,
+      put: [
+        "await authState.keys.set({ 'sender-key-memory': { [jid]: senderKeyMap } });",
+        `                try { globalThis.__bridgeRetry?.onGroupPost?.(destinationJid, msgId, senderKeyRecipients, devices.length); } catch (_) { /* ${PATCH_MARK} */ }`,
+      ].join('\n'),
+    },
   ],
 };
 
