@@ -763,3 +763,100 @@ export function makeOwnWatch({ waitMs = 20_000, maxAgeMs = 5 * 60_000, perMinute
     stats: () => ({ ...stat, watching: [...posts.values()].filter((p) => !p.delivered && !p.resent).length }),
   };
 }
+
+/**
+ * The trace of the number's own phone, post by post (2026-11-25, Michael «כן, תבנה
+ * מעקב»): his posts still stand on his phone as "בהמתנה להודעה זו" - only 36% got
+ * a receipt in 20 s, and neither the copies nor fresh sessions ended it. What is
+ * not known: was his phone in the post's device list, and under which name (LID or
+ * phone number); did the post carry it the group's key; and which of his devices
+ * answered how - the receipts Baileys gives are per user, not per device, so a
+ * receipt from his computer counted as his phone's. This keeps, for the last posts,
+ * the raw receipts (WhatsApp's own <receipt> nodes) device by device. Changes
+ * nothing that is sent. Pure: `now` for the tests.
+ */
+export function makeOwnTrace({ max = 600, settleMs = 90_000, onTimeMs = 20_000, now = Date.now } = {}) {
+  const posts = new Map(); // msgId -> record
+  const settled = { posts: 0, by_key: {}, receipt_types: {}, devices_seen: {} };
+  const bump = (o, k, n = 1) => { o[k] = (o[k] || 0) + n; };
+  /** 'lid:0', 'pn:12' - the name kind and the device of a jid. */
+  const devOf = (jid) => {
+    const s = String(jid ?? '');
+    const kind = /@lid$/.test(s) ? 'lid' : 'pn';
+    const m = /^[^@:]+:(\d+)@/.exec(s);
+    return `${kind}:${m ? Number(m[1]) : 0}`;
+  };
+  /** Which name(s) his phone (device 0) went under in a list of device names. */
+  const phoneForm = (list) => {
+    const kinds = new Set(list.filter((d) => d.endsWith(':0')).map((d) => d.split(':')[0]));
+    return kinds.size === 0 ? 'none' : kinds.size === 2 ? 'both' : [...kinds][0];
+  };
+  /** What became of a post on his phone. */
+  const outcome = (p) => {
+    const phone = p.receipts.filter((r) => r.d.endsWith(':0'));
+    if (phone.some((r) => r.t === 'delivery' && r.ms <= onTimeMs)) return 'on_time';
+    if (phone.some((r) => r.t === 'retry')) return 'phone_asked';
+    if (phone.some((r) => r.t === 'delivery' && p.copyMs != null && r.ms >= p.copyMs)) return 'after_copy';
+    if (phone.some((r) => r.t === 'delivery')) return 'late';
+    if (phone.length) return 'phone_other';
+    if (p.receipts.length) return 'other_device_only';
+    return 'silent';
+  };
+  const settle = (p) => {
+    p.settled = true;
+    const key = `listed_${phoneForm(p.listed)}|key_${phoneForm(p.keyTo)}`;
+    settled.posts += 1;
+    bump((settled.by_key[key] = settled.by_key[key] || {}), outcome(p));
+    for (const r of p.receipts) bump(settled.receipt_types, `${r.d}|${r.t}`);
+  };
+  const settleDue = () => {
+    const t = now();
+    for (const p of posts.values()) if (!p.settled && t - p.at >= settleMs) settle(p);
+  };
+  const compact = (p) => ({
+    id: p.id, group: p.group, at: new Date(p.at).toISOString(),
+    listed: p.listed, keyTo: p.keyTo, devices: p.devices,
+    receipts: p.receipts.map((r) => `${r.d}|${r.t}${r.n ? `#${r.n}` : ''}@${Math.round(r.ms / 100) / 10}s`),
+    copy: p.copyMs == null ? null : `${p.copyOk ? 'ok' : 'failed'}@${Math.round(p.copyMs / 100) / 10}s`,
+    outcome: outcome(p),
+  });
+  return {
+    /** A group post of ours left: his devices in its list, and those it carried the key to. */
+    post(msgId, group, { ownListed = [], ownKeyTo = [], devices = 0 } = {}) {
+      if (!msgId) return;
+      settleDue();
+      posts.set(msgId, {
+        id: msgId, group: String(group || ''), at: now(), devices,
+        listed: ownListed.map(devOf), keyTo: ownKeyTo.map(devOf), receipts: [], copyMs: null, copyOk: null,
+      });
+      if (posts.size > max) for (const [k, p] of posts) { if (!p.settled) settle(p); posts.delete(k); if (posts.size <= max * 0.9) break; }
+    },
+    /** A raw receipt from one of his devices for a post of ours (type: 'delivery' when WhatsApp gives none). */
+    receipt(msgId, participant, type, count) {
+      const p = posts.get(msgId);
+      const d = devOf(participant);
+      bump(settled.devices_seen, d);
+      if (!p) return false;
+      p.receipts.push({ d, t: String(type || 'delivery'), ms: now() - p.at, ...(count ? { n: Number(count) } : {}) });
+      if (p.receipts.length > 20) p.receipts.splice(10, p.receipts.length - 20);
+      return true;
+    },
+    /** The copy to his phone alone went (or not). */
+    copy(msgId, ok) {
+      const p = posts.get(msgId);
+      if (!p || p.copyMs != null) return;
+      p.copyMs = now() - p.at;
+      p.copyOk = !!ok;
+    },
+    stats({ recent = 30, bad = 30 } = {}) {
+      settleDue();
+      const list = [...posts.values()];
+      return {
+        ...settled,
+        watching: list.filter((p) => !p.settled).length,
+        recent: list.slice(-recent).reverse().map(compact),
+        bad: list.filter((p) => p.settled && outcome(p) !== 'on_time').slice(-bad).reverse().map(compact),
+      };
+    },
+  };
+}

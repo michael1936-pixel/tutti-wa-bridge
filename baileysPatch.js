@@ -178,7 +178,7 @@ export const EDITS = {
       find: /await authState\.keys\.set\(\{ 'sender-key-memory': \{ \[jid\]: senderKeyMap \} \}\);/g,
       put: [
         "await authState.keys.set({ 'sender-key-memory': { [jid]: senderKeyMap } });",
-        `                try { globalThis.__bridgeRetry?.onGroupPost?.(destinationJid, msgId, senderKeyRecipients, devices.length); } catch (_) { /* ${PATCH_MARK} */ }`,
+        `                try { globalThis.__bridgeRetry?.onGroupPost?.(destinationJid, msgId, senderKeyRecipients, devices.length, devices); } catch (_) { /* ${PATCH_MARK} */ }`,
       ].join('\n'),
     },
   ],

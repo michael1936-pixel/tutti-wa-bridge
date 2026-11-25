@@ -54,7 +54,7 @@ import { isOwnParticipant, makeRetryCounter, parseGroupLimit, RETRY_RULES } from
 import { quotedOf } from './quoted.js';
 import { baileysPatched } from './baileysPatch.js';
 import {
-  parseMode, forgetAsker, forgetAskers, makeRefusedAskers, makeHealer, userOf, makeUndecryptable, makeRetryStats, makeAskerProbe, makePostKeys, makeChangedMembers, forgetEverywhere, makeOwnWatch, guardLidLookup, makeBreather, breathingRepository, setInSlices, waitUntil, makeTtlCache,
+  parseMode, forgetAsker, forgetAskers, makeRefusedAskers, makeHealer, userOf, makeUndecryptable, makeRetryStats, makeAskerProbe, makePostKeys, makeChangedMembers, forgetEverywhere, makeOwnWatch, makeOwnTrace, guardLidLookup, makeBreather, breathingRepository, setInSlices, waitUntil, makeTtlCache,
 } from './retryMode.js';
 
 // The station's number must never show "מחובר/ת" to the drivers: the bridge is
@@ -219,7 +219,7 @@ async function getCachedGroupMetadata(sock, jid) {
 // Surfaced via /diag and printed once on startup. Bump this string when you
 // redeploy a behavioral change so you can read the version straight from
 // Railway logs.
-const BRIDGE_BUILD = 'own-phone-self-heal-2026-11-24';
+const BRIDGE_BUILD = 'own-phone-trace-2026-11-25';
 
 /** How old a held private message may be and still be passed on. */
 const OFFLINE_PRIVATE_MAX_AGE_MS = 30 * 60_000;
@@ -441,6 +441,11 @@ async function flushChangedMembers(s) {
 // 2026-11-24): no receipt from his own devices 20 s after a group post -> the post
 // once more to his phone alone. Off: OWN_PHONE_WATCH=off.
 const OWN_PHONE_WATCH = String(process.env.OWN_PHONE_WATCH || 'on').toLowerCase() !== 'off';
+// The trace of his own phone, post by post (retryMode.js makeOwnTrace, 2026-11-25): which of
+// his devices each post listed and carried the key to, and the raw receipts device by device.
+// Sends nothing. Off: OWN_TRACE=off.
+const OWN_TRACE = String(process.env.OWN_TRACE || 'on').toLowerCase() !== 'off';
+function ownTraceOf(s) { return (s.ownTrace = s.ownTrace || makeOwnTrace()); }
 function ownPhoneJid(me) {
   if (me?.lid) return `${userOf(me.lid)}@lid`;
   return me?.id ? `${userOf(me.id)}@s.whatsapp.net` : null;
@@ -491,8 +496,10 @@ async function flushOwnWatch(s) {
         // Baileys' retry path: one copy to this device, wrapped as sent by us (deviceSentMessage) with the group's key.
         await sock.relayMessage(group, entry.content, { messageId: id, participant: { jid: own, count: 1 } });
         s.ownWatch.done(true);
+        if (OWN_TRACE) ownTraceOf(s).copy(id, true);
       } catch (e) {
         s.ownWatch.done(false);
+        if (OWN_TRACE) ownTraceOf(s).copy(id, false);
         if (Date.now() - (s.ownWatchWarnAt || 0) > 60_000) {
           s.ownWatchWarnAt = Date.now();
           logger.warn({ phone: s.phone, msgId: id, err: e?.message || String(e) }, 'own_phone_copy_failed');
@@ -547,9 +554,21 @@ globalThis.__bridgeRetry = {
   ...(RETRY_PATCHED ? { phoneDelayMs: PHONE_DELAY_MS, placeholderDelayMs: PLACEHOLDER_DELAY_MS } : {}),
   forgetAsker: (a) => (retryMode.keepGroupMemory ? forgetAsker(a, { repeats: askerRepeats }) : false),
   undecryptable: (id) => (stopLoops ? undecryptable.failed(id) : false),
-  onGroupPost: (jid, msgId, recipients) => {
+  onGroupPost: (jid, msgId, recipients, count, devices) => {
     postKeys.note(msgId, recipients);
     if (OWN_PHONE_WATCH) for (const s of sessions.values()) (s.ownWatch = s.ownWatch || makeOwnWatch()).expect(msgId, jid);
+    if (OWN_TRACE) for (const s of sessions.values()) {
+      const me = s.sock?.authState?.creds?.me;
+      if (!me) continue;
+      const own = (j) => isOwnParticipant(j, me);
+      try {
+        ownTraceOf(s).post(msgId, jid, {
+          ownListed: (Array.isArray(devices) ? devices : []).map((d) => d?.jid).filter(own),
+          ownKeyTo: (Array.isArray(recipients) ? recipients : []).filter(own),
+          devices: Number(count) || 0,
+        });
+      } catch (_) { /* a trace never stops a post */ }
+    }
   },
   // A phone that asks is answered alone (phonesToParticipant) - but the number's own phone keeps the stock way.
   isOwn: (participant) => { for (const s of sessions.values()) if (isOwnParticipant(participant, s.sock?.authState?.creds?.me)) return true; return false; },
@@ -2661,6 +2680,21 @@ async function buildSocket(s, phone, { forceReset } = {}) {
   // Bad-acks / phash errors arrive as message-receipt.update too. These are
   // strong signals that the recipient could not decrypt — bump the same
   // retry counter so we converge to assertSessions.
+  // His own devices' raw receipts for our group posts, device by device (makeOwnTrace, 2026-11-25):
+  // Baileys' message-receipt.update names the user only, so his computer's receipt looked like his phone's.
+  if (OWN_TRACE) sock.ws.on('CB:receipt', (node) => {
+    try {
+      const a = node?.attrs || {};
+      if (!String(a.from || '').endsWith('@g.us') || !a.participant) return;
+      if (!isOwnParticipant(a.participant, sock.authState?.creds?.me)) return;
+      const kids = Array.isArray(node.content) ? node.content : [];
+      const list = kids.find((c) => c?.tag === 'list');
+      const retry = kids.find((c) => c?.tag === 'retry');
+      const ids = [a.id, ...(Array.isArray(list?.content) ? list.content : []).map((c) => c?.attrs?.id)].filter(Boolean);
+      for (const id of ids) ownTraceOf(s).receipt(id, a.participant, a.type, retry?.attrs?.count);
+    } catch (_) { /* a trace never stops a receipt */ }
+  });
+
   sock.ev.on('message-receipt.update', async (receipts) => {
     for (const r of receipts || []) {
       try {
@@ -3288,6 +3322,8 @@ export function snapshotOf(phone) {
       changed: s.changedMembers ? { ...s.changedMembers.stats(), on: CHANGED_MEMBERS } : { on: CHANGED_MEMBERS },
       // His own phone: posts that got no receipt from it in 20 s, sent again to it alone (2026-11-24).
       ownWatch: s.ownWatch ? { ...s.ownWatch.stats(), on: OWN_PHONE_WATCH } : { on: OWN_PHONE_WATCH },
+      // His own phone, post by post: listed / keyed under which name, raw receipts per device (2026-11-25).
+      ownTrace: s.ownTrace ? { ...s.ownTrace.stats(), on: OWN_TRACE } : { on: OWN_TRACE },
       undecryptable: { ...undecryptable.totals(), on: stopLoops },
       stats: s.retryStats?.totals() || null,
       lid: s.lidStat ? { ...s.lidStat, remembered: s.lidNone?.size || 0 } : null,
