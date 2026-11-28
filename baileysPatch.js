@@ -188,8 +188,8 @@ export const EDITS = {
  * One file's source with its edits. Pure.
  * → { state: 'applied' | 'already' | 'mismatch', out, edit?, hits? }
  */
-export function patchSource(src, edits) {
-  if (src.includes(PATCH_MARK)) return { state: 'already', out: src };
+export function patchSource(src, edits, mark = PATCH_MARK) {
+  if (src.includes(mark)) return { state: 'already', out: src };
   let out = src;
   for (const e of edits) {
     const hits = out.match(e.find);
@@ -220,6 +220,44 @@ export function patchAll(read, edits = EDITS) {
 }
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
+
+// ---- The query trace (2026-11-28, queryTrace.js) -----------------------------------
+// One line in Baileys' `query`: every question to WhatsApp is named as it leaves, so a
+// "timed out waiting for message" can be told what it was. A patch of its OWN — its own
+// file, its own mark: if this line ever stops matching, the retry patch above is not
+// touched and the bridge runs exactly as before, only without the names.
+export const QUERY_MARK = 'bridge-patch:query-trace';
+const SOCKET = 'lib/Socket/socket.js';
+export const QUERY_EDITS = {
+  [SOCKET]: [
+    {
+      name: 'query_named_as_it_leaves',
+      find: /const msgId = node\.attrs\.id;/g,
+      put: [
+        'const msgId = node.attrs.id;',
+        `        try { globalThis.__bridgeQuery?.sent?.(msgId, node); } catch (_) { /* ${QUERY_MARK} */ }`,
+      ].join('\n'),
+    },
+  ],
+};
+
+/** The query trace's patch of the installed Baileys. Never throws; never touches the retry patch. */
+export function applyQueryTracePatch(root = HERE) {
+  try {
+    const dir = path.join(root, 'node_modules', 'baileys');
+    const version = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8')).version;
+    if (version !== PATCH_VERSION) return { state: 'version', version };
+    const target = path.join(dir, SOCKET);
+    const r = patchSource(fs.readFileSync(target, 'utf8'), QUERY_EDITS[SOCKET], QUERY_MARK);
+    if (r.state !== 'applied') return { state: r.state, ...(r.edit ? { edit: r.edit, hits: r.hits } : {}) };
+    const tmp = `${target}.bridge-query.tmp`;
+    fs.writeFileSync(tmp, r.out, 'utf8');
+    fs.renameSync(tmp, target);
+    return { state: 'applied' };
+  } catch (err) {
+    return { state: 'error', error: err?.message || String(err) };
+  }
+}
 
 /** Is the installed Baileys patched? (read by session.js at load) */
 export function baileysPatched(root = HERE) {

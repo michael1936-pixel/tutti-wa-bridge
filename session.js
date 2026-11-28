@@ -53,6 +53,7 @@ import makeWASocket, {
 import { isOwnParticipant, makeRetryCounter, parseGroupLimit, RETRY_RULES } from './retryGuard.js';
 import { quotedOf } from './quoted.js';
 import { baileysPatched } from './baileysPatch.js';
+import { kindsLine, makeQueryTrace } from './queryTrace.js';
 import {
   parseMode, forgetAsker, forgetAskers, makeRefusedAskers, makeHealer, userOf, makeUndecryptable, makeRetryStats, makeAskerProbe, makePostKeys, makeChangedMembers, forgetEverywhere, makeOwnWatch, makeOwnTrace, guardLidLookup, makeBreather, breathingRepository, setInSlices, waitUntil, makeTtlCache,
 } from './retryMode.js';
@@ -219,7 +220,7 @@ async function getCachedGroupMetadata(sock, jid) {
 // Surfaced via /diag and printed once on startup. Bump this string when you
 // redeploy a behavioral change so you can read the version straight from
 // Railway logs.
-const BRIDGE_BUILD = 'own-phone-trace-2026-11-25';
+const BRIDGE_BUILD = 'query-trace-2026-11-28';
 
 /** How old a held private message may be and still be passed on. */
 const OFFLINE_PRIVATE_MAX_AGE_MS = 30 * 60_000;
@@ -446,6 +447,11 @@ const OWN_PHONE_WATCH = String(process.env.OWN_PHONE_WATCH || 'on').toLowerCase(
 // Sends nothing. Off: OWN_TRACE=off.
 const OWN_TRACE = String(process.env.OWN_TRACE || 'on').toLowerCase() !== 'off';
 function ownTraceOf(s) { return (s.ownTrace = s.ownTrace || makeOwnTrace()); }
+// Which questions to WhatsApp go unanswered (queryTrace.js, 2026-11-28). Counting only.
+function queryTraceOf(s) { return (s.queryTrace = s.queryTrace || makeQueryTrace()); }
+globalThis.__bridgeQuery = {
+  sent: (msgId, node) => { for (const s of sessions.values()) queryTraceOf(s).sent(msgId, node); },
+};
 function ownPhoneJid(me) {
   if (me?.lid) return `${userOf(me.lid)}@lid`;
   return me?.id ? `${userOf(me.id)}@s.whatsapp.net` : null;
@@ -1347,6 +1353,8 @@ function healthLogger(base, s) {
             // The 15-s timeout of a LID question the guard already gave up on (4 s).
             const lidOnly = QUERY_TIMEOUT.test(msg) && (s.lidTimeoutsOpen || 0) > 0 && Date.now() - (s.lidTimeoutAt || 0) < 20_000;
             if (lidOnly) s.lidTimeoutsOpen -= 1;
+            // What was asked and not answered (queryTrace.js).
+            if (QUERY_TIMEOUT.test(msg)) queryTraceOf(s).timedOut(a.find((x) => x && typeof x === 'object')?.msgId, { spared: lidOnly });
             else if (SESSION_HEALTH.trouble.test(msg)) noteTrouble(s, troubleIdOf(a));
             if (QUERY_TIMEOUT.test(msg) && s.health && !lidOnly) {
               const now = Date.now();
@@ -1370,8 +1378,11 @@ function healthLogger(base, s) {
 function restartIfStuck(s) {
   if (!s?.sock || !stuckOf(s.health, s.status, Date.now(), s.lastInboundEventAt)) return;
   s.health.stuckRestartAt = Date.now();
-  logger.warn({ phone: s.phone, timeouts: s.health.timeouts.length }, 'session_stuck_restart');
-  emitEvent('session_stuck_restart', { phone: s.phone, timeouts: s.health.timeouts.length });
+  // What it had asked in that minute — the watchdog's event carries it to the server's log.
+  const kinds = s.queryTrace ? s.queryTrace.recentKinds(STUCK_SOCKET.windowMs) : {};
+  const hears = Date.now() - Math.max(s.lastInboundEventAt || 0, s.health.since || 0) < STUCK_SOCKET.quietMs;
+  logger.warn({ phone: s.phone, timeouts: s.health.timeouts.length, kinds, hears }, 'session_stuck_restart');
+  emitEvent('session_stuck_restart', { phone: s.phone, timeouts: s.health.timeouts.length, kinds: kindsLine(kinds), hears });
   s.health.timeouts = [];
   try { s.sock.end(new Error('stuck: WhatsApp queries time out')); } catch (err) {
     logger.error({ phone: s.phone, err: err?.message }, 'session_stuck_restart_failed');
@@ -3324,6 +3335,8 @@ export function snapshotOf(phone) {
       ownWatch: s.ownWatch ? { ...s.ownWatch.stats(), on: OWN_PHONE_WATCH } : { on: OWN_PHONE_WATCH },
       // His own phone, post by post: listed / keyed under which name, raw receipts per device (2026-11-25).
       ownTrace: s.ownTrace ? { ...s.ownTrace.stats(), on: OWN_TRACE } : { on: OWN_TRACE },
+      // Which questions to WhatsApp go unanswered (2026-11-28).
+      queries: s.queryTrace ? s.queryTrace.stats() : null,
       undecryptable: { ...undecryptable.totals(), on: stopLoops },
       stats: s.retryStats?.totals() || null,
       lid: s.lidStat ? { ...s.lidStat, remembered: s.lidNone?.size || 0 } : null,

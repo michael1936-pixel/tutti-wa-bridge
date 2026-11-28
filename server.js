@@ -46,7 +46,7 @@ import {
   heartbeatStale,
   SILENCE_DEFAULTS,
 } from './watchdog.js';
-import { applyBaileysPatch } from './baileysPatch.js';
+import { applyBaileysPatch, applyQueryTracePatch } from './baileysPatch.js';
 import { parseMode } from './retryMode.js';
 import { parseGroupLimit } from './retryGuard.js';
 import { makeFeedPacker, feedPosters, feedUrls } from './feedPack.js';
@@ -118,6 +118,8 @@ const feedPacker = makeFeedPacker({
 let BRIDGE_BUILD = 'unknown';
 // What applyBaileysPatch said at boot: applied | already | mismatch | version | error.
 let RETRY_PATCH = { state: 'not_run' };
+// The query trace's own patch (queryTrace.js): applied | already | mismatch | version | error.
+let QUERY_PATCH = { state: 'not_run' };
 // The retry patch's mode, kept for the numbers' processes (session.js reads it at start).
 const RETRY_MODE_FILE = path.join(process.env.AUTH_DIR || '/data', 'retry-mode.json');
 function storedRetryMode() {
@@ -492,6 +494,7 @@ app.get('/diag', (_req, res) => {
     isolation: ISOLATED ? 'process_per_number' : 'off',
     // The retry patch (baileysPatch.js): its state at boot and the mode in force.
     baileys_retry_patch: RETRY_PATCH.state,
+    baileys_query_trace: QUERY_PATCH.state,
     retry_mode: storedRetryMode(),
     retry_group_per_minute: storedGroupLimit(),
     retry_forget_refused: storedForgetRefused(),
@@ -776,6 +779,9 @@ async function main() {
   // number's process (or this one, isolation off) loads it (baileysPatch.js).
   RETRY_PATCH = applyBaileysPatch(__dirname);
   logger[RETRY_PATCH.state === 'applied' || RETRY_PATCH.state === 'already' ? 'info' : 'error'](RETRY_PATCH, 'baileys_retry_patch');
+  // The names of the questions (queryTrace.js) — apart: a miss here changes nothing else.
+  QUERY_PATCH = applyQueryTracePatch(__dirname);
+  logger[QUERY_PATCH.state === 'applied' || QUERY_PATCH.state === 'already' ? 'info' : 'warn'](QUERY_PATCH, 'baileys_query_trace');
   if (!ISOLATED) {
     local = await import('./session.js');
     BRIDGE_BUILD = local.BRIDGE_BUILD;
